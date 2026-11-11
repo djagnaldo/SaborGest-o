@@ -17,6 +17,8 @@ export function formatBRL(value: number | undefined | null): string {
   }).format(value);
 }
 
+export const formatCurrencyBR = formatBRL;
+
 export function parseBRL(valueStr: string): number {
   if (!valueStr) return 0;
   const clean = valueStr.replace(/[^\d,-]/g, '').replace(',', '.');

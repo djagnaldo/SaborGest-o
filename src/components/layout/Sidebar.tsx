@@ -11,6 +11,7 @@ import {
   Grid2X2,
   Receipt,
   WalletCards,
+  TrendingDown,
   TrendingUp,
   Users2,
   Contact2,
@@ -21,24 +22,27 @@ import {
   X,
   Lock,
   Radio,
-  FileText,
-  ShieldCheck,
+  FolderArchive,
+  Database,
+  Palette,
 } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import { getRoleName } from '../../utils/formatters';
 
 export type ActiveTab =
   | 'dashboard'
-  | 'server'
-  | 'debts'
-  | 'tests'
+  | 'pos'
+  | 'tables'
   | 'products'
   | 'inventory'
-  | 'tables'
-  | 'pos'
   | 'cash'
-  | 'financial'
+  | 'expenses'
   | 'team'
+  | 'financial'
+  | 'history'
+  | 'backup'
+  | 'customization'
+  | 'server'
   | 'contacts'
   | 'settings'
   | 'my_sales';
@@ -59,34 +63,28 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const { currentUser, isAdm, activeView, setActiveView } = useAuth();
 
   const adminNavItems = [
-    { id: 'dashboard', label: 'Dashboard Geral', icon: LayoutDashboard },
-    { id: 'server', label: 'Servidor Local & Pareamento', icon: Radio, highlight: true },
-    { id: 'debts', label: 'Fiado e Pendências', icon: FileText, highlight: true },
-    { id: 'tests', label: 'Validação Offline (10 Testes)', icon: ShieldCheck, badge: '10 Cenários' },
-    { id: 'products', label: 'Cardápio & Produtos', icon: UtensilsCrossed, badge: 'Fichas' },
+    { id: 'dashboard', label: 'Início', icon: LayoutDashboard },
+    { id: 'pos', label: 'Vendas (PDV)', icon: Receipt, highlight: true },
+    { id: 'tables', label: 'Mesas & Salão', icon: Grid2X2 },
+    { id: 'products', label: 'Produtos & Cardápio', icon: UtensilsCrossed },
     { id: 'inventory', label: 'Controle de Estoque', icon: Boxes },
-    { id: 'tables', label: 'Mesas & Comandas', icon: Grid2X2 },
-    { id: 'pos', label: 'Ponto de Venda (PDV)', icon: Receipt },
     { id: 'cash', label: 'Controle de Caixa', icon: WalletCards },
-    { id: 'financial', label: 'Financeiro & DRE', icon: TrendingUp },
-    { id: 'team', label: 'Equipe & Permissões', icon: Users2 },
+    { id: 'expenses', label: 'Controle de Gastos', icon: TrendingDown },
+    { id: 'team', label: 'Controle de Vendedores', icon: Users2 },
+    { id: 'financial', label: 'Relatórios & DRE', icon: TrendingUp },
+    { id: 'history', label: 'Histórico & Arquivos', icon: FolderArchive, highlight: true },
+    { id: 'backup', label: 'Backups & Restauração', icon: Database, highlight: true },
+    { id: 'customization', label: 'Personalização Visual', icon: Palette },
+    { id: 'server', label: 'Acesso PC & Servidor Local', icon: Radio },
     { id: 'contacts', label: 'Clientes & Fornecedores', icon: Contact2 },
     { id: 'settings', label: 'Configurações', icon: Settings },
   ];
 
   const sellerNavItems = [
-    { id: 'pos', label: 'Registrar Venda (PDV)', icon: Receipt, highlight: true },
-    { id: 'debts', label: 'Consultar Pendências (Fiado)', icon: FileText },
-    { id: 'tables', label: 'Mesas & Comandas', icon: Grid2X2 },
-    { id: 'products', label: 'Consultar Cardápio', icon: UtensilsCrossed },
-    { id: 'my_sales', label: 'Minhas Vendas & Metas', icon: Award },
-    {
-      id: 'cash',
-      label: 'Meu Caixa',
-      icon: WalletCards,
-      disabled: !currentUser?.permissions?.canOpenCloseCash,
-      lockText: 'Sem permissão de caixa',
-    },
+    { id: 'my_sales', label: 'Início / Minhas Vendas', icon: Award, highlight: true },
+    { id: 'products', label: 'Cardápio', icon: UtensilsCrossed },
+    { id: 'tables', label: 'Mesas', icon: Grid2X2 },
+    { id: 'pos', label: 'Balcão / Registrar Venda', icon: Receipt },
   ];
 
   const navItems = activeView === 'admin' ? adminNavItems : sellerNavItems;

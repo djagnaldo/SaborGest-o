@@ -32,6 +32,7 @@ import {
   getCategories,
   saveProduct,
   deleteProduct,
+  deleteProductSafely,
   addAuditLog,
 } from '../../services/storage';
 import {
@@ -155,15 +156,9 @@ export const ProductsView: React.FC = () => {
     if (!checkMasterAuthority('delete_product')) return;
 
     const prod = products.find((p) => p.id === id);
-    if (confirm(`Deseja realmente remover o produto ${prod?.name}?`)) {
-      deleteProduct(id);
-      addAuditLog({
-        tenantId: currentTenant.id,
-        userId: currentUser?.id || 'admin',
-        userName: currentUser?.name || 'Administrador',
-        action: 'EXCLUIU_PRODUTO',
-        details: `Excluiu o produto ${prod?.name} na Matriz`,
-      });
+    if (confirm(`Deseja realmente remover o produto "${prod?.name}"?\n(Se o produto possuir vendas históricas, ele será desativado com segurança do cardápio ativo sem apagar o histórico).`)) {
+      const result = deleteProductSafely(id);
+      alert(result.message);
       refreshList();
     }
   };

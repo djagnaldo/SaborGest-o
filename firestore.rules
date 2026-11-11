@@ -93,6 +93,18 @@ service cloud.firestore {
         allow create: if isTenantUser(tenantId);
         allow update, delete: if isTenantAdmin(tenantId);
       }
+
+      match /saved_reports/{reportId} {
+        allow read, write: if isTenantAdmin(tenantId);
+      }
+
+      match /archived_periods/{archiveId} {
+        allow read, write: if isTenantAdmin(tenantId);
+      }
+
+      match /backups/{backupId} {
+        allow read, write: if isTenantAdmin(tenantId);
+      }
     }
   }
 }

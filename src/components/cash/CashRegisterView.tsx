@@ -217,34 +217,34 @@ export const CashRegisterView: React.FC = () => {
             </div>
 
             <div className="text-right">
-              <span className="text-xs text-stone-400">Total Esperado em Gaveta (Espécie)</span>
+              <span className="text-xs text-stone-400">Saldo Calculado em Gaveta (Espécie)</span>
               <p className="text-2xl font-black text-stone-900">
                 {formatBRL(currentSession.expectedAmount)}
               </p>
             </div>
           </div>
 
-          {/* Grid de Totais por Método (EXCLUSIVAMENTE DINHEIRO, PIX, DEVENDO) */}
+          {/* Grid de Totais do Caixa Geral: Recebimentos, Despesas e Saldo */}
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
             <div className="rounded-xl bg-stone-50 p-3 border border-stone-200/60">
               <span className="text-[10px] font-semibold text-stone-500 uppercase">Fundo Inicial</span>
               <p className="mt-1 text-sm font-bold text-stone-800">{formatBRL(currentSession.initialAmount)}</p>
             </div>
             <div className="rounded-xl bg-stone-50 p-3 border border-stone-200/60">
-              <span className="text-[10px] font-semibold text-stone-500 uppercase">1. Dinheiro (Espécie)</span>
+              <span className="text-[10px] font-semibold text-stone-500 uppercase">Recebimentos (Dinheiro)</span>
               <p className="mt-1 text-sm font-bold text-stone-800">{formatBRL(currentSession.totalCash)}</p>
             </div>
             <div className="rounded-xl bg-stone-50 p-3 border border-stone-200/60">
-              <span className="text-[10px] font-semibold text-stone-500 uppercase">2. PIX Recebido</span>
+              <span className="text-[10px] font-semibold text-stone-500 uppercase">Recebimentos (PIX)</span>
               <p className="mt-1 text-sm font-bold text-emerald-700">{formatBRL(currentSession.totalPix)}</p>
             </div>
-            <div className="rounded-xl bg-amber-50 p-3 border border-amber-200/60">
-              <span className="text-[10px] font-semibold text-amber-800 uppercase">3. Fiado (DEVENDO)</span>
-              <p className="mt-1 text-sm font-bold text-amber-900">{formatBRL(currentSession.totalDevendo || 0)}</p>
-            </div>
-            <div className="rounded-xl bg-stone-50 p-3 border border-stone-200/60">
-              <span className="text-[10px] font-semibold text-stone-500 uppercase">Sangrias Realizadas</span>
+            <div className="rounded-xl bg-rose-50 p-3 border border-rose-200/60">
+              <span className="text-[10px] font-semibold text-rose-800 uppercase">Despesas / Gastos (Dinheiro)</span>
               <p className="mt-1 text-sm font-bold text-rose-700">-{formatBRL(currentSession.totalWithdrawals)}</p>
+            </div>
+            <div className="rounded-xl bg-stone-900 p-3 border border-stone-800 text-white">
+              <span className="text-[10px] font-semibold text-stone-300 uppercase">Saldo Calculado</span>
+              <p className="mt-1 text-sm font-black text-white">{formatBRL(currentSession.expectedAmount)}</p>
             </div>
           </div>
         </div>

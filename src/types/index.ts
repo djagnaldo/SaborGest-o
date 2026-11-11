@@ -29,6 +29,12 @@ export interface UserProfile {
   role: UserRole;
   avatarUrl?: string;
   active: boolean;
+  canSell?: boolean; // Permissão para vender (LIGADA / DESLIGADA)
+  status?: 'autorizado' | 'bloqueado';
+  accessCode?: string; // Código individual ou PIN
+  qrToken?: string; // Token único de pareamento do dispositivo
+  deviceModel?: string;
+  lastSyncAt?: string;
   commissionRate: number; // e.g. 5%
   salesTargetMonthly?: number; // e.g. R$ 15.000,00
   permissions: UserPermission;
@@ -146,7 +152,7 @@ export type OrderStatus =
   | 'closed'
   | 'cancelled';
 
-export type PaymentMethod = 'dinheiro' | 'pix' | 'devendo';
+export type PaymentMethod = 'dinheiro' | 'pix' | 'devendo' | 'pendente';
 
 export interface DebtRecord {
   id: string;
@@ -201,6 +207,35 @@ export interface OrderPayment {
   receiptSellerName?: string;
 }
 
+export interface TableExtraCharge {
+  id: string;
+  tableId: string;
+  tableNumberOrName: string;
+  amount: number;
+  description: string;
+  isCashWithdrawal: boolean; // Houve saída de dinheiro da gaveta do caixa
+  createdAt: string;
+  createdById: string;
+  createdByName: string;
+  financialTxId?: string; // ID da saída registrada no controle de gastos/caixa
+  status: 'active' | 'cancelled';
+  cancelledAt?: string;
+  cancelledBy?: string;
+  cancellationReason?: string;
+}
+
+export interface TableTimer {
+  durationMinutes: number;
+  startedAt: string; // ISO
+  targetTime: string; // ISO
+  pausedRemainingSeconds?: number;
+  isPaused?: boolean;
+  isExpired?: boolean;
+  acknowledged?: boolean;
+  setById: string;
+  setByName: string;
+}
+
 export interface Order {
   id: string;
   tenantId: string;
@@ -209,6 +244,7 @@ export interface Order {
   status: OrderStatus;
   tableNumber?: number;
   tableId?: string;
+  tableName?: string;
   comandaNumber?: string;
   customerId?: string;
   customerName?: string;
@@ -219,6 +255,8 @@ export interface Order {
   subtotal: number;
   discount: number;
   serviceFee: number;
+  extraTotal?: number;
+  extraCharges?: TableExtraCharge[];
   total: number;
   payments: OrderPayment[];
   paid: boolean;
@@ -269,14 +307,20 @@ export interface RestaurantTable {
   tenantId: string;
   number: number;
   label?: string;
+  customerName?: string;
+  isNamedTable?: boolean; // Se foi criada com identificação nominal do cliente
   status: TableStatus;
   capacity: number;
   currentOrderId?: string;
   currentTotal: number;
+  productsTotal?: number;
+  extraTotal?: number;
+  extraCharges?: TableExtraCharge[];
+  activeOrdersCount?: number;
+  timer?: TableTimer;
   openedAt?: string;
   waiterId?: string;
   waiterName?: string;
-  customerName?: string;
   isDemo?: boolean;
 }
 
@@ -377,4 +421,137 @@ export interface AuditLog {
   details: string;
   ip?: string;
   timestamp: string;
+}
+
+export type ReportType =
+  | 'vendas'
+  | 'produtos'
+  | 'estoque'
+  | 'movimentacoes_estoque'
+  | 'recebimentos'
+  | 'gastos'
+  | 'mesas'
+  | 'vendedores'
+  | 'financeiro_geral';
+
+export type ReportPeriodType =
+  | 'diario'
+  | 'semanal'
+  | 'mensal'
+  | 'anual'
+  | 'personalizado';
+
+export interface SavedReport {
+  id: string;
+  tenantId: string;
+  title: string;
+  type: ReportType;
+  periodType: ReportPeriodType;
+  startDate: string;
+  endDate: string;
+  createdAt: string;
+  createdById: string;
+  createdByName: string;
+  establishmentName: string;
+  establishmentDocument?: string;
+  summary: Record<string, any>;
+  items: any[];
+  notes?: string;
+  isDemo?: boolean;
+}
+
+export interface ArchivedPeriod {
+  id: string;
+  tenantId: string;
+  label: string;
+  periodType: ReportPeriodType;
+  startDate: string;
+  endDate: string;
+  archivedAt: string;
+  archivedById: string;
+  archivedByName: string;
+  notes?: string;
+  metrics: {
+    totalRevenue: number;
+    ordersCount: number;
+    cashTotal: number;
+    pixTotal: number;
+    expensesTotal: number;
+    netProfit: number;
+    itemsSold: number;
+  };
+  snapshot: {
+    orders: Order[];
+    products: Product[];
+    inventoryTransactions: InventoryTransaction[];
+    expenses: FinancialTransaction[];
+    tables: RestaurantTable[];
+    cashSessions: CashRegisterSession[];
+  };
+  isProtected: boolean;
+  isDemo?: boolean;
+}
+
+export interface SystemBackup {
+  id: string;
+  tenantId: string;
+  name: string;
+  createdAt: string;
+  createdById: string;
+  createdByName: string;
+  scopePeriod?: string;
+  version: string;
+  sizeBytes: number;
+  stats: {
+    ordersCount: number;
+    productsCount: number;
+    tablesCount: number;
+    expensesCount: number;
+    inventoryTxCount: number;
+    usersCount: number;
+    photosCount: number;
+  };
+  payload: {
+    tenant: Tenant;
+    products: Product[];
+    categories: Category[];
+    tables: RestaurantTable[];
+    orders: Order[];
+    expenses: FinancialTransaction[];
+    cashSessions: CashRegisterSession[];
+    inventoryTransactions: InventoryTransaction[];
+    users: UserProfile[];
+    savedReports: SavedReport[];
+    archivedPeriods: ArchivedPeriod[];
+    themeConfig?: SystemThemeConfig;
+  };
+  checksum: string;
+  cloudSynced?: boolean;
+  isDemo?: boolean;
+}
+
+export interface SystemThemeConfig {
+  posColor: string; // Cor da seção de vendas (Hex)
+  inventoryColor: string; // Cor da seção de estoque (Hex)
+  productsColor: string; // Cor da seção de produtos (Hex)
+  tablesColor: string; // Cor da seção de mesas (Hex)
+  cashColor: string; // Cor da seção de caixa (Hex)
+  expensesColor: string; // Cor da seção de gastos (Hex)
+  reportsColor: string; // Cor da seção de relatórios (Hex)
+  primaryButtonColor: string; // Cor dos botões principais (Hex)
+  statusColor: string; // Cor de destaque e identificação dos status (Hex)
+  updatedAt: string;
+  updatedById: string;
+}
+
+export interface ResetOperationOptions {
+  resetTables: boolean;
+  resetProducts: boolean;
+  resetStock: boolean;
+  resetSales: boolean;
+  resetExpenses: boolean;
+  resetMovements: boolean;
+  createBackupFirst: boolean;
+  confirmationText: string;
+  reason?: string;
 }

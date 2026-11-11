@@ -18,6 +18,13 @@ import {
   InventoryTransaction,
   AuditLog,
   DebtRecord,
+  SavedReport,
+  ArchivedPeriod,
+  SystemBackup,
+  SystemThemeConfig,
+  ResetOperationOptions,
+  TableExtraCharge,
+  TableTimer,
 } from '../types';
 import {
   INITIAL_DEMO_TENANT,
@@ -30,6 +37,12 @@ import {
   INITIAL_DEMO_CASH_SESSION,
   INITIAL_DEMO_CUSTOMERS,
   INITIAL_DEMO_SUPPLIERS,
+  INITIAL_DEMO_EXPENSES,
+  INITIAL_DEMO_INVENTORY_TRANSACTIONS,
+  INITIAL_DEMO_SAVED_REPORTS,
+  INITIAL_DEMO_ARCHIVED_PERIODS,
+  INITIAL_DEMO_BACKUPS,
+  DEFAULT_THEME_CONFIG,
 } from './mock-data';
 
 const STORAGE_KEYS = {
@@ -46,6 +59,10 @@ const STORAGE_KEYS = {
   FINANCIAL: 'sabor_financial',
   INVENTORY: 'sabor_inventory',
   AUDIT: 'sabor_audit',
+  SAVED_REPORTS: 'sabor_saved_reports',
+  ARCHIVED_PERIODS: 'sabor_archived_periods',
+  BACKUPS: 'sabor_system_backups',
+  THEME_CONFIG: 'sabor_theme_config',
   ACTIVE_TENANT_ID: 'sabor_active_tenant_id',
   ACTIVE_USER_ID: 'sabor_active_user_id',
 };
@@ -83,8 +100,40 @@ export function initLocalStorage(): void {
     setStorage(STORAGE_KEYS.CASH, [INITIAL_DEMO_CASH_SESSION]);
     setStorage(STORAGE_KEYS.CUSTOMERS, INITIAL_DEMO_CUSTOMERS);
     setStorage(STORAGE_KEYS.SUPPLIERS, INITIAL_DEMO_SUPPLIERS);
+    setStorage(STORAGE_KEYS.FINANCIAL, INITIAL_DEMO_EXPENSES);
+    setStorage(STORAGE_KEYS.INVENTORY, INITIAL_DEMO_INVENTORY_TRANSACTIONS);
+    setStorage(STORAGE_KEYS.SAVED_REPORTS, INITIAL_DEMO_SAVED_REPORTS);
+    setStorage(STORAGE_KEYS.ARCHIVED_PERIODS, INITIAL_DEMO_ARCHIVED_PERIODS);
+    setStorage(STORAGE_KEYS.BACKUPS, INITIAL_DEMO_BACKUPS);
+    setStorage(STORAGE_KEYS.THEME_CONFIG, DEFAULT_THEME_CONFIG);
     setStorage(STORAGE_KEYS.ACTIVE_TENANT_ID, INITIAL_DEMO_TENANT.id);
     setStorage(STORAGE_KEYS.ACTIVE_USER_ID, INITIAL_DEMO_USERS[0].id);
+  } else {
+    // Garante que coleções adicionais estejam inicializadas se vazias
+    const fin = getStorage<any[]>(STORAGE_KEYS.FINANCIAL, []);
+    if (fin.length === 0) {
+      setStorage(STORAGE_KEYS.FINANCIAL, INITIAL_DEMO_EXPENSES);
+    }
+    const inv = getStorage<any[]>(STORAGE_KEYS.INVENTORY, []);
+    if (inv.length === 0) {
+      setStorage(STORAGE_KEYS.INVENTORY, INITIAL_DEMO_INVENTORY_TRANSACTIONS);
+    }
+    const reps = getStorage<any[]>(STORAGE_KEYS.SAVED_REPORTS, []);
+    if (reps.length === 0) {
+      setStorage(STORAGE_KEYS.SAVED_REPORTS, INITIAL_DEMO_SAVED_REPORTS);
+    }
+    const archs = getStorage<any[]>(STORAGE_KEYS.ARCHIVED_PERIODS, []);
+    if (archs.length === 0) {
+      setStorage(STORAGE_KEYS.ARCHIVED_PERIODS, INITIAL_DEMO_ARCHIVED_PERIODS);
+    }
+    const bkps = getStorage<any[]>(STORAGE_KEYS.BACKUPS, []);
+    if (bkps.length === 0) {
+      setStorage(STORAGE_KEYS.BACKUPS, INITIAL_DEMO_BACKUPS);
+    }
+    const theme = getStorage<any>(STORAGE_KEYS.THEME_CONFIG, null);
+    if (!theme) {
+      setStorage(STORAGE_KEYS.THEME_CONFIG, DEFAULT_THEME_CONFIG);
+    }
   }
 }
 
@@ -143,6 +192,58 @@ export function setActiveUserId(id: string): void {
   setStorage(STORAGE_KEYS.ACTIVE_USER_ID, id);
 }
 
+// Controle de Permissão Individual de Vendedores (Painel do ADM)
+export function toggleSellerSellingPermission(
+  userId: string,
+  canSell: boolean,
+  adminName: string = 'Administrador Matriz'
+): UserProfile | null {
+  const allUsers = getStorage<UserProfile[]>(STORAGE_KEYS.USERS, INITIAL_DEMO_USERS);
+  const index = allUsers.findIndex((u) => u.id === userId);
+  if (index < 0) return null;
+
+  const target = allUsers[index];
+  const updated: UserProfile = {
+    ...target,
+    canSell,
+    active: canSell,
+    status: canSell ? 'autorizado' : 'bloqueado',
+    updatedAt: new Date().toISOString(),
+  };
+
+  allUsers[index] = updated;
+  setStorage(STORAGE_KEYS.USERS, allUsers);
+
+  // Registro de Auditoria Administrativa Obrigatório
+  addAuditLog({
+    tenantId: target.tenantId,
+    userId: 'adm',
+    userName: adminName,
+    action: canSell ? 'AUTORIZOU_VENDEDOR' : 'BLOQUEOU_VENDEDOR',
+    details: `${canSell ? 'Permissão de venda LIGADA (AUTORIZADO)' : 'Permissão de venda DESLIGADA (BLOQUEADO)'} para o ${target.name}.`,
+  });
+
+  // Notifica todos os terminais e janelas ativas
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(
+      new CustomEvent('sabor_local_sync', {
+        detail: { action: 'seller_permission_changed', userId, canSell },
+      })
+    );
+  }
+
+  return updated;
+}
+
+export function isSellerAuthorizedToSell(userId?: string): boolean {
+  if (!userId) return false;
+  const allUsers = getStorage<UserProfile[]>(STORAGE_KEYS.USERS, INITIAL_DEMO_USERS);
+  const user = allUsers.find((u) => u.id === userId);
+  if (!user) return false;
+  if (user.role === 'admin') return true;
+  return user.canSell !== false && user.status !== 'bloqueado';
+}
+
 // Categories
 export function getCategories(tenantId: string): Category[] {
   const all = getStorage<Category[]>(STORAGE_KEYS.CATEGORIES, INITIAL_DEMO_CATEGORIES);
@@ -193,8 +294,127 @@ export function saveProduct(product: Product): void {
 }
 
 export function deleteProduct(id: string): void {
+  deleteProductSafely(id);
+}
+
+// Exclusão segura de produtos: preserva produtos com histórico em vendas, desativando do cardápio ativo
+export function deleteProductSafely(id: string): { success: boolean; actionTaken: 'deleted' | 'deactivated'; message: string } {
   const all = getStorage<Product[]>(STORAGE_KEYS.PRODUCTS, INITIAL_DEMO_PRODUCTS);
-  setStorage(STORAGE_KEYS.PRODUCTS, all.filter((p) => p.id !== id));
+  const prod = all.find((p) => p.id === id);
+  if (!prod) return { success: false, actionTaken: 'deleted', message: 'Produto não encontrado.' };
+
+  const orders = getStorage<Order[]>(STORAGE_KEYS.ORDERS, INITIAL_DEMO_ORDERS);
+  const hasPastOrders = orders.some((o) => o.items?.some((i) => i.productId === id));
+
+  if (hasPastOrders) {
+    // Preserva o produto no histórico, mas desativa do cardápio ativo
+    prod.active = false;
+    prod.updatedAt = new Date().toISOString();
+    setStorage(STORAGE_KEYS.PRODUCTS, all);
+    addAuditLog({
+      tenantId: prod.tenantId,
+      userId: 'admin',
+      userName: 'Administrador',
+      action: 'DESATIVOU_PRODUTO',
+      details: `Produto "${prod.name}" desativado do cardápio ativo (preservado no histórico de vendas e movimentações)`,
+    });
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('sabor_local_sync', { detail: { action: 'product_deactivated', id } }));
+    }
+    return {
+      success: true,
+      actionTaken: 'deactivated',
+      message: `O produto "${prod.name}" possui vendas registradas. Ele foi desativado do cardápio ativo e seu histórico foi 100% preservado.`,
+    };
+  } else {
+    // Produto novo sem vendas pode ser excluído diretamente
+    const filtered = all.filter((p) => p.id !== id);
+    setStorage(STORAGE_KEYS.PRODUCTS, filtered);
+    addAuditLog({
+      tenantId: prod.tenantId,
+      userId: 'admin',
+      userName: 'Administrador',
+      action: 'EXCLUIU_PRODUTO',
+      details: `Removeu o produto "${prod.name}" da base de dados`,
+    });
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('sabor_local_sync', { detail: { action: 'product_deleted', id } }));
+    }
+    return {
+      success: true,
+      actionTaken: 'deleted',
+      message: `Produto "${prod.name}" removido com sucesso.`,
+    };
+  }
+}
+
+// Atualização e correção de estoque pelo ADM com histórico obrigatório
+export function updateProductStock(
+  productId: string,
+  newStock: number,
+  reason: string,
+  adminName: string = 'Administrador',
+  adminId: string = 'admin',
+  type: 'adjustment' | 'purchase' | 'waste' = 'adjustment'
+): { success: boolean; product?: Product; error?: string } {
+  const all = getStorage<Product[]>(STORAGE_KEYS.PRODUCTS, INITIAL_DEMO_PRODUCTS);
+  const index = all.findIndex((p) => p.id === productId);
+  if (index < 0) return { success: false, error: 'Produto não encontrado.' };
+
+  const prod = all[index];
+  const previousStock = prod.stockQuantity ?? 0;
+  const quantityDiff = newStock - previousStock;
+
+  all[index] = {
+    ...prod,
+    stockQuantity: Math.max(0, newStock),
+    updatedAt: new Date().toISOString(),
+  };
+  setStorage(STORAGE_KEYS.PRODUCTS, all);
+
+  // Registra movimentação de estoque
+  const transaction: InventoryTransaction = {
+    id: `inv-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+    tenantId: prod.tenantId,
+    productId: prod.id,
+    productName: prod.name,
+    type,
+    quantity: Math.abs(quantityDiff),
+    previousStock,
+    newStock,
+    reason: reason || (type === 'adjustment' ? 'Correção manual pelo ADM' : type === 'purchase' ? 'Entrada de mercadoria' : 'Ajuste de perda'),
+    userId: adminId,
+    userName: adminName,
+    createdAt: new Date().toISOString(),
+  };
+  addInventoryTransaction(transaction);
+
+  // Registro de Auditoria
+  addAuditLog({
+    tenantId: prod.tenantId,
+    userId: adminId,
+    userName: adminName,
+    action: 'AJUSTE_ESTOQUE',
+    details: `Alterou estoque de "${prod.name}": anterior ${previousStock} ➔ novo ${newStock}. Motivo: ${reason}`,
+  });
+
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('sabor_local_sync', { detail: { action: 'stock_adjusted', productId } }));
+  }
+  return { success: true, product: all[index] };
+}
+
+// Movimentações de Estoque
+export function getInventoryTransactions(tenantId: string): InventoryTransaction[] {
+  const all = getStorage<InventoryTransaction[]>(STORAGE_KEYS.INVENTORY, INITIAL_DEMO_INVENTORY_TRANSACTIONS);
+  return all.filter((i) => i.tenantId === tenantId);
+}
+
+export function addInventoryTransaction(trans: InventoryTransaction): void {
+  const all = getStorage<InventoryTransaction[]>(STORAGE_KEYS.INVENTORY, INITIAL_DEMO_INVENTORY_TRANSACTIONS);
+  all.unshift(trans);
+  if (all.length > 1000) all.length = 1000;
+  setStorage(STORAGE_KEYS.INVENTORY, all);
 }
 
 // Validação de estoque oficial na Matriz antes de autorizar a venda
@@ -232,23 +452,41 @@ export function deductStockForOrder(
     const idx = all.findIndex((p) => p.id === item.productId && p.tenantId === tenantId);
     if (idx >= 0) {
       const prev = all[idx].stockQuantity ?? 0;
+      const newStock = Math.max(0, prev - item.quantity);
       all[idx] = {
         ...all[idx],
-        stockQuantity: Math.max(0, prev - item.quantity),
+        stockQuantity: newStock,
         updatedAt: new Date().toISOString(),
       };
+
+      // Registra baixa automática de venda
+      addInventoryTransaction({
+        id: `inv-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+        tenantId,
+        productId: item.productId,
+        productName: item.productName,
+        type: 'sale',
+        quantity: item.quantity,
+        previousStock: prev,
+        newStock,
+        reason: 'Baixa automática por venda confirmada',
+        userId: 'sistema',
+        userName: 'Ponto de Venda',
+        createdAt: new Date().toISOString(),
+      });
     }
   }
 
   setStorage(STORAGE_KEYS.PRODUCTS, all);
-  // Dispara evento para atualização imediata de todos os componentes da interface
-  window.dispatchEvent(
-    new CustomEvent('sabor_local_sync', { detail: { action: 'stock_updated', tenantId } })
-  );
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(
+      new CustomEvent('sabor_local_sync', { detail: { action: 'stock_updated', tenantId } })
+    );
+  }
   return { success: true };
 }
 
-// Tables
+// Tables (Ilimitadas e Dinâmicas)
 export function getTables(tenantId: string): RestaurantTable[] {
   const all = getStorage<RestaurantTable[]>(STORAGE_KEYS.TABLES, INITIAL_DEMO_TABLES);
   return all.filter((t) => t.tenantId === tenantId);
@@ -263,6 +501,442 @@ export function saveTable(table: RestaurantTable): void {
     all.push(table);
   }
   setStorage(STORAGE_KEYS.TABLES, all);
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('sabor_local_sync', { detail: { action: 'table_saved', tableId: table.id } }));
+  }
+}
+
+// Exclusão de Mesas com Validação Obrigatória de Pedidos Ativos
+export function deleteTable(id: string): { success: boolean; error?: string } {
+  const all = getStorage<RestaurantTable[]>(STORAGE_KEYS.TABLES, INITIAL_DEMO_TABLES);
+  const target = all.find((t) => t.id === id);
+  if (!target) return { success: false, error: 'Mesa não encontrada.' };
+
+  // Bloqueio rigoroso: Não permite excluir mesas com pedidos ativos ou em atendimento
+  if (target.status === 'occupied' || target.status === 'closing' || (target.currentTotal && target.currentTotal > 0)) {
+    return {
+      success: false,
+      error: `Não é permitido excluir a ${target.label || `Mesa ${target.number}`} enquanto houver pedido ativo ou conta em aberto (Total: ${target.currentTotal || 0}). Encerre ou transfira o atendimento antes de excluir.`,
+    };
+  }
+
+  const filtered = all.filter((t) => t.id !== id);
+  setStorage(STORAGE_KEYS.TABLES, filtered);
+  addAuditLog({
+    tenantId: target.tenantId,
+    userId: 'admin',
+    userName: 'Administrador',
+    action: 'EXCLUIU_MESA',
+    details: `Excluiu a ${target.label || `Mesa ${target.number}`} do salão`,
+  });
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('sabor_local_sync', { detail: { action: 'table_deleted', id } }));
+  }
+  return { success: true };
+}
+
+// Exclusão de Mesas em Lote pelo ADM
+export function deleteTablesBatch(ids: string[]): { successCount: number; blockedCount: number; blockedReasons: string[] } {
+  const all = getStorage<RestaurantTable[]>(STORAGE_KEYS.TABLES, INITIAL_DEMO_TABLES);
+  let successCount = 0;
+  let blockedCount = 0;
+  const blockedReasons: string[] = [];
+  const idsToDelete = new Set<string>();
+
+  for (const id of ids) {
+    const table = all.find((t) => t.id === id);
+    if (!table) continue;
+    if (table.status === 'occupied' || table.status === 'closing' || (table.currentTotal && table.currentTotal > 0)) {
+      blockedCount++;
+      blockedReasons.push(`${table.label || `Mesa ${table.number}`} está ocupada ou possui saldo em aberto (${table.currentTotal.toFixed(2)})`);
+    } else {
+      idsToDelete.add(id);
+      successCount++;
+    }
+  }
+
+  if (idsToDelete.size > 0) {
+    const remaining = all.filter((t) => !idsToDelete.has(t.id));
+    setStorage(STORAGE_KEYS.TABLES, remaining);
+    addAuditLog({
+      tenantId: all[0]?.tenantId || 'tenant-01',
+      userId: 'admin',
+      userName: 'Administrador',
+      action: 'EXCLUIU_MESAS_LOTE',
+      details: `Excluiu ${successCount} mesa(s) livre(s) em lote. ${blockedCount} mesa(s) bloqueada(s).`,
+    });
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('sabor_local_sync', { detail: { action: 'tables_batch_deleted' } }));
+    }
+  }
+
+  return { successCount, blockedCount, blockedReasons };
+}
+
+// Excluir Todas as Mesas Livres pelo ADM
+export function deleteAllAvailableTables(tenantId: string): { successCount: number; blockedCount: number } {
+  const all = getStorage<RestaurantTable[]>(STORAGE_KEYS.TABLES, INITIAL_DEMO_TABLES);
+  const availableIds = all
+    .filter((t) => t.tenantId === tenantId && t.status === 'available' && (!t.currentTotal || t.currentTotal <= 0))
+    .map((t) => t.id);
+
+  const blockedCount = all.filter((t) => t.tenantId === tenantId && (t.status === 'occupied' || t.status === 'closing' || (t.currentTotal && t.currentTotal > 0))).length;
+
+  if (availableIds.length > 0) {
+    const remaining = all.filter((t) => !availableIds.includes(t.id));
+    setStorage(STORAGE_KEYS.TABLES, remaining);
+    addAuditLog({
+      tenantId,
+      userId: 'admin',
+      userName: 'Administrador',
+      action: 'LIMPOU_MESAS_LIVRES',
+      details: `Removeu todas as ${availableIds.length} mesas disponíveis do salão. ${blockedCount} mesas ocupadas preservadas.`,
+    });
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('sabor_local_sync', { detail: { action: 'tables_cleared' } }));
+    }
+  }
+
+  return { successCount: availableIds.length, blockedCount };
+}
+
+// ==========================================
+// 2. LANÇAMENTO DE VALORES EXTRAS NA MESA
+// ==========================================
+
+export function addTableExtraCharge(
+  tenantId: string,
+  tableId: string,
+  chargeData: { amount: number; description: string; isCashWithdrawal: boolean },
+  adminUser: { id: string; name: string }
+): { success: boolean; charge?: TableExtraCharge; table?: RestaurantTable; error?: string } {
+  const all = getStorage<RestaurantTable[]>(STORAGE_KEYS.TABLES, INITIAL_DEMO_TABLES);
+  const index = all.findIndex((t) => t.id === tableId);
+  if (index < 0) return { success: false, error: 'Mesa não encontrada.' };
+
+  const table = all[index];
+  const chargeId = `extra-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+  let financialTxId: string | undefined;
+
+  // Se houve saída de dinheiro da gaveta do caixa (ex: entregue ao cliente para lazer do filho)
+  if (chargeData.isCashWithdrawal) {
+    financialTxId = `tx-extra-${Date.now()}`;
+    const financialTx: FinancialTransaction = {
+      id: financialTxId,
+      tenantId,
+      type: 'withdrawal',
+      category: 'Adiantamento ao Cliente',
+      description: `Valor entregue ao cliente (${table.label || `Mesa ${table.number}`}): ${chargeData.description}`,
+      amount: chargeData.amount,
+      date: new Date().toISOString(),
+      paid: true,
+      paymentMethod: 'dinheiro',
+      userId: adminUser.id,
+      userName: adminUser.name,
+      notes: `Lançamento extra vinculado à ${table.label || `Mesa ${table.number}`}`,
+      createdAt: new Date().toISOString(),
+    };
+
+    saveExpense(financialTx);
+  }
+
+  const newCharge: TableExtraCharge = {
+    id: chargeId,
+    tableId,
+    tableNumberOrName: table.label || `Mesa ${table.number}`,
+    amount: chargeData.amount,
+    description: chargeData.description,
+    isCashWithdrawal: chargeData.isCashWithdrawal,
+    createdAt: new Date().toISOString(),
+    createdById: adminUser.id,
+    createdByName: adminUser.name,
+    financialTxId,
+    status: 'active',
+  };
+
+  const existingCharges = table.extraCharges || [];
+  const updatedCharges = [...existingCharges, newCharge];
+
+  // Recalcula totais
+  const activeCharges = updatedCharges.filter((c) => c.status === 'active');
+  const extraTotal = activeCharges.reduce((acc, c) => acc + c.amount, 0);
+  const productsTotal = table.productsTotal || (table.currentTotal - (table.extraTotal || 0)) || 0;
+  const currentTotal = productsTotal + extraTotal;
+
+  // Se mesa estava livre, marca como ocupada com o lançamento
+  const newStatus = table.status === 'available' ? 'occupied' : table.status;
+  const openedAt = table.openedAt || new Date().toISOString();
+
+  const updatedTable: RestaurantTable = {
+    ...table,
+    status: newStatus,
+    openedAt,
+    productsTotal,
+    extraTotal,
+    currentTotal,
+    extraCharges: updatedCharges,
+  };
+
+  all[index] = updatedTable;
+  setStorage(STORAGE_KEYS.TABLES, all);
+
+  addAuditLog({
+    tenantId,
+    userId: adminUser.id,
+    userName: adminUser.name,
+    action: 'LANCAMENTO_EXTRA_MESA',
+    details: `Adicionou valor extra de R$ ${chargeData.amount.toFixed(2)} (${chargeData.description}) à ${table.label || `Mesa ${table.number}`}.${chargeData.isCashWithdrawal ? ' Registrada saída em dinheiro no caixa.' : ''}`,
+  });
+
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('sabor_local_sync', { detail: { action: 'extra_charge_added', tableId } }));
+  }
+
+  return { success: true, charge: newCharge, table: updatedTable };
+}
+
+export function cancelTableExtraCharge(
+  tenantId: string,
+  tableId: string,
+  chargeId: string,
+  cancellationReason: string,
+  adminUser: { id: string; name: string }
+): { success: boolean; table?: RestaurantTable; error?: string } {
+  const all = getStorage<RestaurantTable[]>(STORAGE_KEYS.TABLES, INITIAL_DEMO_TABLES);
+  const index = all.findIndex((t) => t.id === tableId);
+  if (index < 0) return { success: false, error: 'Mesa não encontrada.' };
+
+  const table = all[index];
+  const existingCharges = table.extraCharges || [];
+  const chargeIndex = existingCharges.findIndex((c) => c.id === chargeId);
+  if (chargeIndex < 0) return { success: false, error: 'Lançamento extra não encontrado.' };
+
+  const targetCharge = existingCharges[chargeIndex];
+  if (targetCharge.status === 'cancelled') {
+    return { success: false, error: 'Este lançamento extra já foi cancelado.' };
+  }
+
+  // Se houve saída de caixa, estorna a saída no caixa
+  if (targetCharge.isCashWithdrawal && targetCharge.financialTxId) {
+    const cashSessions = getCashSessions(tenantId);
+    const active = cashSessions.find((c) => c.status === 'open');
+    if (active) {
+      active.totalWithdrawals = Math.max(0, (active.totalWithdrawals || 0) - targetCharge.amount);
+      active.expectedAmount = (active.expectedAmount || 0) + targetCharge.amount;
+      saveCashSession(active);
+    }
+    deleteExpense(targetCharge.financialTxId);
+  }
+
+  const updatedCharges = [...existingCharges];
+  updatedCharges[chargeIndex] = {
+    ...targetCharge,
+    status: 'cancelled',
+    cancelledAt: new Date().toISOString(),
+    cancelledBy: adminUser.name,
+    cancellationReason: cancellationReason || 'Cancelado pelo ADM',
+  };
+
+  const activeCharges = updatedCharges.filter((c) => c.status === 'active');
+  const extraTotal = activeCharges.reduce((acc, c) => acc + c.amount, 0);
+  const productsTotal = table.productsTotal || 0;
+  const currentTotal = productsTotal + extraTotal;
+
+  const updatedTable: RestaurantTable = {
+    ...table,
+    extraTotal,
+    currentTotal,
+    extraCharges: updatedCharges,
+  };
+
+  all[index] = updatedTable;
+  setStorage(STORAGE_KEYS.TABLES, all);
+
+  addAuditLog({
+    tenantId,
+    userId: adminUser.id,
+    userName: adminUser.name,
+    action: 'CANCELOU_EXTRA_MESA',
+    details: `Cancelou lançamento extra de R$ ${targetCharge.amount.toFixed(2)} da ${table.label || `Mesa ${table.number}`}. Motivo: ${cancellationReason}`,
+  });
+
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('sabor_local_sync', { detail: { action: 'extra_charge_cancelled', tableId } }));
+  }
+
+  return { success: true, table: updatedTable };
+}
+
+// ==========================================
+// 4. ALERTA E TEMPORIZADOR POR MESA
+// ==========================================
+
+export function setTableTimer(
+  tenantId: string,
+  tableId: string,
+  durationMinutes: number,
+  adminUser: { id: string; name: string }
+): RestaurantTable | null {
+  const all = getStorage<RestaurantTable[]>(STORAGE_KEYS.TABLES, INITIAL_DEMO_TABLES);
+  const index = all.findIndex((t) => t.id === tableId);
+  if (index < 0) return null;
+
+  const table = all[index];
+  const now = new Date();
+  const targetTime = new Date(now.getTime() + durationMinutes * 60000).toISOString();
+
+  const timer: TableTimer = {
+    durationMinutes,
+    startedAt: now.toISOString(),
+    targetTime,
+    isPaused: false,
+    isExpired: false,
+    acknowledged: false,
+    setById: adminUser.id,
+    setByName: adminUser.name,
+  };
+
+  const updatedTable: RestaurantTable = {
+    ...table,
+    timer,
+  };
+
+  all[index] = updatedTable;
+  setStorage(STORAGE_KEYS.TABLES, all);
+
+  addAuditLog({
+    tenantId,
+    userId: adminUser.id,
+    userName: adminUser.name,
+    action: 'CONFIGUROU_TEMPORIZADOR_MESA',
+    details: `Definiu alerta de ${durationMinutes} min para a ${table.label || `Mesa ${table.number}`}`,
+  });
+
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('sabor_local_sync', { detail: { action: 'timer_set', tableId } }));
+  }
+
+  return updatedTable;
+}
+
+export function pauseResumeTableTimer(tenantId: string, tableId: string): RestaurantTable | null {
+  const all = getStorage<RestaurantTable[]>(STORAGE_KEYS.TABLES, INITIAL_DEMO_TABLES);
+  const index = all.findIndex((t) => t.id === tableId);
+  if (index < 0 || !all[index].timer) return null;
+
+  const table = all[index];
+  const timer = table.timer!;
+  const now = Date.now();
+  const target = new Date(timer.targetTime).getTime();
+
+  let updatedTimer: TableTimer;
+
+  if (timer.isPaused) {
+    // Retomar contagem
+    const remaining = (timer.pausedRemainingSeconds || 0) * 1000;
+    const newTarget = new Date(now + remaining).toISOString();
+    updatedTimer = {
+      ...timer,
+      isPaused: false,
+      targetTime: newTarget,
+      pausedRemainingSeconds: undefined,
+    };
+  } else {
+    // Pausar contagem
+    const remainingSeconds = Math.max(0, Math.round((target - now) / 1000));
+    updatedTimer = {
+      ...timer,
+      isPaused: true,
+      pausedRemainingSeconds: remainingSeconds,
+    };
+  }
+
+  const updatedTable: RestaurantTable = { ...table, timer: updatedTimer };
+  all[index] = updatedTable;
+  setStorage(STORAGE_KEYS.TABLES, all);
+
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('sabor_local_sync', { detail: { action: 'timer_updated', tableId } }));
+  }
+
+  return updatedTable;
+}
+
+export function resetTableTimer(tenantId: string, tableId: string): RestaurantTable | null {
+  const all = getStorage<RestaurantTable[]>(STORAGE_KEYS.TABLES, INITIAL_DEMO_TABLES);
+  const index = all.findIndex((t) => t.id === tableId);
+  if (index < 0 || !all[index].timer) return null;
+
+  const table = all[index];
+  const timer = table.timer!;
+  const now = new Date();
+  const targetTime = new Date(now.getTime() + timer.durationMinutes * 60000).toISOString();
+
+  const updatedTimer: TableTimer = {
+    ...timer,
+    startedAt: now.toISOString(),
+    targetTime,
+    isPaused: false,
+    isExpired: false,
+    acknowledged: false,
+    pausedRemainingSeconds: undefined,
+  };
+
+  const updatedTable: RestaurantTable = { ...table, timer: updatedTimer };
+  all[index] = updatedTable;
+  setStorage(STORAGE_KEYS.TABLES, all);
+
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('sabor_local_sync', { detail: { action: 'timer_reset', tableId } }));
+  }
+
+  return updatedTable;
+}
+
+export function cancelTableTimer(tenantId: string, tableId: string): RestaurantTable | null {
+  const all = getStorage<RestaurantTable[]>(STORAGE_KEYS.TABLES, INITIAL_DEMO_TABLES);
+  const index = all.findIndex((t) => t.id === tableId);
+  if (index < 0) return null;
+
+  const table = all[index];
+  const updatedTable: RestaurantTable = {
+    ...table,
+    timer: undefined,
+  };
+
+  all[index] = updatedTable;
+  setStorage(STORAGE_KEYS.TABLES, all);
+
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('sabor_local_sync', { detail: { action: 'timer_cancelled', tableId } }));
+  }
+
+  return updatedTable;
+}
+
+export function acknowledgeTableTimer(tenantId: string, tableId: string): RestaurantTable | null {
+  const all = getStorage<RestaurantTable[]>(STORAGE_KEYS.TABLES, INITIAL_DEMO_TABLES);
+  const index = all.findIndex((t) => t.id === tableId);
+  if (index < 0 || !all[index].timer) return null;
+
+  const table = all[index];
+  const updatedTable: RestaurantTable = {
+    ...table,
+    timer: {
+      ...table.timer!,
+      acknowledged: true,
+      isExpired: true,
+    },
+  };
+
+  all[index] = updatedTable;
+  setStorage(STORAGE_KEYS.TABLES, all);
+
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('sabor_local_sync', { detail: { action: 'timer_acknowledged', tableId } }));
+  }
+
+  return updatedTable;
 }
 
 // Orders
@@ -424,6 +1098,87 @@ export function saveCashSession(session: CashRegisterSession): void {
   setStorage(STORAGE_KEYS.CASH, all);
 }
 
+// Gastos e Despesas do Estabelecimento (Controle Integrado ao Caixa Geral)
+export function getExpenses(tenantId: string): FinancialTransaction[] {
+  const all = getStorage<FinancialTransaction[]>(STORAGE_KEYS.FINANCIAL, INITIAL_DEMO_EXPENSES);
+  return all.filter((f) => f.tenantId === tenantId && (f.type === 'expense_fixed' || f.type === 'expense_variable' || f.type === 'withdrawal'));
+}
+
+export function saveExpense(expense: FinancialTransaction): void {
+  const all = getStorage<FinancialTransaction[]>(STORAGE_KEYS.FINANCIAL, INITIAL_DEMO_EXPENSES);
+  const index = all.findIndex((f) => f.id === expense.id);
+  if (index >= 0) {
+    all[index] = expense;
+  } else {
+    all.unshift(expense);
+  }
+  setStorage(STORAGE_KEYS.FINANCIAL, all);
+
+  // Se o gasto foi pago em dinheiro e houver sessão aberta de caixa, registra saída no caixa
+  if (expense.paymentMethod === 'dinheiro') {
+    const cashSessions = getCashSessions(expense.tenantId);
+    const active = cashSessions.find((c) => c.status === 'open');
+    if (active) {
+      active.totalWithdrawals = (active.totalWithdrawals || 0) + expense.amount;
+      active.expectedAmount = Math.max(0, (active.expectedAmount || 0) - expense.amount);
+      saveCashSession(active);
+    }
+  }
+
+  addAuditLog({
+    tenantId: expense.tenantId,
+    userId: expense.userId || 'admin',
+    userName: expense.userName || 'Administrador',
+    action: 'REGISTRO_GASTO',
+    details: `Registrou despesa de ${expense.amount.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}: "${expense.description}" (${expense.category})`,
+  });
+
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('sabor_local_sync', { detail: { action: 'expense_saved', id: expense.id } }));
+  }
+}
+
+export function deleteExpense(id: string): void {
+  const all = getStorage<FinancialTransaction[]>(STORAGE_KEYS.FINANCIAL, INITIAL_DEMO_EXPENSES);
+  const target = all.find((f) => f.id === id);
+  if (target) {
+    const filtered = all.filter((f) => f.id !== id);
+    setStorage(STORAGE_KEYS.FINANCIAL, filtered);
+    addAuditLog({
+      tenantId: target.tenantId,
+      userId: 'admin',
+      userName: 'Administrador',
+      action: 'REMOVEU_GASTO',
+      details: `Removeu gasto de ${target.amount.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' })}: "${target.description}"`,
+    });
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('sabor_local_sync', { detail: { action: 'expense_deleted', id } }));
+    }
+  }
+}
+
+// SEPARAÇÃO TOTAL ENTRE VENDEDOR E CAIXA GERAL
+// Retorna estritamente as métricas do próprio vendedor logado (sem acesso a dados globais)
+export function getSellerSalesSummary(tenantId: string, sellerId?: string, sellerName?: string) {
+  const orders = getOrders(tenantId);
+  const myOrders = orders.filter((o) => {
+    if (o.status === 'cancelled') return false;
+    if (sellerId && o.waiterId === sellerId) return true;
+    if (sellerName && o.waiterName?.toLowerCase() === sellerName.toLowerCase()) return true;
+    return false;
+  });
+
+  const totalSold = myOrders.filter((o) => o.paid).reduce((acc, o) => acc + (o.total || 0), 0);
+  const activeOrders = myOrders.filter((o) => o.status === 'received' || o.status === 'preparing' || o.status === 'ready');
+
+  return {
+    salesCount: myOrders.filter((o) => o.paid).length,
+    totalSold,
+    activeOrdersCount: activeOrders.length,
+    orders: myOrders,
+  };
+}
+
 // Customers & Suppliers
 export function getCustomers(tenantId: string): Customer[] {
   const all = getStorage<Customer[]>(STORAGE_KEYS.CUSTOMERS, INITIAL_DEMO_CUSTOMERS);
@@ -499,4 +1254,506 @@ export function reloadDemoData(tenantId: string): void {
   setStorage(STORAGE_KEYS.CASH, [INITIAL_DEMO_CASH_SESSION]);
   setStorage(STORAGE_KEYS.CUSTOMERS, INITIAL_DEMO_CUSTOMERS);
   setStorage(STORAGE_KEYS.SUPPLIERS, INITIAL_DEMO_SUPPLIERS);
+}
+
+// ==========================================
+// 1. SALVAR BALANÇOS E RELATÓRIOS
+// ==========================================
+
+export function getSavedReports(tenantId: string): SavedReport[] {
+  const all = getStorage<SavedReport[]>(STORAGE_KEYS.SAVED_REPORTS, []);
+  return all.filter((r) => r.tenantId === tenantId);
+}
+
+export function saveReport(report: SavedReport): void {
+  const all = getStorage<SavedReport[]>(STORAGE_KEYS.SAVED_REPORTS, []);
+  const index = all.findIndex((r) => r.id === report.id);
+  if (index >= 0) {
+    all[index] = report;
+  } else {
+    all.unshift(report);
+  }
+  setStorage(STORAGE_KEYS.SAVED_REPORTS, all);
+
+  addAuditLog({
+    tenantId: report.tenantId,
+    userId: report.createdById,
+    userName: report.createdByName,
+    action: 'SALVAR_RELATORIO',
+    details: `Relatório salvo: "${report.title}" (${report.type}) para o período ${report.startDate} a ${report.endDate}`,
+  });
+}
+
+export function deleteSavedReport(id: string): void {
+  const all = getStorage<SavedReport[]>(STORAGE_KEYS.SAVED_REPORTS, []);
+  const target = all.find((r) => r.id === id);
+  const filtered = all.filter((r) => r.id !== id);
+  setStorage(STORAGE_KEYS.SAVED_REPORTS, filtered);
+
+  if (target) {
+    addAuditLog({
+      tenantId: target.tenantId,
+      userId: 'system',
+      userName: 'Administrador',
+      action: 'EXCLUIR_RELATORIO',
+      details: `Relatório "${target.title}" removido`,
+    });
+  }
+}
+
+// ==========================================
+// 2. ARQUIVAMENTO DE PERÍODOS
+// ==========================================
+
+export function getArchivedPeriods(tenantId: string): ArchivedPeriod[] {
+  const all = getStorage<ArchivedPeriod[]>(STORAGE_KEYS.ARCHIVED_PERIODS, []);
+  return all.filter((a) => a.tenantId === tenantId);
+}
+
+export function archivePeriod(period: ArchivedPeriod): void {
+  const all = getStorage<ArchivedPeriod[]>(STORAGE_KEYS.ARCHIVED_PERIODS, []);
+  const index = all.findIndex((a) => a.id === period.id);
+  if (index >= 0) {
+    all[index] = { ...period, isProtected: true };
+  } else {
+    all.unshift({ ...period, isProtected: true });
+  }
+  setStorage(STORAGE_KEYS.ARCHIVED_PERIODS, all);
+
+  addAuditLog({
+    tenantId: period.tenantId,
+    userId: period.archivedById,
+    userName: period.archivedByName,
+    action: 'ARQUIVAR_PERIODO',
+    details: `Período arquivado com sucesso: "${period.label}" (${period.startDate} a ${period.endDate}). Receita preservada: R$ ${period.metrics.totalRevenue.toFixed(2)}`,
+  });
+}
+
+// ==========================================
+// 4. CENTRAL DE BACKUPS E RESTAURAÇÃO
+// ==========================================
+
+function generateSimpleChecksum(content: string): string {
+  let hash = 0;
+  for (let i = 0; i < content.length; i++) {
+    const char = content.charCodeAt(i);
+    hash = (hash << 5) - hash + char;
+    hash |= 0;
+  }
+  return `sha256-${Math.abs(hash).toString(16)}${Date.now().toString(16)}`;
+}
+
+export function getSystemBackups(tenantId: string): SystemBackup[] {
+  const all = getStorage<SystemBackup[]>(STORAGE_KEYS.BACKUPS, []);
+  return all.filter((b) => b.tenantId === tenantId);
+}
+
+export function createSystemBackup(
+  tenantId: string,
+  name: string,
+  adminUser: { id: string; name: string },
+  scopePeriod?: string
+): SystemBackup {
+  const tenants = getTenants();
+  const tenant = tenants.find((t) => t.id === tenantId) || INITIAL_DEMO_TENANT;
+  const products = getProducts(tenantId);
+  const categories = getCategories(tenantId);
+  const tables = getTables(tenantId);
+  const orders = getOrders(tenantId);
+  const expenses = getExpenses(tenantId);
+  const cashSessions = getStorage<CashRegisterSession[]>(STORAGE_KEYS.CASH, []).filter(
+    (c) => c.tenantId === tenantId
+  );
+  const inventoryTransactions = getInventoryTransactions(tenantId);
+  const users = getUsers(tenantId);
+  const savedReports = getSavedReports(tenantId);
+  const archivedPeriods = getArchivedPeriods(tenantId);
+  const themeConfig = getThemeConfig(tenantId);
+
+  const payload = {
+    tenant,
+    products,
+    categories,
+    tables,
+    orders,
+    expenses,
+    cashSessions,
+    inventoryTransactions,
+    users,
+    savedReports,
+    archivedPeriods,
+    themeConfig,
+  };
+
+  const payloadStr = JSON.stringify(payload);
+  const sizeBytes = new Blob([payloadStr]).size;
+  const checksum = generateSimpleChecksum(payloadStr);
+
+  const now = new Date();
+  const dateStr = now.toISOString().replace(/[-:T]/g, '').slice(0, 14);
+  const backupId = `BKP-${dateStr}`;
+
+  const photosCount = products.filter((p) => Boolean(p.imageUrl)).length;
+
+  const newBackup: SystemBackup = {
+    id: backupId,
+    tenantId,
+    name: name || `Backup Manual ${now.toLocaleDateString('pt-BR')} ${now.toLocaleTimeString('pt-BR')}`,
+    createdAt: now.toISOString(),
+    createdById: adminUser.id,
+    createdByName: adminUser.name,
+    scopePeriod: scopePeriod || `Completo (${now.toLocaleDateString('pt-BR')})`,
+    version: '1.0.0',
+    sizeBytes,
+    stats: {
+      ordersCount: orders.length,
+      productsCount: products.length,
+      tablesCount: tables.length,
+      expensesCount: expenses.length,
+      inventoryTxCount: inventoryTransactions.length,
+      usersCount: users.length,
+      photosCount,
+    },
+    payload,
+    checksum,
+    cloudSynced: true,
+  };
+
+  const all = getStorage<SystemBackup[]>(STORAGE_KEYS.BACKUPS, []);
+  all.unshift(newBackup);
+  setStorage(STORAGE_KEYS.BACKUPS, all);
+
+  addAuditLog({
+    tenantId,
+    userId: adminUser.id,
+    userName: adminUser.name,
+    action: 'CRIAR_BACKUP',
+    details: `Backup criado: "${newBackup.name}" (${backupId}). Tamanho: ${(sizeBytes / 1024).toFixed(1)} KB`,
+  });
+
+  return newBackup;
+}
+
+export function restoreSystemBackup(
+  backup: SystemBackup,
+  adminUser: { id: string; name: string }
+): { success: boolean; message: string } {
+  if (!backup || !backup.payload) {
+    return { success: false, message: 'Arquivo de backup corrompido ou payload ausente.' };
+  }
+
+  const { tenantId, payload } = backup;
+
+  try {
+    // 1. Restaura produtos
+    if (Array.isArray(payload.products)) {
+      const allProd = getStorage<Product[]>(STORAGE_KEYS.PRODUCTS, []);
+      const otherProds = allProd.filter((p) => p.tenantId !== tenantId);
+      setStorage(STORAGE_KEYS.PRODUCTS, [...otherProds, ...payload.products]);
+    }
+
+    // 2. Restaura categorias
+    if (Array.isArray(payload.categories)) {
+      const allCat = getStorage<Category[]>(STORAGE_KEYS.CATEGORIES, []);
+      const otherCats = allCat.filter((c) => c.tenantId !== tenantId);
+      setStorage(STORAGE_KEYS.CATEGORIES, [...otherCats, ...payload.categories]);
+    }
+
+    // 3. Restaura mesas
+    if (Array.isArray(payload.tables)) {
+      const allTables = getStorage<RestaurantTable[]>(STORAGE_KEYS.TABLES, []);
+      const otherTables = allTables.filter((t) => t.tenantId !== tenantId);
+      setStorage(STORAGE_KEYS.TABLES, [...otherTables, ...payload.tables]);
+    }
+
+    // 4. Restaura pedidos (sem duplicar)
+    if (Array.isArray(payload.orders)) {
+      const allOrders = getStorage<Order[]>(STORAGE_KEYS.ORDERS, []);
+      const otherOrders = allOrders.filter((o) => o.tenantId !== tenantId);
+      setStorage(STORAGE_KEYS.ORDERS, [...otherOrders, ...payload.orders]);
+    }
+
+    // 5. Restaura despesas
+    if (Array.isArray(payload.expenses)) {
+      const allExpenses = getStorage<FinancialTransaction[]>(STORAGE_KEYS.FINANCIAL, []);
+      const otherExp = allExpenses.filter((e) => e.tenantId !== tenantId);
+      setStorage(STORAGE_KEYS.FINANCIAL, [...otherExp, ...payload.expenses]);
+    }
+
+    // 6. Restaura estoque
+    if (Array.isArray(payload.inventoryTransactions)) {
+      const allInv = getStorage<InventoryTransaction[]>(STORAGE_KEYS.INVENTORY, []);
+      const otherInv = allInv.filter((i) => i.tenantId !== tenantId);
+      setStorage(STORAGE_KEYS.INVENTORY, [...otherInv, ...payload.inventoryTransactions]);
+    }
+
+    // 7. Restaura sessões de caixa
+    if (Array.isArray(payload.cashSessions)) {
+      const allCash = getStorage<CashRegisterSession[]>(STORAGE_KEYS.CASH, []);
+      const otherCash = allCash.filter((c) => c.tenantId !== tenantId);
+      setStorage(STORAGE_KEYS.CASH, [...otherCash, ...payload.cashSessions]);
+    }
+
+    // 8. Restaura tema se presente
+    if (payload.themeConfig) {
+      setStorage(STORAGE_KEYS.THEME_CONFIG, payload.themeConfig);
+      window.dispatchEvent(new CustomEvent('sabor_theme_updated', { detail: payload.themeConfig }));
+    }
+
+    // 9. Preserva e une relatórios salvos e períodos arquivados sem perda
+    if (Array.isArray(payload.savedReports)) {
+      const existingReports = getSavedReports(tenantId);
+      const combined = [...existingReports];
+      payload.savedReports.forEach((rep) => {
+        if (!combined.some((c) => c.id === rep.id)) {
+          combined.push(rep);
+        }
+      });
+      const allReps = getStorage<SavedReport[]>(STORAGE_KEYS.SAVED_REPORTS, []).filter(
+        (r) => r.tenantId !== tenantId
+      );
+      setStorage(STORAGE_KEYS.SAVED_REPORTS, [...allReps, ...combined]);
+    }
+
+    if (Array.isArray(payload.archivedPeriods)) {
+      const existingArch = getArchivedPeriods(tenantId);
+      const combinedArch = [...existingArch];
+      payload.archivedPeriods.forEach((arch) => {
+        if (!combinedArch.some((c) => c.id === arch.id)) {
+          combinedArch.push(arch);
+        }
+      });
+      const allArch = getStorage<ArchivedPeriod[]>(STORAGE_KEYS.ARCHIVED_PERIODS, []).filter(
+        (a) => a.tenantId !== tenantId
+      );
+      setStorage(STORAGE_KEYS.ARCHIVED_PERIODS, [...allArch, ...combinedArch]);
+    }
+
+    addAuditLog({
+      tenantId,
+      userId: adminUser.id,
+      userName: adminUser.name,
+      action: 'RESTAURAR_BACKUP',
+      details: `Restauração completa do backup "${backup.name}" (${backup.id}) realizada com sucesso`,
+    });
+
+    window.dispatchEvent(new CustomEvent('sabor_local_sync'));
+
+    return {
+      success: true,
+      message: `Backup restaurado com sucesso! ${payload.products?.length || 0} produtos, ${payload.orders?.length || 0} vendas e ${payload.tables?.length || 0} mesas recuperadas.`,
+    };
+  } catch (err: any) {
+    console.error('Erro ao restaurar backup:', err);
+    return {
+      success: false,
+      message: `Falha na restauração: ${err?.message || 'Erro desconhecido'}`,
+    };
+  }
+}
+
+export function deleteSystemBackup(id: string): void {
+  const all = getStorage<SystemBackup[]>(STORAGE_KEYS.BACKUPS, []);
+  const target = all.find((b) => b.id === id);
+  const filtered = all.filter((b) => b.id !== id);
+  setStorage(STORAGE_KEYS.BACKUPS, filtered);
+
+  if (target) {
+    addAuditLog({
+      tenantId: target.tenantId,
+      userId: 'system',
+      userName: 'Administrador',
+      action: 'EXCLUIR_BACKUP',
+      details: `Backup "${target.name}" (${id}) removido da central`,
+    });
+  }
+}
+
+// ==========================================
+// 6. PERSONALIZAÇÃO VISUAL PELO ADM
+// ==========================================
+
+export function getThemeConfig(_tenantId?: string): SystemThemeConfig {
+  const stored = getStorage<SystemThemeConfig | null>(STORAGE_KEYS.THEME_CONFIG, null);
+  if (!stored) return DEFAULT_THEME_CONFIG;
+  return { ...DEFAULT_THEME_CONFIG, ...stored };
+}
+
+export function saveThemeConfig(
+  theme: SystemThemeConfig,
+  adminUser?: { id: string; name: string }
+): void {
+  const updatedTheme: SystemThemeConfig = {
+    ...theme,
+    updatedAt: new Date().toISOString(),
+    updatedById: adminUser?.id || 'admin',
+  };
+  setStorage(STORAGE_KEYS.THEME_CONFIG, updatedTheme);
+
+  // Notifica todos os componentes ativos em tempo real (incluindo visão do vendedor)
+  window.dispatchEvent(
+    new CustomEvent('sabor_theme_updated', {
+      detail: updatedTheme,
+    })
+  );
+
+  addAuditLog({
+    tenantId: 'system',
+    userId: adminUser?.id || 'admin',
+    userName: adminUser?.name || 'Administrador',
+    action: 'PERSONALIZAR_CORES',
+    details: 'Tema visual e paleta de cores atualizados pelo Administrador',
+  });
+}
+
+export function resetThemeConfig(_tenantId?: string): SystemThemeConfig {
+  setStorage(STORAGE_KEYS.THEME_CONFIG, DEFAULT_THEME_CONFIG);
+  window.dispatchEvent(
+    new CustomEvent('sabor_theme_updated', {
+      detail: DEFAULT_THEME_CONFIG,
+    })
+  );
+
+  addAuditLog({
+    tenantId: 'system',
+    userId: 'admin',
+    userName: 'Administrador',
+    action: 'RESTAURAR_CORES_PADRAO',
+    details: 'Cores visuais restauradas para o padrão oficial do SaborGestão',
+  });
+
+  return DEFAULT_THEME_CONFIG;
+}
+
+// ==========================================
+// 3. REINICIAR OPERAÇÃO E COMEÇAR NOVO PERÍODO
+// ==========================================
+
+export function executeResetOperation(
+  tenantId: string,
+  options: ResetOperationOptions,
+  adminUser: { id: string; name: string }
+): { success: boolean; message: string; backupCreated?: SystemBackup } {
+  // Validação explícita de segurança
+  if (options.confirmationText.trim() !== 'CONFIRMAR REINICIO') {
+    return {
+      success: false,
+      message: 'Texto de confirmação incorreto. Digite exatamente "CONFIRMAR REINICIO" para autorizar.',
+    };
+  }
+
+  let backupCreated: SystemBackup | undefined;
+
+  // 1. Cria backup de segurança obrigatório se solicitado
+  if (options.createBackupFirst) {
+    backupCreated = createSystemBackup(
+      tenantId,
+      `Backup Automático Pré-Reinício (${new Date().toLocaleDateString('pt-BR')})`,
+      adminUser,
+      'Pré-Reinício'
+    );
+  }
+
+  const actionsTaken: string[] = [];
+
+  // 2. Reiniciar Mesas
+  if (options.resetTables) {
+    const allTables = getStorage<RestaurantTable[]>(STORAGE_KEYS.TABLES, []);
+    const updatedTables = allTables.map((t) => {
+      if (t.tenantId === tenantId) {
+        return {
+          ...t,
+          status: 'available' as const,
+          currentOrderId: undefined,
+          currentTotal: 0,
+          openedAt: undefined,
+          waiterId: undefined,
+          waiterName: undefined,
+          customerName: undefined,
+        };
+      }
+      return t;
+    });
+    setStorage(STORAGE_KEYS.TABLES, updatedTables);
+    actionsTaken.push('Mesas liberadas e zeradas');
+  }
+
+  // 3. Reiniciar Estoque (Zerar quantidades para inventário limpo)
+  if (options.resetStock) {
+    const allProducts = getStorage<Product[]>(STORAGE_KEYS.PRODUCTS, []);
+    const updatedProducts = allProducts.map((p) => {
+      if (p.tenantId === tenantId) {
+        return { ...p, stockQuantity: 0, updatedAt: new Date().toISOString() };
+      }
+      return p;
+    });
+    setStorage(STORAGE_KEYS.PRODUCTS, updatedProducts);
+
+    // Registra transação de auditoria de estoque
+    addInventoryTransaction({
+      id: `inv-reset-${Date.now()}`,
+      tenantId,
+      productId: 'all',
+      productName: 'Todos os Produtos',
+      type: 'adjustment',
+      quantity: 0,
+      previousStock: 0,
+      newStock: 0,
+      reason: 'Reinício operacional — Zeramento de estoque para novo inventário',
+      userId: adminUser.id,
+      userName: adminUser.name,
+      createdAt: new Date().toISOString(),
+    });
+    actionsTaken.push('Estoque zerado para novo inventário');
+  }
+
+  // 4. Reiniciar Cadastro de Produtos (se explicitamente solicitado)
+  if (options.resetProducts) {
+    const allProducts = getStorage<Product[]>(STORAGE_KEYS.PRODUCTS, []);
+    // Desativa ou limpa produtos operacionais deste tenant
+    const remainingProducts = allProducts.filter((p) => p.tenantId !== tenantId);
+    setStorage(STORAGE_KEYS.PRODUCTS, remainingProducts);
+    actionsTaken.push('Catálogo de produtos reiniciado');
+  }
+
+  // 5. Reiniciar Vendas Operacionais do dia a dia
+  if (options.resetSales) {
+    const allOrders = getStorage<Order[]>(STORAGE_KEYS.ORDERS, []);
+    const remainingOrders = allOrders.filter((o) => o.tenantId !== tenantId);
+    setStorage(STORAGE_KEYS.ORDERS, remainingOrders);
+    actionsTaken.push('Vendas operacionais do dia a dia reiniciadas');
+  }
+
+  // 6. Reiniciar Despesas Operacionais
+  if (options.resetExpenses) {
+    const allExpenses = getStorage<FinancialTransaction[]>(STORAGE_KEYS.FINANCIAL, []);
+    const remainingExpenses = allExpenses.filter((e) => e.tenantId !== tenantId);
+    setStorage(STORAGE_KEYS.FINANCIAL, remainingExpenses);
+    actionsTaken.push('Despesas operacionais reiniciadas');
+  }
+
+  // 7. Reiniciar Movimentações
+  if (options.resetMovements) {
+    const allInv = getStorage<InventoryTransaction[]>(STORAGE_KEYS.INVENTORY, []);
+    const remainingInv = allInv.filter((i) => i.tenantId !== tenantId);
+    setStorage(STORAGE_KEYS.INVENTORY, remainingInv);
+    actionsTaken.push('Histórico recente de movimentações reiniciado');
+  }
+
+  // NUNCA APAGAR: Relatórios Salvos, Arquivos de Períodos, Backups ou Logs de Auditoria!
+  addAuditLog({
+    tenantId,
+    userId: adminUser.id,
+    userName: adminUser.name,
+    action: 'REINICIAR_OPERACAO',
+    details: `Reinício Operacional executado com sucesso: ${actionsTaken.join(', ')}. Motivo: ${options.reason || 'Novo ciclo operacional'}. Balanços históricos permaneceram preservados.`,
+  });
+
+  window.dispatchEvent(new CustomEvent('sabor_local_sync'));
+
+  return {
+    success: true,
+    message: `Operação reiniciada com sucesso! ${actionsTaken.join('. ')}. Todos os balanços e relatórios históricos foram preservados.`,
+    backupCreated,
+  };
 }

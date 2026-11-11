@@ -10,7 +10,8 @@ import { Header } from './components/layout/Header';
 import { Sidebar, ActiveTab } from './components/layout/Sidebar';
 import { OverviewDashboard } from './components/dashboard/OverviewDashboard';
 import { LocalServerManager } from './components/server/LocalServerManager';
-import { TeamManagement } from './components/team/TeamManagement';
+import { SellerControlPanel } from './components/team/SellerControlPanel';
+import { PcBrowserAccessModal } from './components/server/PcBrowserAccessModal';
 import { ProductsView } from './components/products/ProductsView';
 import { TablesView } from './components/tables/TablesView';
 import { PosView } from './components/pos/PosView';
@@ -20,8 +21,11 @@ import { InventoryView } from './components/inventory/InventoryView';
 import { ContactsView } from './components/contacts/ContactsView';
 import { SettingsView } from './components/settings/SettingsView';
 import { MySalesView } from './components/seller/MySalesView';
-import { PendingDebtsView } from './components/debts/PendingDebtsView';
-import { ConnectionTestRunner } from './components/testing/ConnectionTestRunner';
+import { ExpensesView } from './components/expenses/ExpensesView';
+import { BackupManagerView } from './components/backup/BackupManagerView';
+import { HistoricalArchivesView } from './components/history/HistoricalArchivesView';
+import { AppCustomizationView } from './components/customization/AppCustomizationView';
+import { ThemeProvider } from './contexts/ThemeContext';
 import { TenantModal } from './components/tenants/TenantModal';
 import {
   initLocalDatabase,
@@ -44,9 +48,13 @@ import {
   CheckCircle2,
   Grid2X2,
   Receipt,
-  FileText,
   WalletCards,
+  TrendingDown,
+  UtensilsCrossed,
   Menu,
+  Users2,
+  Award,
+  LayoutDashboard,
 } from 'lucide-react';
 import { formatTimeBR } from './utils/formatters';
 
@@ -59,6 +67,7 @@ const AppContent: React.FC = () => {
   const [tenantModalMode, setTenantModalMode] = useState<'create' | 'edit'>('create');
   const [activeDeviceView, setActiveDeviceView] = useState<'adm' | 'pc' | 'seller'>('adm');
   const [connStatus, setConnStatus] = useState(getConnectionStatus());
+  const [isPcModalOpen, setIsPcModalOpen] = useState(false);
 
   // Inicialização do Banco Local Principal
   useEffect(() => {
@@ -86,7 +95,7 @@ const AppContent: React.FC = () => {
       const admin = users.find((u) => u.role === 'admin') || users[0];
       if (admin) switchUser(admin.id);
       setActiveView('admin');
-      setCurrentTab('server');
+      setCurrentTab('dashboard');
     } else if (mode === 'pc') {
       const cashier = users.find((u) => u.role === 'cashier') || users[0];
       if (cashier) switchUser(cashier.id);
@@ -96,15 +105,16 @@ const AppContent: React.FC = () => {
       const waiter = users.find((u) => u.role === 'waiter') || users[0];
       if (waiter) switchUser(waiter.id);
       setActiveView('vendedor');
-      setCurrentTab('pos');
+      setCurrentTab('my_sales');
     }
   };
 
   // Sync tab when view mode switches
   useEffect(() => {
     if (activeView === 'vendedor') {
-      if (['dashboard', 'server', 'tests', 'team', 'financial', 'settings', 'inventory'].includes(currentTab)) {
-        setCurrentTab('pos');
+      const allowedSellerTabs: ActiveTab[] = ['my_sales', 'products', 'tables', 'pos'];
+      if (!allowedSellerTabs.includes(currentTab)) {
+        setCurrentTab('my_sales');
       }
     }
   }, [activeView, currentTab]);
@@ -278,6 +288,7 @@ const AppContent: React.FC = () => {
         onOpenNewTenant={handleOpenNewTenant}
         onOpenEditTenant={handleOpenEditTenant}
         onToggleSidebarMobile={() => setMobileSidebarOpen(!mobileSidebarOpen)}
+        onOpenPcAccess={() => setIsPcModalOpen(true)}
       />
 
       <div className="flex flex-1 overflow-hidden">
@@ -294,14 +305,22 @@ const AppContent: React.FC = () => {
           <div className="mx-auto max-w-7xl">
             {currentTab === 'dashboard' && <OverviewDashboard onNavigate={setCurrentTab} />}
             {currentTab === 'server' && <LocalServerManager />}
-            {currentTab === 'debts' && <PendingDebtsView />}
-            {currentTab === 'tests' && <ConnectionTestRunner />}
-            {currentTab === 'team' && <TeamManagement />}
+            {currentTab === 'team' && <SellerControlPanel />}
             {currentTab === 'products' && <ProductsView />}
-            {currentTab === 'tables' && <TablesView />}
+            {currentTab === 'tables' && (
+              <TablesView
+                onStartSaleForTable={(_tableNumber) => {
+                  setCurrentTab('pos');
+                }}
+              />
+            )}
             {currentTab === 'pos' && <PosView />}
             {currentTab === 'cash' && <CashRegisterView />}
+            {currentTab === 'expenses' && <ExpensesView />}
             {currentTab === 'financial' && <FinancialView />}
+            {currentTab === 'history' && <HistoricalArchivesView />}
+            {currentTab === 'backup' && <BackupManagerView />}
+            {currentTab === 'customization' && <AppCustomizationView />}
             {currentTab === 'inventory' && <InventoryView />}
             {currentTab === 'contacts' && <ContactsView />}
             {currentTab === 'settings' && (
@@ -312,56 +331,110 @@ const AppContent: React.FC = () => {
         </main>
       </div>
 
-      {/* Barra de Navegação Inferior para Celular Android (Touch-Friendly) */}
+      {/* Barra de Navegação Inferior para Celular Android (Touch-Friendly e Adaptada ao Perfil) */}
       <nav aria-label="Navegação rápida celular" className="lg:hidden shrink-0 border-t border-stone-200 bg-white/95 px-2 py-1.5 backdrop-blur-md shadow-lg z-30">
         <div className="grid grid-cols-5 gap-1">
-          <button
-            onClick={() => setCurrentTab('pos')}
-            className={`flex flex-col items-center justify-center py-1.5 px-1 rounded-xl text-[10px] font-bold transition min-h-[48px] ${
-              currentTab === 'pos'
-                ? 'bg-amber-600 text-white shadow-xs'
-                : 'text-stone-600 hover:bg-stone-100 active:scale-95'
-            }`}
-          >
-            <Receipt className="h-4 w-4 mb-0.5" />
-            <span className="truncate w-full text-center">PDV Balcão</span>
-          </button>
+          {activeView === 'admin' ? (
+            <>
+              <button
+                onClick={() => setCurrentTab('dashboard')}
+                className={`flex flex-col items-center justify-center py-1.5 px-1 rounded-xl text-[10px] font-bold transition min-h-[48px] ${
+                  currentTab === 'dashboard'
+                    ? 'bg-amber-600 text-white shadow-xs'
+                    : 'text-stone-600 hover:bg-stone-100 active:scale-95'
+                }`}
+              >
+                <LayoutDashboard className="h-4 w-4 mb-0.5" />
+                <span className="truncate w-full text-center">Início</span>
+              </button>
 
-          <button
-            onClick={() => setCurrentTab('tables')}
-            className={`flex flex-col items-center justify-center py-1.5 px-1 rounded-xl text-[10px] font-bold transition min-h-[48px] ${
-              currentTab === 'tables'
-                ? 'bg-amber-600 text-white shadow-xs'
-                : 'text-stone-600 hover:bg-stone-100 active:scale-95'
-            }`}
-          >
-            <Grid2X2 className="h-4 w-4 mb-0.5" />
-            <span className="truncate w-full text-center">Mesas/Cmd</span>
-          </button>
+              <button
+                onClick={() => setCurrentTab('pos')}
+                className={`flex flex-col items-center justify-center py-1.5 px-1 rounded-xl text-[10px] font-bold transition min-h-[48px] ${
+                  currentTab === 'pos'
+                    ? 'bg-amber-600 text-white shadow-xs'
+                    : 'text-stone-600 hover:bg-stone-100 active:scale-95'
+                }`}
+              >
+                <Receipt className="h-4 w-4 mb-0.5" />
+                <span className="truncate w-full text-center">Vendas</span>
+              </button>
 
-          <button
-            onClick={() => setCurrentTab('debts')}
-            className={`flex flex-col items-center justify-center py-1.5 px-1 rounded-xl text-[10px] font-bold transition min-h-[48px] ${
-              currentTab === 'debts'
-                ? 'bg-amber-600 text-white shadow-xs'
-                : 'text-stone-600 hover:bg-stone-100 active:scale-95'
-            }`}
-          >
-            <FileText className="h-4 w-4 mb-0.5" />
-            <span className="truncate w-full text-center">Fiado</span>
-          </button>
+              <button
+                onClick={() => setCurrentTab('tables')}
+                className={`flex flex-col items-center justify-center py-1.5 px-1 rounded-xl text-[10px] font-bold transition min-h-[48px] ${
+                  currentTab === 'tables'
+                    ? 'bg-amber-600 text-white shadow-xs'
+                    : 'text-stone-600 hover:bg-stone-100 active:scale-95'
+                }`}
+              >
+                <Grid2X2 className="h-4 w-4 mb-0.5" />
+                <span className="truncate w-full text-center">Mesas</span>
+              </button>
 
-          <button
-            onClick={() => setCurrentTab('cash')}
-            className={`flex flex-col items-center justify-center py-1.5 px-1 rounded-xl text-[10px] font-bold transition min-h-[48px] ${
-              currentTab === 'cash'
-                ? 'bg-amber-600 text-white shadow-xs'
-                : 'text-stone-600 hover:bg-stone-100 active:scale-95'
-            }`}
-          >
-            <WalletCards className="h-4 w-4 mb-0.5" />
-            <span className="truncate w-full text-center">Caixa</span>
-          </button>
+              <button
+                onClick={() => setCurrentTab('expenses')}
+                className={`flex flex-col items-center justify-center py-1.5 px-1 rounded-xl text-[10px] font-bold transition min-h-[48px] ${
+                  currentTab === 'expenses'
+                    ? 'bg-amber-600 text-white shadow-xs'
+                    : 'text-stone-600 hover:bg-stone-100 active:scale-95'
+                }`}
+              >
+                <TrendingDown className="h-4 w-4 mb-0.5" />
+                <span className="truncate w-full text-center">Gastos</span>
+              </button>
+            </>
+          ) : (
+            <>
+              <button
+                onClick={() => setCurrentTab('my_sales')}
+                className={`flex flex-col items-center justify-center py-1.5 px-1 rounded-xl text-[10px] font-bold transition min-h-[48px] ${
+                  currentTab === 'my_sales'
+                    ? 'bg-amber-600 text-white shadow-xs'
+                    : 'text-stone-600 hover:bg-stone-100 active:scale-95'
+                }`}
+              >
+                <Award className="h-4 w-4 mb-0.5" />
+                <span className="truncate w-full text-center">Minhas Vendas</span>
+              </button>
+
+              <button
+                onClick={() => setCurrentTab('pos')}
+                className={`flex flex-col items-center justify-center py-1.5 px-1 rounded-xl text-[10px] font-bold transition min-h-[48px] ${
+                  currentTab === 'pos'
+                    ? 'bg-amber-600 text-white shadow-xs'
+                    : 'text-stone-600 hover:bg-stone-100 active:scale-95'
+                }`}
+              >
+                <Receipt className="h-4 w-4 mb-0.5" />
+                <span className="truncate w-full text-center">Balcão</span>
+              </button>
+
+              <button
+                onClick={() => setCurrentTab('tables')}
+                className={`flex flex-col items-center justify-center py-1.5 px-1 rounded-xl text-[10px] font-bold transition min-h-[48px] ${
+                  currentTab === 'tables'
+                    ? 'bg-amber-600 text-white shadow-xs'
+                    : 'text-stone-600 hover:bg-stone-100 active:scale-95'
+                }`}
+              >
+                <Grid2X2 className="h-4 w-4 mb-0.5" />
+                <span className="truncate w-full text-center">Mesas</span>
+              </button>
+
+              <button
+                onClick={() => setCurrentTab('products')}
+                className={`flex flex-col items-center justify-center py-1.5 px-1 rounded-xl text-[10px] font-bold transition min-h-[48px] ${
+                  currentTab === 'products'
+                    ? 'bg-amber-600 text-white shadow-xs'
+                    : 'text-stone-600 hover:bg-stone-100 active:scale-95'
+                }`}
+              >
+                <UtensilsCrossed className="h-4 w-4 mb-0.5" />
+                <span className="truncate w-full text-center">Cardápio</span>
+              </button>
+            </>
+          )}
 
           <button
             onClick={() => setMobileSidebarOpen(true)}
@@ -379,6 +452,13 @@ const AppContent: React.FC = () => {
         onClose={() => setIsTenantModalOpen(false)}
         mode={tenantModalMode}
       />
+
+      {/* Modal de Acesso pelo Navegador do PC (Servidor Local Wi-Fi) */}
+      <PcBrowserAccessModal
+        isOpen={isPcModalOpen}
+        onClose={() => setIsPcModalOpen(false)}
+        onSwitchToPcView={() => handleDeviceSwitch('pc')}
+      />
     </div>
   );
 };
@@ -387,7 +467,9 @@ export default function App() {
   return (
     <TenantProvider>
       <AuthProvider>
-        <AppContent />
+        <ThemeProvider>
+          <AppContent />
+        </ThemeProvider>
       </AuthProvider>
     </TenantProvider>
   );

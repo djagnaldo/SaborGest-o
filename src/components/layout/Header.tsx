@@ -26,6 +26,7 @@ import {
   Camera,
   Activity,
   ArrowRight,
+  Monitor,
 } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import { useTenant } from '../../contexts/TenantContext';
@@ -43,12 +44,14 @@ interface HeaderProps {
   onOpenNewTenant: () => void;
   onOpenEditTenant: () => void;
   onToggleSidebarMobile: () => void;
+  onOpenPcAccess?: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
   onOpenNewTenant,
   onOpenEditTenant,
   onToggleSidebarMobile,
+  onOpenPcAccess,
 }) => {
   const { currentTenant, tenants, switchTenant, clearTenantDemoData, reloadTenantDemoData } = useTenant();
   const matriz = getMatrizInfo();
@@ -236,6 +239,18 @@ export const Header: React.FC<HeaderProps> = ({
             Área do Vendedor
           </button>
         </div>
+
+        {/* Botão de Acesso pelo Navegador do PC (Wi-Fi Local) */}
+        {onOpenPcAccess && (
+          <button
+            onClick={onOpenPcAccess}
+            className="hidden sm:flex items-center gap-1.5 rounded-xl border border-blue-200 bg-blue-50/70 px-2.5 py-1.5 text-xs font-semibold text-blue-800 hover:bg-blue-100 transition shadow-2xs"
+            title="Acesso Administrativo pelo Navegador do Computador (Rede Wi-Fi Local)"
+          >
+            <Monitor className="h-3.5 w-3.5 text-blue-600" />
+            <span className="hidden lg:inline">Acesso PC</span>
+          </button>
+        )}
 
         {/* Menu de Gestão de Dados (Demonstração / Banco Local) */}
         <div className="relative">
