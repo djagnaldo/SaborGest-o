@@ -1,0 +1,6 @@
+{
+  "name": "SaborGestão - ERP & PDV para Bares e Restaurantes",
+  "description": "Sistema completo de gestão comercial e ponto de venda (PDV) para bares, lanchonetes e restaurantes com controle de balcão, mesas, comandas, estoque com baixa automática e fiado.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

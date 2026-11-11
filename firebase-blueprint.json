@@ -1,0 +1,293 @@
+{
+  "entities": {
+    "tenant": {
+      "title": "Tenant",
+      "description": "Establishment (restaurant, bar, burger shop, etc.) profile and configuration",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string", "maxLength": 100 },
+        "tradeName": { "type": "string", "maxLength": 100 },
+        "document": { "type": "string", "maxLength": 20 },
+        "phone": { "type": "string", "maxLength": 30 },
+        "address": { "type": "string", "maxLength": 200 },
+        "segment": { "type": "string", "maxLength": 50 },
+        "ownerEmail": { "type": "string", "maxLength": 100 },
+        "ownerId": { "type": "string", "maxLength": 128 },
+        "allowNegativeStock": { "type": "boolean" },
+        "serviceFeePercentage": { "type": "number" },
+        "currency": { "type": "string", "maxLength": 10 },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "name", "ownerEmail", "ownerId", "createdAt"]
+    },
+    "userProfile": {
+      "title": "UserProfile",
+      "description": "User profile with role and access control for establishment",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "tenantId": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 100 },
+        "email": { "type": "string", "maxLength": 100 },
+        "role": { "type": "string", "enum": ["admin", "manager", "waiter", "cashier"] },
+        "active": { "type": "boolean" },
+        "commissionRate": { "type": "number" },
+        "salesTarget": { "type": "number" },
+        "phone": { "type": "string", "maxLength": 30 },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "tenantId", "name", "email", "role", "active"]
+    },
+    "category": {
+      "title": "Category",
+      "description": "Product menu categories",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "tenantId": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 80 },
+        "icon": { "type": "string", "maxLength": 50 },
+        "color": { "type": "string", "maxLength": 20 },
+        "order": { "type": "number" },
+        "active": { "type": "boolean" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "tenantId", "name", "active"]
+    },
+    "product": {
+      "title": "Product",
+      "description": "Food and beverage catalog item with pricing and stock",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "tenantId": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 120 },
+        "internalCode": { "type": "string", "maxLength": 50 },
+        "barcode": { "type": "string", "maxLength": 50 },
+        "categoryId": { "type": "string", "maxLength": 80 },
+        "description": { "type": "string", "maxLength": 500 },
+        "imageUrl": { "type": "string", "maxLength": 500 },
+        "costPrice": { "type": "number" },
+        "sellingPrice": { "type": "number" },
+        "profitMargin": { "type": "number" },
+        "unit": { "type": "string", "maxLength": 10 },
+        "stockQuantity": { "type": "number" },
+        "minStock": { "type": "number" },
+        "supplierId": { "type": "string", "maxLength": 128 },
+        "active": { "type": "boolean" },
+        "isComposite": { "type": "boolean" },
+        "recipe": { "type": "string", "maxLength": 2000 },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "tenantId", "name", "categoryId", "sellingPrice", "stockQuantity", "active"]
+    },
+    "order": {
+      "title": "Order",
+      "description": "Sales order (Counter, Table, Delivery, Pickup)",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "tenantId": { "type": "string", "maxLength": 128 },
+        "orderNumber": { "type": "number" },
+        "type": { "type": "string", "enum": ["counter", "table", "delivery", "pickup"] },
+        "status": { "type": "string", "enum": ["received", "preparing", "ready", "out_for_delivery", "delivered", "closed", "cancelled"] },
+        "tableId": { "type": "string", "maxLength": 50 },
+        "customerId": { "type": "string", "maxLength": 128 },
+        "customerName": { "type": "string", "maxLength": 100 },
+        "customerPhone": { "type": "string", "maxLength": 30 },
+        "deliveryAddress": { "type": "string", "maxLength": 250 },
+        "deliveryFee": { "type": "number" },
+        "waiterId": { "type": "string", "maxLength": 128 },
+        "waiterName": { "type": "string", "maxLength": 100 },
+        "itemsJson": { "type": "string", "maxLength": 10000 },
+        "subtotal": { "type": "number" },
+        "discount": { "type": "number" },
+        "serviceFee": { "type": "number" },
+        "total": { "type": "number" },
+        "paymentMethod": { "type": "string", "maxLength": 50 },
+        "paid": { "type": "boolean" },
+        "notes": { "type": "string", "maxLength": 500 },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "tenantId", "type", "status", "subtotal", "total", "createdAt"]
+    },
+    "table": {
+      "title": "Table",
+      "description": "Restaurant table and tab tracking",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "tenantId": { "type": "string", "maxLength": 128 },
+        "number": { "type": "number" },
+        "label": { "type": "string", "maxLength": 50 },
+        "status": { "type": "string", "enum": ["available", "occupied", "reserved", "closing"] },
+        "capacity": { "type": "number" },
+        "currentOrderId": { "type": "string", "maxLength": 128 },
+        "currentTotal": { "type": "number" },
+        "openedAt": { "type": "string" },
+        "waiterId": { "type": "string", "maxLength": 128 },
+        "waiterName": { "type": "string", "maxLength": 100 }
+      },
+      "required": ["id", "tenantId", "number", "status"]
+    },
+    "cashRegister": {
+      "title": "CashRegister",
+      "description": "Cash register sessions with openings, closings, and reconciliations",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "tenantId": { "type": "string", "maxLength": 128 },
+        "openedBy": { "type": "string", "maxLength": 128 },
+        "openedByName": { "type": "string", "maxLength": 100 },
+        "openedAt": { "type": "string" },
+        "closedBy": { "type": "string", "maxLength": 128 },
+        "closedByName": { "type": "string", "maxLength": 100 },
+        "closedAt": { "type": "string" },
+        "status": { "type": "string", "enum": ["open", "closed"] },
+        "initialAmount": { "type": "number" },
+        "totalCash": { "type": "number" },
+        "totalPix": { "type": "number" },
+        "totalCreditCard": { "type": "number" },
+        "totalDebitCard": { "type": "number" },
+        "totalCreditTabs": { "type": "number" },
+        "totalWithdrawals": { "type": "number" },
+        "totalDeposits": { "type": "number" },
+        "expectedAmount": { "type": "number" },
+        "countedAmount": { "type": "number" },
+        "discrepancy": { "type": "number" },
+        "notes": { "type": "string", "maxLength": 500 }
+      },
+      "required": ["id", "tenantId", "openedBy", "openedAt", "status", "initialAmount"]
+    },
+    "financialTransaction": {
+      "title": "FinancialTransaction",
+      "description": "Cash flow transactions (expenses, revenues, sangria, reforço)",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "tenantId": { "type": "string", "maxLength": 128 },
+        "type": { "type": "string", "enum": ["expense_fixed", "expense_variable", "revenue", "withdrawal", "deposit"] },
+        "category": { "type": "string", "maxLength": 80 },
+        "description": { "type": "string", "maxLength": 200 },
+        "amount": { "type": "number" },
+        "date": { "type": "string" },
+        "dueDate": { "type": "string" },
+        "paid": { "type": "boolean" },
+        "paymentMethod": { "type": "string", "maxLength": 50 },
+        "cashRegisterId": { "type": "string", "maxLength": 128 },
+        "userId": { "type": "string", "maxLength": 128 },
+        "userName": { "type": "string", "maxLength": 100 },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "tenantId", "type", "description", "amount", "date", "paid"]
+    },
+    "customer": {
+      "title": "Customer",
+      "description": "Customer directory with credit/fiado tracking",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "tenantId": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 100 },
+        "phone": { "type": "string", "maxLength": 30 },
+        "email": { "type": "string", "maxLength": 100 },
+        "address": { "type": "string", "maxLength": 200 },
+        "totalSpent": { "type": "number" },
+        "pendingCredit": { "type": "number" },
+        "ordersCount": { "type": "number" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "tenantId", "name", "phone"]
+    },
+    "supplier": {
+      "title": "Supplier",
+      "description": "Suppliers of ingredients and retail products",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "tenantId": { "type": "string", "maxLength": 128 },
+        "name": { "type": "string", "maxLength": 100 },
+        "document": { "type": "string", "maxLength": 30 },
+        "phone": { "type": "string", "maxLength": 30 },
+        "email": { "type": "string", "maxLength": 100 },
+        "address": { "type": "string", "maxLength": 200 },
+        "category": { "type": "string", "maxLength": 80 },
+        "pendingBalance": { "type": "number" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "tenantId", "name", "phone"]
+    },
+    "inventoryTransaction": {
+      "title": "InventoryTransaction",
+      "description": "Stock movements (purchase in, sale out, loss/waste, adjustment)",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "tenantId": { "type": "string", "maxLength": 128 },
+        "productId": { "type": "string", "maxLength": 128 },
+        "productName": { "type": "string", "maxLength": 120 },
+        "type": { "type": "string", "enum": ["purchase", "sale", "waste", "adjustment"] },
+        "quantity": { "type": "number" },
+        "previousStock": { "type": "number" },
+        "newStock": { "type": "number" },
+        "unitCost": { "type": "number" },
+        "reason": { "type": "string", "maxLength": 200 },
+        "userId": { "type": "string", "maxLength": 128 },
+        "userName": { "type": "string", "maxLength": 100 },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "tenantId", "productId", "type", "quantity", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/tenants/{tenantId}": {
+      "schema": "tenant",
+      "description": "Establishments"
+    },
+    "/tenants/{tenantId}/users/{userId}": {
+      "schema": "userProfile",
+      "description": "User profiles and permissions for a tenant"
+    },
+    "/tenants/{tenantId}/categories/{categoryId}": {
+      "schema": "category",
+      "description": "Menu categories for a tenant"
+    },
+    "/tenants/{tenantId}/products/{productId}": {
+      "schema": "product",
+      "description": "Products and menu items for a tenant"
+    },
+    "/tenants/{tenantId}/orders/{orderId}": {
+      "schema": "order",
+      "description": "Orders for a tenant"
+    },
+    "/tenants/{tenantId}/tables/{tableId}": {
+      "schema": "table",
+      "description": "Tables for a tenant"
+    },
+    "/tenants/{tenantId}/cash_registers/{cashId}": {
+      "schema": "cashRegister",
+      "description": "Cash register sessions for a tenant"
+    },
+    "/tenants/{tenantId}/financial_transactions/{txId}": {
+      "schema": "financialTransaction",
+      "description": "Financial transactions for a tenant"
+    },
+    "/tenants/{tenantId}/customers/{customerId}": {
+      "schema": "customer",
+      "description": "Customers for a tenant"
+    },
+    "/tenants/{tenantId}/suppliers/{supplierId}": {
+      "schema": "supplier",
+      "description": "Suppliers for a tenant"
+    },
+    "/tenants/{tenantId}/inventory_transactions/{txId}": {
+      "schema": "inventoryTransaction",
+      "description": "Inventory movement audit trail for a tenant"
+    }
+  }
+}

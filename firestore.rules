@@ -1,0 +1,98 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Default Deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isBootstrapAdmin() {
+      return isSignedIn() && request.auth.token.email == 'agnaldomix@gmail.com';
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isTenantUser(tenantId) {
+      return isBootstrapAdmin() || (
+        isSignedIn() && (
+          exists(/databases/$(database)/documents/tenants/$(tenantId)/users/$(request.auth.uid)) ||
+          get(/databases/$(database)/documents/tenants/$(tenantId)).data.ownerId == request.auth.uid
+        )
+      );
+    }
+
+    function isTenantAdmin(tenantId) {
+      return isBootstrapAdmin() || (
+        isSignedIn() && (
+          get(/databases/$(database)/documents/tenants/$(tenantId)).data.ownerId == request.auth.uid ||
+          (
+            exists(/databases/$(database)/documents/tenants/$(tenantId)/users/$(request.auth.uid)) &&
+            get(/databases/$(database)/documents/tenants/$(tenantId)/users/$(request.auth.uid)).data.role in ['admin', 'manager']
+          )
+        )
+      );
+    }
+
+    // Tenant configuration
+    match /tenants/{tenantId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && isValidId(tenantId);
+      allow update, delete: if isTenantAdmin(tenantId);
+
+      // Sub-collections under Tenant
+      match /users/{userId} {
+        allow read: if isTenantUser(tenantId);
+        allow create, update, delete: if isTenantAdmin(tenantId) || (isSignedIn() && request.auth.uid == userId);
+      }
+
+      match /categories/{categoryId} {
+        allow read: if isTenantUser(tenantId);
+        allow write: if isTenantAdmin(tenantId);
+      }
+
+      match /products/{productId} {
+        allow read: if isTenantUser(tenantId);
+        allow write: if isTenantAdmin(tenantId);
+      }
+
+      match /tables/{tableId} {
+        allow read, write: if isTenantUser(tenantId);
+      }
+
+      match /orders/{orderId} {
+        allow read, write: if isTenantUser(tenantId);
+      }
+
+      match /cash_registers/{cashId} {
+        allow read: if isTenantUser(tenantId);
+        allow create, update: if isTenantUser(tenantId);
+        allow delete: if isTenantAdmin(tenantId);
+      }
+
+      match /financial_transactions/{txId} {
+        allow read, write: if isTenantAdmin(tenantId);
+      }
+
+      match /customers/{customerId} {
+        allow read, write: if isTenantUser(tenantId);
+      }
+
+      match /suppliers/{supplierId} {
+        allow read, write: if isTenantAdmin(tenantId);
+      }
+
+      match /inventory_transactions/{txId} {
+        allow read: if isTenantUser(tenantId);
+        allow create: if isTenantUser(tenantId);
+        allow update, delete: if isTenantAdmin(tenantId);
+      }
+    }
+  }
+}
