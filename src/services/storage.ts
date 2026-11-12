@@ -24,6 +24,9 @@ import {
   SystemThemeConfig,
   ResetOperationOptions,
   TableExtraCharge,
+  TableExtraChargeEditEntry,
+  TablePaymentRecord,
+  TableAccountArchive,
   TableTimer,
 } from '../types';
 import {
@@ -62,6 +65,7 @@ const STORAGE_KEYS = {
   SAVED_REPORTS: 'sabor_saved_reports',
   ARCHIVED_PERIODS: 'sabor_archived_periods',
   BACKUPS: 'sabor_system_backups',
+  TABLE_ARCHIVES: 'sabor_table_archives',
   THEME_CONFIG: 'sabor_theme_config',
   ACTIVE_TENANT_ID: 'sabor_active_tenant_id',
   ACTIVE_USER_ID: 'sabor_active_user_id',
@@ -506,28 +510,70 @@ export function saveTable(table: RestaurantTable): void {
   }
 }
 
-// Exclusão de Mesas com Validação Obrigatória de Pedidos Ativos
-export function deleteTable(id: string): { success: boolean; error?: string } {
+// Verifica de forma rigorosa se uma mesa pode ser excluída
+export function getTableDeletionBlockReason(
+  table: RestaurantTable,
+  orders: Order[]
+): string | null {
+  const tableName = table.label || `Mesa ${table.number}`;
+  const reasons: string[] = [];
+
+  if (table.status === 'occupied') {
+    reasons.push('status atual é OCUPADA');
+  } else if (table.status === 'closing') {
+    reasons.push('status atual é AGUARDANDO PAGAMENTO');
+  }
+
+  const totalOpen = table.currentTotal || 0;
+  const productsOpen = table.productsTotal || 0;
+  const extraOpen = table.extraTotal || 0;
+  if (totalOpen > 0 || productsOpen > 0 || extraOpen > 0) {
+    reasons.push(`possui saldo em aberto de R$ ${totalOpen.toFixed(2)}`);
+  }
+
+  const activeExtras = (table.extraCharges || []).filter((c) => c.status === 'active');
+  if (activeExtras.length > 0) {
+    reasons.push(`possui ${activeExtras.length} lançamento(s) extra(s) ativo(s)`);
+  }
+
+  const openOrders = orders.filter(
+    (o) =>
+      o.type === 'table' &&
+      (o.tableId === table.id || o.tableNumber === table.number) &&
+      o.status !== 'cancelled' &&
+      (!o.paid || o.status !== 'closed')
+  );
+  if (openOrders.length > 0) {
+    reasons.push(`possui ${openOrders.length} pedido(s) ativo(s) ou com pagamento pendente`);
+  }
+
+  if (reasons.length === 0) return null;
+  return `Bloqueio de segurança em "${tableName}": ${reasons.join('; ')}. Encerre os pedidos e confirme a quitação total antes de excluir.`;
+}
+
+// Exclusão de Mesas com Validação Obrigatória de Pedidos Ativos, Saldo e Movimentações
+export function deleteTable(
+  id: string,
+  adminUser?: { id: string; name: string }
+): { success: boolean; error?: string } {
   const all = getStorage<RestaurantTable[]>(STORAGE_KEYS.TABLES, INITIAL_DEMO_TABLES);
   const target = all.find((t) => t.id === id);
   if (!target) return { success: false, error: 'Mesa não encontrada.' };
 
-  // Bloqueio rigoroso: Não permite excluir mesas com pedidos ativos ou em atendimento
-  if (target.status === 'occupied' || target.status === 'closing' || (target.currentTotal && target.currentTotal > 0)) {
-    return {
-      success: false,
-      error: `Não é permitido excluir a ${target.label || `Mesa ${target.number}`} enquanto houver pedido ativo ou conta em aberto (Total: ${target.currentTotal || 0}). Encerre ou transfira o atendimento antes de excluir.`,
-    };
+  const orders = getOrders(target.tenantId);
+  const blockReason = getTableDeletionBlockReason(target, orders);
+  if (blockReason) {
+    return { success: false, error: blockReason };
   }
 
   const filtered = all.filter((t) => t.id !== id);
   setStorage(STORAGE_KEYS.TABLES, filtered);
   addAuditLog({
     tenantId: target.tenantId,
-    userId: 'admin',
-    userName: 'Administrador',
+    userId: adminUser?.id || 'admin',
+    userName: adminUser?.name || 'Administrador',
     action: 'EXCLUIU_MESA',
-    details: `Excluiu a ${target.label || `Mesa ${target.number}`} do salão`,
+    details: `Excluiu o cadastro de "${target.label || `Mesa ${target.number}`}" (#${target.number}) do salão. Histórico financeiro e de pedidos preservado.`,
   });
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent('sabor_local_sync', { detail: { action: 'table_deleted', id } }));
@@ -536,21 +582,34 @@ export function deleteTable(id: string): { success: boolean; error?: string } {
 }
 
 // Exclusão de Mesas em Lote pelo ADM
-export function deleteTablesBatch(ids: string[]): { successCount: number; blockedCount: number; blockedReasons: string[] } {
+export function deleteTablesBatch(
+  ids: string[],
+  adminUser?: { id: string; name: string }
+): { successCount: number; blockedCount: number; blockedReasons: string[] } {
   const all = getStorage<RestaurantTable[]>(STORAGE_KEYS.TABLES, INITIAL_DEMO_TABLES);
   let successCount = 0;
   let blockedCount = 0;
   const blockedReasons: string[] = [];
   const idsToDelete = new Set<string>();
+  const deletedNames: string[] = [];
+  let tenantIdRef = 'tenant-01';
+
+  const ordersCache: Record<string, Order[]> = {};
 
   for (const id of ids) {
     const table = all.find((t) => t.id === id);
     if (!table) continue;
-    if (table.status === 'occupied' || table.status === 'closing' || (table.currentTotal && table.currentTotal > 0)) {
+    tenantIdRef = table.tenantId;
+    if (!ordersCache[table.tenantId]) {
+      ordersCache[table.tenantId] = getOrders(table.tenantId);
+    }
+    const blockReason = getTableDeletionBlockReason(table, ordersCache[table.tenantId]);
+    if (blockReason) {
       blockedCount++;
-      blockedReasons.push(`${table.label || `Mesa ${table.number}`} está ocupada ou possui saldo em aberto (${table.currentTotal.toFixed(2)})`);
+      blockedReasons.push(blockReason);
     } else {
       idsToDelete.add(id);
+      deletedNames.push(table.label || `Mesa ${table.number}`);
       successCount++;
     }
   }
@@ -559,11 +618,11 @@ export function deleteTablesBatch(ids: string[]): { successCount: number; blocke
     const remaining = all.filter((t) => !idsToDelete.has(t.id));
     setStorage(STORAGE_KEYS.TABLES, remaining);
     addAuditLog({
-      tenantId: all[0]?.tenantId || 'tenant-01',
-      userId: 'admin',
-      userName: 'Administrador',
+      tenantId: tenantIdRef,
+      userId: adminUser?.id || 'admin',
+      userName: adminUser?.name || 'Administrador',
       action: 'EXCLUIU_MESAS_LOTE',
-      details: `Excluiu ${successCount} mesa(s) livre(s) em lote. ${blockedCount} mesa(s) bloqueada(s).`,
+      details: `Excluiu ${successCount} mesa(s) livre(s) em lote (${deletedNames.join(', ')}). ${blockedCount} mesa(s) protegida(s). Histórico preservado.`,
     });
     if (typeof window !== 'undefined') {
       window.dispatchEvent(new CustomEvent('sabor_local_sync', { detail: { action: 'tables_batch_deleted' } }));
@@ -574,30 +633,43 @@ export function deleteTablesBatch(ids: string[]): { successCount: number; blocke
 }
 
 // Excluir Todas as Mesas Livres pelo ADM
-export function deleteAllAvailableTables(tenantId: string): { successCount: number; blockedCount: number } {
+export function deleteAllAvailableTables(
+  tenantId: string,
+  adminUser?: { id: string; name: string }
+): { successCount: number; blockedCount: number; blockedReasons: string[] } {
   const all = getStorage<RestaurantTable[]>(STORAGE_KEYS.TABLES, INITIAL_DEMO_TABLES);
-  const availableIds = all
-    .filter((t) => t.tenantId === tenantId && t.status === 'available' && (!t.currentTotal || t.currentTotal <= 0))
-    .map((t) => t.id);
+  const orders = getOrders(tenantId);
+  const availableIds: string[] = [];
+  const blockedReasons: string[] = [];
 
-  const blockedCount = all.filter((t) => t.tenantId === tenantId && (t.status === 'occupied' || t.status === 'closing' || (t.currentTotal && t.currentTotal > 0))).length;
+  for (const t of all) {
+    if (t.tenantId !== tenantId) continue;
+    const blockReason = getTableDeletionBlockReason(t, orders);
+    if (blockReason) {
+      blockedReasons.push(blockReason);
+    } else {
+      availableIds.push(t.id);
+    }
+  }
+
+  const blockedCount = blockedReasons.length;
 
   if (availableIds.length > 0) {
     const remaining = all.filter((t) => !availableIds.includes(t.id));
     setStorage(STORAGE_KEYS.TABLES, remaining);
     addAuditLog({
       tenantId,
-      userId: 'admin',
-      userName: 'Administrador',
+      userId: adminUser?.id || 'admin',
+      userName: adminUser?.name || 'Administrador',
       action: 'LIMPOU_MESAS_LIVRES',
-      details: `Removeu todas as ${availableIds.length} mesas disponíveis do salão. ${blockedCount} mesas ocupadas preservadas.`,
+      details: `Removeu ${availableIds.length} mesa(s) disponível(is) do salão. ${blockedCount} mesa(s) ocupada(s)/com pendências protegida(s). Históricos preservados.`,
     });
     if (typeof window !== 'undefined') {
       window.dispatchEvent(new CustomEvent('sabor_local_sync', { detail: { action: 'tables_cleared' } }));
     }
   }
 
-  return { successCount: availableIds.length, blockedCount };
+  return { successCount: availableIds.length, blockedCount, blockedReasons };
 }
 
 // ==========================================
@@ -610,6 +682,13 @@ export function addTableExtraCharge(
   chargeData: { amount: number; description: string; isCashWithdrawal: boolean },
   adminUser: { id: string; name: string }
 ): { success: boolean; charge?: TableExtraCharge; table?: RestaurantTable; error?: string } {
+  if (!chargeData.amount || chargeData.amount <= 0) {
+    return { success: false, error: 'Informe um valor positivo em reais.' };
+  }
+  if (!chargeData.description || !chargeData.description.trim()) {
+    return { success: false, error: 'A descrição/motivo do lançamento extra é obrigatória.' };
+  }
+
   const all = getStorage<RestaurantTable[]>(STORAGE_KEYS.TABLES, INITIAL_DEMO_TABLES);
   const index = all.findIndex((t) => t.id === tableId);
   if (index < 0) return { success: false, error: 'Mesa não encontrada.' };
@@ -618,22 +697,32 @@ export function addTableExtraCharge(
   const chargeId = `extra-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
   let financialTxId: string | undefined;
 
-  // Se houve saída de dinheiro da gaveta do caixa (ex: entregue ao cliente para lazer do filho)
+  // Se houve saída de dinheiro da gaveta do caixa (ex: entregue ao cliente)
   if (chargeData.isCashWithdrawal) {
-    financialTxId = `tx-extra-${Date.now()}`;
+    const cashSessions = getCashSessions(tenantId);
+    const activeSession = cashSessions.find((c) => c.status === 'open');
+
+    financialTxId = `tx-extra-${chargeId}`;
+    const existingFin = getStorage<FinancialTransaction[]>(STORAGE_KEYS.FINANCIAL, INITIAL_DEMO_EXPENSES);
+    if (existingFin.some((f) => f.id === financialTxId || f.relatedChargeId === chargeId)) {
+      return { success: false, error: 'Prevenção de duplicidade: esta sangria já foi registrada.' };
+    }
+
     const financialTx: FinancialTransaction = {
       id: financialTxId,
       tenantId,
       type: 'withdrawal',
       category: 'Adiantamento ao Cliente',
-      description: `Valor entregue ao cliente (${table.label || `Mesa ${table.number}`}): ${chargeData.description}`,
+      description: `Sangria/Valor extra entregue (${table.label || `Mesa ${table.number}`}): ${chargeData.description.trim()}`,
       amount: chargeData.amount,
       date: new Date().toISOString(),
       paid: true,
       paymentMethod: 'dinheiro',
+      cashRegisterId: activeSession?.id,
+      relatedChargeId: chargeId,
       userId: adminUser.id,
       userName: adminUser.name,
-      notes: `Lançamento extra vinculado à ${table.label || `Mesa ${table.number}`}`,
+      notes: `Lançamento extra ${chargeId} vinculado à ${table.label || `Mesa ${table.number}`}`,
       createdAt: new Date().toISOString(),
     };
 
@@ -645,22 +734,23 @@ export function addTableExtraCharge(
     tableId,
     tableNumberOrName: table.label || `Mesa ${table.number}`,
     amount: chargeData.amount,
-    description: chargeData.description,
+    description: chargeData.description.trim(),
     isCashWithdrawal: chargeData.isCashWithdrawal,
     createdAt: new Date().toISOString(),
     createdById: adminUser.id,
     createdByName: adminUser.name,
     financialTxId,
     status: 'active',
+    editHistory: [],
   };
 
   const existingCharges = table.extraCharges || [];
   const updatedCharges = [...existingCharges, newCharge];
 
-  // Recalcula totais
+  // Recalcula totais preservando consumo de produtos separado
   const activeCharges = updatedCharges.filter((c) => c.status === 'active');
   const extraTotal = activeCharges.reduce((acc, c) => acc + c.amount, 0);
-  const productsTotal = table.productsTotal || (table.currentTotal - (table.extraTotal || 0)) || 0;
+  const productsTotal = table.productsTotal ?? Math.max(0, (table.currentTotal || 0) - (table.extraTotal || 0));
   const currentTotal = productsTotal + extraTotal;
 
   // Se mesa estava livre, marca como ocupada com o lançamento
@@ -685,7 +775,7 @@ export function addTableExtraCharge(
     userId: adminUser.id,
     userName: adminUser.name,
     action: 'LANCAMENTO_EXTRA_MESA',
-    details: `Adicionou valor extra de R$ ${chargeData.amount.toFixed(2)} (${chargeData.description}) à ${table.label || `Mesa ${table.number}`}.${chargeData.isCashWithdrawal ? ' Registrada saída em dinheiro no caixa.' : ''}`,
+    details: `Adicionou valor extra de R$ ${chargeData.amount.toFixed(2)} ("${chargeData.description.trim()}") à ${table.label || `Mesa ${table.number}`}.${chargeData.isCashWithdrawal ? ' Sangria em dinheiro registrada no caixa ativo.' : ' Sem retirada de caixa.'}`,
   });
 
   if (typeof window !== 'undefined') {
@@ -695,13 +785,20 @@ export function addTableExtraCharge(
   return { success: true, charge: newCharge, table: updatedTable };
 }
 
-export function cancelTableExtraCharge(
+export function editTableExtraCharge(
   tenantId: string,
   tableId: string,
   chargeId: string,
-  cancellationReason: string,
+  updates: { amount: number; description: string; reason: string },
   adminUser: { id: string; name: string }
 ): { success: boolean; table?: RestaurantTable; error?: string } {
+  if (!updates.amount || updates.amount <= 0) {
+    return { success: false, error: 'O novo valor deve ser maior que zero.' };
+  }
+  if (!updates.description.trim()) {
+    return { success: false, error: 'A descrição do lançamento extra é obrigatória.' };
+  }
+
   const all = getStorage<RestaurantTable[]>(STORAGE_KEYS.TABLES, INITIAL_DEMO_TABLES);
   const index = all.findIndex((t) => t.id === tableId);
   if (index < 0) return { success: false, error: 'Mesa não encontrada.' };
@@ -713,28 +810,213 @@ export function cancelTableExtraCharge(
 
   const targetCharge = existingCharges[chargeIndex];
   if (targetCharge.status === 'cancelled') {
-    return { success: false, error: 'Este lançamento extra já foi cancelado.' };
+    return { success: false, error: 'Não é possível editar um lançamento já cancelado.' };
   }
 
-  // Se houve saída de caixa, estorna a saída no caixa
-  if (targetCharge.isCashWithdrawal && targetCharge.financialTxId) {
+  const diff = Number((updates.amount - targetCharge.amount).toFixed(2));
+  let adjustmentTxId: string | undefined;
+
+  // Mantém movimentação original intacta; registra ajuste complementar se houve sangria de caixa
+  if (targetCharge.isCashWithdrawal && Math.abs(diff) > 0.009) {
+    const allFinancial = getStorage<FinancialTransaction[]>(STORAGE_KEYS.FINANCIAL, INITIAL_DEMO_EXPENSES);
     const cashSessions = getCashSessions(tenantId);
     const active = cashSessions.find((c) => c.status === 'open');
+    adjustmentTxId = `tx-adj-${chargeId}-${Date.now()}`;
+
+    if (diff > 0) {
+      // Aumento na sangria: registra saída complementar
+      const extraWithdrawal: FinancialTransaction = {
+        id: adjustmentTxId,
+        tenantId,
+        type: 'withdrawal',
+        category: 'Ajuste de Adiantamento',
+        description: `Complemento de sangria (${table.label || `Mesa ${table.number}`}): ${updates.reason || updates.description}`,
+        amount: diff,
+        date: new Date().toISOString(),
+        paid: true,
+        paymentMethod: 'dinheiro',
+        cashRegisterId: active?.id,
+        relatedChargeId: chargeId,
+        userId: adminUser.id,
+        userName: adminUser.name,
+        notes: `Ajuste de edição do lançamento extra ${chargeId} (de R$ ${targetCharge.amount.toFixed(2)} para R$ ${updates.amount.toFixed(2)})`,
+        createdAt: new Date().toISOString(),
+      };
+      allFinancial.unshift(extraWithdrawal);
+      setStorage(STORAGE_KEYS.FINANCIAL, allFinancial);
+      if (active) {
+        active.totalWithdrawals = (active.totalWithdrawals || 0) + diff;
+        active.expectedAmount = Math.max(0, (active.expectedAmount || 0) - diff);
+        saveCashSession(active);
+      }
+    } else {
+      // Redução na sangria: registra estorno parcial (depósito)
+      const refundAmount = Math.abs(diff);
+      const partialEstorno: FinancialTransaction = {
+        id: adjustmentTxId,
+        tenantId,
+        type: 'deposit',
+        category: 'Estorno Parcial de Adiantamento',
+        description: `Devolução parcial de sangria (${table.label || `Mesa ${table.number}`}): ${updates.reason || updates.description}`,
+        amount: refundAmount,
+        date: new Date().toISOString(),
+        paid: true,
+        paymentMethod: 'dinheiro',
+        cashRegisterId: active?.id,
+        relatedChargeId: chargeId,
+        userId: adminUser.id,
+        userName: adminUser.name,
+        notes: `Estorno parcial na edição do lançamento extra ${chargeId} (de R$ ${targetCharge.amount.toFixed(2)} para R$ ${updates.amount.toFixed(2)})`,
+        createdAt: new Date().toISOString(),
+      };
+      allFinancial.unshift(partialEstorno);
+      setStorage(STORAGE_KEYS.FINANCIAL, allFinancial);
+      if (active) {
+        active.totalDeposits = (active.totalDeposits || 0) + refundAmount;
+        active.expectedAmount = (active.expectedAmount || 0) + refundAmount;
+        saveCashSession(active);
+      }
+    }
+  }
+
+  const editEntry: TableExtraChargeEditEntry = {
+    editedAt: new Date().toISOString(),
+    editedById: adminUser.id,
+    editedByName: adminUser.name,
+    previousAmount: targetCharge.amount,
+    newAmount: updates.amount,
+    previousDescription: targetCharge.description,
+    newDescription: updates.description.trim(),
+    reason: updates.reason.trim() || 'Edição administrativa',
+    adjustmentTxId,
+  };
+
+  const updatedCharges = [...existingCharges];
+  updatedCharges[chargeIndex] = {
+    ...targetCharge,
+    amount: updates.amount,
+    description: updates.description.trim(),
+    editedAt: editEntry.editedAt,
+    editedBy: adminUser.name,
+    editHistory: [...(targetCharge.editHistory || []), editEntry],
+  };
+
+  const activeCharges = updatedCharges.filter((c) => c.status === 'active');
+  const extraTotal = activeCharges.reduce((acc, c) => acc + c.amount, 0);
+  const productsTotal = table.productsTotal || 0;
+  const currentTotal = productsTotal + extraTotal;
+
+  const updatedTable: RestaurantTable = {
+    ...table,
+    extraTotal,
+    currentTotal,
+    extraCharges: updatedCharges,
+  };
+
+  all[index] = updatedTable;
+  setStorage(STORAGE_KEYS.TABLES, all);
+
+  addAuditLog({
+    tenantId,
+    userId: adminUser.id,
+    userName: adminUser.name,
+    action: 'EDITOU_EXTRA_MESA',
+    details: `Editou valor extra da ${table.label || `Mesa ${table.number}`}: de R$ ${targetCharge.amount.toFixed(2)} ("${targetCharge.description}") para R$ ${updates.amount.toFixed(2)} ("${updates.description.trim()}"). Motivo: ${editEntry.reason}`,
+  });
+
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('sabor_local_sync', { detail: { action: 'extra_charge_edited', tableId } }));
+  }
+
+  return { success: true, table: updatedTable };
+}
+
+export function cancelTableExtraCharge(
+  tenantId: string,
+  tableId: string,
+  chargeId: string,
+  cancellationReason: string,
+  adminUser: { id: string; name: string }
+): { success: boolean; table?: RestaurantTable; error?: string } {
+  if (!cancellationReason || !cancellationReason.trim()) {
+    return { success: false, error: 'A justificativa para cancelar o lançamento é obrigatória.' };
+  }
+
+  const all = getStorage<RestaurantTable[]>(STORAGE_KEYS.TABLES, INITIAL_DEMO_TABLES);
+  const index = all.findIndex((t) => t.id === tableId);
+  if (index < 0) return { success: false, error: 'Mesa não encontrada.' };
+
+  const table = all[index];
+  const existingCharges = table.extraCharges || [];
+  const chargeIndex = existingCharges.findIndex((c) => c.id === chargeId);
+  if (chargeIndex < 0) return { success: false, error: 'Lançamento extra não encontrado.' };
+
+  const targetCharge = existingCharges[chargeIndex];
+  if (targetCharge.status === 'cancelled' || targetCharge.estornoTxId) {
+    return { success: false, error: 'Este lançamento extra já foi cancelado e estornado anteriormente.' };
+  }
+
+  let estornoTxId: string | undefined;
+
+  // Se houve saída de caixa, registra estorno sem apagar a movimentação original (e evita duplicidade)
+  if (targetCharge.isCashWithdrawal && targetCharge.financialTxId) {
+    const allFinancial = getStorage<FinancialTransaction[]>(STORAGE_KEYS.FINANCIAL, INITIAL_DEMO_EXPENSES);
+    const alreadyReversed = allFinancial.some(
+      (f) => f.type === 'deposit' && f.relatedChargeId === targetCharge.id && f.category === 'Estorno de Adiantamento'
+    );
+    if (alreadyReversed) {
+      return { success: false, error: 'Prevenção de duplicidade: estorno financeiro já registrado para este lançamento.' };
+    }
+
+    const origTxIndex = allFinancial.findIndex((f) => f.id === targetCharge.financialTxId);
+    if (origTxIndex >= 0) {
+      allFinancial[origTxIndex] = {
+        ...allFinancial[origTxIndex],
+        notes: `${allFinancial[origTxIndex].notes || ''} [ESTORNADO EM ${new Date().toISOString()}: ${cancellationReason.trim()}]`,
+      };
+    }
+
+    const cashSessions = getCashSessions(tenantId);
+    const active = cashSessions.find((c) => c.status === 'open');
+    estornoTxId = `tx-estorno-${targetCharge.id}`;
+
+    // Registra estorno financeiro de entrada (depósito) mantendo a saída original preservada
+    const estornoTx: FinancialTransaction = {
+      id: estornoTxId,
+      tenantId,
+      type: 'deposit',
+      category: 'Estorno de Adiantamento',
+      description: `Estorno de sangria da ${table.label || `Mesa ${table.number}`}: ${cancellationReason.trim()}`,
+      amount: targetCharge.amount,
+      date: new Date().toISOString(),
+      paid: true,
+      paymentMethod: 'dinheiro',
+      cashRegisterId: active?.id,
+      relatedChargeId: targetCharge.id,
+      userId: adminUser.id,
+      userName: adminUser.name,
+      notes: `Estorno integral referente ao lançamento extra ${targetCharge.id}. Justificativa: ${cancellationReason.trim()}`,
+      createdAt: new Date().toISOString(),
+    };
+    allFinancial.unshift(estornoTx);
+    setStorage(STORAGE_KEYS.FINANCIAL, allFinancial);
+
+    // Atualiza saldo na sessão aberta de caixa
     if (active) {
-      active.totalWithdrawals = Math.max(0, (active.totalWithdrawals || 0) - targetCharge.amount);
+      active.totalDeposits = (active.totalDeposits || 0) + targetCharge.amount;
       active.expectedAmount = (active.expectedAmount || 0) + targetCharge.amount;
       saveCashSession(active);
     }
-    deleteExpense(targetCharge.financialTxId);
   }
 
   const updatedCharges = [...existingCharges];
   updatedCharges[chargeIndex] = {
     ...targetCharge,
     status: 'cancelled',
+    estornoTxId,
     cancelledAt: new Date().toISOString(),
     cancelledBy: adminUser.name,
-    cancellationReason: cancellationReason || 'Cancelado pelo ADM',
+    cancellationReason: cancellationReason.trim(),
   };
 
   const activeCharges = updatedCharges.filter((c) => c.status === 'active');
@@ -757,7 +1039,7 @@ export function cancelTableExtraCharge(
     userId: adminUser.id,
     userName: adminUser.name,
     action: 'CANCELOU_EXTRA_MESA',
-    details: `Cancelou lançamento extra de R$ ${targetCharge.amount.toFixed(2)} da ${table.label || `Mesa ${table.number}`}. Motivo: ${cancellationReason}`,
+    details: `Cancelou lançamento extra de R$ ${targetCharge.amount.toFixed(2)} da ${table.label || `Mesa ${table.number}`}. Motivo: ${cancellationReason.trim()}.${estornoTxId ? ' Estorno financeiro registrado sem apagar lançamento original.' : ''}`,
   });
 
   if (typeof window !== 'undefined') {
@@ -954,6 +1236,273 @@ export function saveOrder(order: Order): void {
     all.unshift(order);
   }
   setStorage(STORAGE_KEYS.ORDERS, all);
+}
+
+// Garante separação estrita entre venda de produtos e valores extras da mesa
+export function getOrderProductSalesTotal(order: Order): number {
+  const extra = order.extraTotal || 0;
+  return Math.max(0, (order.total || 0) - extra);
+}
+
+export function getOrderExtraTotal(order: Order): number {
+  return order.extraTotal || 0;
+}
+
+// Atualiza caixa ativo ao confirmar recebimento em Dinheiro ou PIX
+export function recordPaymentInCashSession(
+  tenantId: string,
+  method: 'dinheiro' | 'pix',
+  amount: number
+): void {
+  if (amount <= 0) return;
+  const cashSessions = getCashSessions(tenantId);
+  const activeSession = cashSessions.find((c) => c.status === 'open');
+  if (activeSession) {
+    if (method === 'dinheiro') {
+      activeSession.totalCash = (activeSession.totalCash || 0) + amount;
+      activeSession.expectedAmount = (activeSession.expectedAmount || 0) + amount;
+    } else if (method === 'pix') {
+      activeSession.totalPix = (activeSession.totalPix || 0) + amount;
+    }
+    saveCashSession(activeSession);
+  }
+}
+
+// ==========================================
+// 5. CONFERÊNCIA, QUITAÇÃO E ARQUIVAMENTO DE MESA
+// ==========================================
+
+export function getTableArchives(tenantId: string): TableAccountArchive[] {
+  const all = getStorage<TableAccountArchive[]>(STORAGE_KEYS.TABLE_ARCHIVES, []);
+  return all.filter((a) => a.tenantId === tenantId);
+}
+
+export function saveTableArchive(archive: TableAccountArchive): void {
+  const all = getStorage<TableAccountArchive[]>(STORAGE_KEYS.TABLE_ARCHIVES, []);
+  if (!all.some((a) => a.id === archive.id)) {
+    all.unshift(archive);
+    setStorage(STORAGE_KEYS.TABLE_ARCHIVES, all);
+  }
+}
+
+export function registerTablePaymentAndSettle(
+  tenantId: string,
+  tableId: string,
+  paymentInput: {
+    method: 'dinheiro' | 'pix';
+    amount: number;
+    receivedAmount?: number;
+    notes?: string;
+    allowEmptyRelease?: boolean;
+  },
+  operatorUser: { id: string; name: string }
+): {
+  success: boolean;
+  settled: boolean;
+  remainingBalance: number;
+  table?: RestaurantTable;
+  archive?: TableAccountArchive;
+  error?: string;
+} {
+  const allTables = getStorage<RestaurantTable[]>(STORAGE_KEYS.TABLES, INITIAL_DEMO_TABLES);
+  const idx = allTables.findIndex((t) => t.id === tableId);
+  if (idx < 0) return { success: false, settled: false, remainingBalance: 0, error: 'Mesa não encontrada.' };
+
+  const table = allTables[idx];
+  const productsTotal = table.productsTotal ?? Math.max(0, (table.currentTotal || 0) - (table.extraTotal || 0));
+  const extraTotal = table.extraTotal || 0;
+  const grandTotal = Number((productsTotal + extraTotal).toFixed(2));
+  const previousPaid = Number((table.paidAmount || 0).toFixed(2));
+  const currentRemaining = Number(Math.max(0, grandTotal - previousPaid).toFixed(2));
+
+  // Caso especial: mesa aberta sem nenhum consumo nem valor extra
+  if (currentRemaining <= 0.009) {
+    if (!paymentInput.allowEmptyRelease && grandTotal > 0 && previousPaid < grandTotal) {
+      return {
+        success: false,
+        settled: false,
+        remainingBalance: currentRemaining,
+        error: 'Saldo restante pendente de confirmação.',
+      };
+    }
+  } else {
+    if (!paymentInput.amount || paymentInput.amount <= 0) {
+      return {
+        success: false,
+        settled: false,
+        remainingBalance: currentRemaining,
+        error: 'Informe um valor de pagamento positivo para quitar ou abater o saldo da mesa.',
+      };
+    }
+  }
+
+  const paidNow = currentRemaining <= 0.009 ? 0 : Math.min(currentRemaining, Number(paymentInput.amount.toFixed(2)));
+  const existingPayments = table.payments || [];
+  let updatedPayments = [...existingPayments];
+
+  if (paidNow > 0) {
+    const newPay: TablePaymentRecord = {
+      id: `tpay-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      method: paymentInput.method,
+      amount: paidNow,
+      receivedAmount: paymentInput.method === 'dinheiro' ? paymentInput.receivedAmount || paidNow : paidNow,
+      change:
+        paymentInput.method === 'dinheiro'
+          ? Math.max(0, Number(((paymentInput.receivedAmount || paidNow) - paidNow).toFixed(2)))
+          : 0,
+      paidAt: new Date().toISOString(),
+      receivedById: operatorUser.id,
+      receivedByName: operatorUser.name,
+      notes: paymentInput.notes,
+    };
+    updatedPayments.push(newPay);
+
+    // Atualiza sessão aberta do caixa
+    recordPaymentInCashSession(tenantId, paymentInput.method, paidNow);
+
+    // Registra movimentação financeira de entrada
+    const allFinancial = getStorage<FinancialTransaction[]>(STORAGE_KEYS.FINANCIAL, INITIAL_DEMO_EXPENSES);
+    const activeCash = getCashSessions(tenantId).find((c) => c.status === 'open');
+    const revTx: FinancialTransaction = {
+      id: `tx-tpay-${newPay.id}`,
+      tenantId,
+      type: 'revenue',
+      category: 'Fechamento de Mesa',
+      description: `Recebimento ${table.label || `Mesa ${table.number}`} (${paymentInput.method.toUpperCase()})`,
+      amount: paidNow,
+      date: newPay.paidAt,
+      paid: true,
+      paymentMethod: paymentInput.method,
+      cashRegisterId: activeCash?.id,
+      userId: operatorUser.id,
+      userName: operatorUser.name,
+      notes: `Consumo produtos: R$ ${productsTotal.toFixed(2)} | Valores extras: R$ ${extraTotal.toFixed(2)}`,
+      createdAt: newPay.paidAt,
+    };
+    allFinancial.unshift(revTx);
+    setStorage(STORAGE_KEYS.FINANCIAL, allFinancial);
+  }
+
+  const newPaidTotal = Number((previousPaid + paidNow).toFixed(2));
+  const remainingBalance = Number(Math.max(0, grandTotal - newPaidTotal).toFixed(2));
+
+  // Se ainda existe saldo restante, NÃO libera a mesa!
+  if (remainingBalance > 0.009) {
+    const partialTable: RestaurantTable = {
+      ...table,
+      status: table.status === 'available' ? 'closing' : table.status,
+      paidAmount: newPaidTotal,
+      payments: updatedPayments,
+    };
+    allTables[idx] = partialTable;
+    setStorage(STORAGE_KEYS.TABLES, allTables);
+
+    addAuditLog({
+      tenantId,
+      userId: operatorUser.id,
+      userName: operatorUser.name,
+      action: 'PAGAMENTO_PARCIAL_MESA',
+      details: `Registrou pagamento parcial de R$ ${paidNow.toFixed(2)} (${paymentInput.method.toUpperCase()}) na "${table.label || `Mesa ${table.number}`}". Saldo restante: R$ ${remainingBalance.toFixed(2)}. Mesa mantida ocupada.`,
+    });
+
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('sabor_local_sync', { detail: { action: 'table_partial_payment', tableId } }));
+    }
+
+    return {
+      success: true,
+      settled: false,
+      remainingBalance,
+      table: partialTable,
+    };
+  }
+
+  // Quitação integral confirmada -> encerra pedidos vinculados, arquiva conta, libera mesa e zera timer
+  const nowIso = new Date().toISOString();
+  const allOrders = getStorage<Order[]>(STORAGE_KEYS.ORDERS, INITIAL_DEMO_ORDERS);
+  const linkedOrderIds: string[] = [];
+
+  const updatedOrders = allOrders.map((o) => {
+    if (
+      o.tenantId === tenantId &&
+      o.type === 'table' &&
+      (o.tableId === table.id || o.tableNumber === table.number) &&
+      o.status !== 'cancelled' &&
+      (!o.paid || o.status !== 'closed')
+    ) {
+      linkedOrderIds.push(o.id);
+      return {
+        ...o,
+        status: 'closed' as const,
+        paid: true,
+        closedAt: o.closedAt || nowIso,
+      };
+    }
+    return o;
+  });
+  setStorage(STORAGE_KEYS.ORDERS, updatedOrders);
+
+  // Arquiva o histórico completo da conta da mesa antes de zerar os valores operacionais
+  const archive: TableAccountArchive = {
+    id: `tarch-${table.id}-${Date.now()}`,
+    tenantId,
+    tableId: table.id,
+    tableNumber: table.number,
+    tableName: table.customerName || table.label || `Mesa ${table.number}`,
+    openedAt: table.openedAt || nowIso,
+    closedAt: nowIso,
+    closedById: operatorUser.id,
+    closedByName: operatorUser.name,
+    productsTotal,
+    extraTotal,
+    grandTotal,
+    paidTotal: newPaidTotal,
+    orderIds: linkedOrderIds,
+    extraCharges: table.extraCharges || [],
+    payments: updatedPayments,
+  };
+  saveTableArchive(archive);
+
+  // Libera mesa e encerra temporizador
+  const freedTable: RestaurantTable = {
+    ...table,
+    status: 'available',
+    openedAt: undefined,
+    waiterId: undefined,
+    waiterName: undefined,
+    currentOrderId: undefined,
+    currentTotal: 0,
+    productsTotal: 0,
+    extraTotal: 0,
+    paidAmount: 0,
+    payments: [],
+    extraCharges: [],
+    activeOrdersCount: 0,
+    timer: undefined,
+  };
+
+  allTables[idx] = freedTable;
+  setStorage(STORAGE_KEYS.TABLES, allTables);
+
+  addAuditLog({
+    tenantId,
+    userId: operatorUser.id,
+    userName: operatorUser.name,
+    action: 'QUITACAO_E_LIBERACAO_MESA',
+    details: `Quitou e liberou "${table.label || `Mesa ${table.number}`}". Produtos: R$ ${productsTotal.toFixed(2)} | Extras: R$ ${extraTotal.toFixed(2)} | Total pago: R$ ${newPaidTotal.toFixed(2)}. Arquivo ${archive.id} preservado.`,
+  });
+
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('sabor_local_sync', { detail: { action: 'table_settled', tableId } }));
+  }
+
+  return {
+    success: true,
+    settled: true,
+    remainingBalance: 0,
+    table: freedTable,
+    archive,
+  };
 }
 
 // Fiado e Pendências (Debts)
@@ -1168,7 +1717,9 @@ export function getSellerSalesSummary(tenantId: string, sellerId?: string, selle
     return false;
   });
 
-  const totalSold = myOrders.filter((o) => o.paid).reduce((acc, o) => acc + (o.total || 0), 0);
+  const totalSold = myOrders
+    .filter((o) => o.paid)
+    .reduce((acc, o) => acc + getOrderProductSalesTotal(o), 0);
   const activeOrders = myOrders.filter((o) => o.status === 'received' || o.status === 'preparing' || o.status === 'ready');
 
   return {
@@ -1368,6 +1919,7 @@ export function createSystemBackup(
   const users = getUsers(tenantId);
   const savedReports = getSavedReports(tenantId);
   const archivedPeriods = getArchivedPeriods(tenantId);
+  const tableArchives = getTableArchives(tenantId);
   const themeConfig = getThemeConfig(tenantId);
 
   const payload = {
@@ -1382,6 +1934,7 @@ export function createSystemBackup(
     users,
     savedReports,
     archivedPeriods,
+    tableArchives,
     themeConfig,
   };
 
@@ -1527,6 +2080,20 @@ export function restoreSystemBackup(
         (a) => a.tenantId !== tenantId
       );
       setStorage(STORAGE_KEYS.ARCHIVED_PERIODS, [...allArch, ...combinedArch]);
+    }
+
+    if (Array.isArray(payload.tableArchives)) {
+      const existingTableArch = getTableArchives(tenantId);
+      const combinedTableArch = [...existingTableArch];
+      payload.tableArchives.forEach((arch) => {
+        if (!combinedTableArch.some((c) => c.id === arch.id)) {
+          combinedTableArch.push(arch);
+        }
+      });
+      const allTableArch = getStorage<TableAccountArchive[]>(STORAGE_KEYS.TABLE_ARCHIVES, []).filter(
+        (a) => a.tenantId !== tenantId
+      );
+      setStorage(STORAGE_KEYS.TABLE_ARCHIVES, [...allTableArch, ...combinedTableArch]);
     }
 
     addAuditLog({

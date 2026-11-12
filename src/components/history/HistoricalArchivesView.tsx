@@ -45,6 +45,7 @@ import {
   getInventoryTransactions,
   getExpenses,
   getTables,
+  getOrderProductSalesTotal,
 } from '../../services/storage';
 import { formatCurrencyBR, formatTimeBR } from '../../utils/formatters';
 
@@ -132,7 +133,7 @@ export const HistoricalArchivesView: React.FC = () => {
     let summaryData: Record<string, any> = {};
     let itemRows: any[] = [];
 
-    const totalVendido = filteredOrders.reduce((acc, o) => acc + (o.total || 0), 0);
+    const totalVendido = filteredOrders.reduce((acc, o) => acc + getOrderProductSalesTotal(o), 0);
     const totalPedidos = filteredOrders.length;
     const totalDespesas = filteredExpenses.reduce((acc, e) => acc + (e.amount || 0), 0);
     const lucroLiquido = totalVendido - totalDespesas;
@@ -267,7 +268,7 @@ export const HistoricalArchivesView: React.FC = () => {
       return t >= startFilter && t <= endFilter;
     });
 
-    const totalRevenue = periodOrders.reduce((acc, o) => acc + (o.total || 0), 0);
+    const totalRevenue = periodOrders.reduce((acc, o) => acc + getOrderProductSalesTotal(o), 0);
     const expensesTotal = periodExpenses.reduce((acc, e) => acc + (e.amount || 0), 0);
     const cashTotal = periodOrders
       .flatMap((o) => o.payments || [])

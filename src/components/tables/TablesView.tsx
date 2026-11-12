@@ -29,10 +29,11 @@ import {
   Square,
   ShieldAlert,
   Info,
+  Archive,
 } from 'lucide-react';
 import { useTenant } from '../../contexts/TenantContext';
 import { useAuth } from '../../contexts/AuthContext';
-import { RestaurantTable, TableExtraCharge, TableTimer } from '../../types';
+import { RestaurantTable, TableExtraCharge, TableTimer, TableAccountArchive } from '../../types';
 import {
   getTables,
   saveTable,
@@ -40,16 +41,28 @@ import {
   deleteTablesBatch,
   deleteAllAvailableTables,
   addTableExtraCharge,
+  editTableExtraCharge,
   cancelTableExtraCharge,
   setTableTimer,
   pauseResumeTableTimer,
   resetTableTimer,
   cancelTableTimer,
   acknowledgeTableTimer,
+  registerTablePaymentAndSettle,
+  getTableArchives,
+  getOrders,
+  getTableDeletionBlockReason,
   addAuditLog,
 } from '../../services/storage';
-import { formatBRL, formatTimeBR } from '../../utils/formatters';
+import { formatBRL, formatTimeBR, formatDateTimeBR } from '../../utils/formatters';
 import { playTableAlarmSound } from '../../utils/soundAlert';
+import {
+  sendTableExpiredNotification,
+  requestNotificationPermission,
+  getNotificationPermission,
+  isNotificationSupported,
+} from '../../utils/notifications';
+import confetti from 'canvas-confetti';
 
 interface TablesViewProps {
   onStartSaleForTable?: (tableNumber: number) => void;
@@ -80,11 +93,29 @@ export const TablesView: React.FC<TablesViewProps> = ({ onStartSaleForTable }) =
   const [extraAmount, setExtraAmount] = useState<number>(10);
   const [extraDescription, setExtraDescription] = useState<string>('Valor entregue ao cliente');
   const [isCashWithdrawal, setIsCashWithdrawal] = useState<boolean>(true);
+  const [isSubmittingExtra, setIsSubmittingExtra] = useState<boolean>(false);
+
+  // Modal de Edição de Lançamento Extra (ADM)
+  const [editingExtraCharge, setEditingExtraCharge] = useState<TableExtraCharge | null>(null);
+  const [editExtraAmount, setEditExtraAmount] = useState<number>(0);
+  const [editExtraDescription, setEditExtraDescription] = useState<string>('');
+  const [editExtraReason, setEditExtraReason] = useState<string>('');
 
   // Modal de Temporizador / Alerta (ADM)
   const [isTimerModalOpen, setIsTimerModalOpen] = useState(false);
-  const [timerMinutes, setTimerMinutes] = useState<number>(15);
   const [customTimerMinutes, setCustomTimerMinutes] = useState<number>(15);
+  const [notificationPerm, setNotificationPerm] = useState<NotificationPermission>(getNotificationPermission());
+
+  // Modal de Conferência e Quitação da Mesa (Item 4)
+  const [isSettlementModalOpen, setIsSettlementModalOpen] = useState(false);
+  const [settlementMethod, setSettlementMethod] = useState<'dinheiro' | 'pix'>('dinheiro');
+  const [settlementPayAmount, setSettlementPayAmount] = useState<number>(0);
+  const [settlementCashReceived, setSettlementCashReceived] = useState<number>(0);
+  const [settlementNotes, setSettlementNotes] = useState<string>('');
+
+  // Modal de Histórico Arquivado de Mesas
+  const [isArchivesModalOpen, setIsArchivesModalOpen] = useState(false);
+  const [tableArchives, setTableArchives] = useState<TableAccountArchive[]>([]);
 
   // Modo de Seleção Múltipla para Exclusão em Lote (ADM)
   const [isBatchMode, setIsBatchMode] = useState(false);
@@ -114,19 +145,24 @@ export const TablesView: React.FC<TablesViewProps> = ({ onStartSaleForTable }) =
     return () => window.removeEventListener('sabor_local_sync', handleSync);
   }, [currentTenant.id]);
 
-  // Timer em tempo real a cada 1 segundo para contagem regressiva e disparo de alarme
+  // Timer em tempo real a cada 1 segundo para contagem regressiva, disparo de alarme e notificação Android
   useEffect(() => {
     const interval = setInterval(() => {
       const now = Date.now();
       setCurrentTime(now);
 
-      // Verifica se alguma mesa acabou de expirar o temporizador para emitir alerta sonoro
+      // Verifica se alguma mesa acabou de expirar o temporizador para emitir alerta sonoro e notificação
       tables.forEach((table) => {
         if (table.timer && !table.timer.isPaused && !table.timer.acknowledged) {
           const target = new Date(table.timer.targetTime).getTime();
           if (now >= target && !table.timer.isExpired) {
-            // Dispara som de alerta suave
+            // Dispara som sintetizado de alerta suave
             playTableAlarmSound();
+            // Dispara notificação compatível com Android / segundo plano
+            sendTableExpiredNotification(
+              table.label || `Mesa ${table.number}`,
+              table.timer.durationMinutes
+            );
             // Marca como expirado no storage
             table.timer.isExpired = true;
             saveTable(table);
@@ -257,18 +293,19 @@ export const TablesView: React.FC<TablesViewProps> = ({ onStartSaleForTable }) =
   // ADM: Excluir Mesa Individual (Com validação obrigatória)
   const handleDeleteTable = (table: RestaurantTable, e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
+    if (!isAdm) return;
 
-    // Bloqueio rigoroso: Não permite exclusão se houver pedido ativo ou valor em aberto
-    if (table.status === 'occupied' || table.status === 'closing' || (table.currentTotal && table.currentTotal > 0)) {
-      showFeedback(
-        `⛔ Bloqueio de Segurança: Não é permitido excluir "${table.label || `Mesa ${table.number}`}" enquanto houver atendimento ativo ou conta em aberto (${formatBRL(table.currentTotal)}). Encerre a conta antes de excluir.`,
-        'error'
-      );
+    const blockReason = getTableDeletionBlockReason(table, getOrders(currentTenant.id));
+    if (blockReason) {
+      showFeedback(`⛔ ${blockReason}`, 'error');
       return;
     }
 
-    if (confirm(`Confirma a exclusão de "${table.label || `Mesa ${table.number}`}"? Esta ação removerá a mesa do salão.`)) {
-      const result = deleteTable(table.id);
+    if (confirm(`Confirma a exclusão de "${table.label || `Mesa ${table.number}`}"? Esta ação removerá apenas o cadastro da mesa; todo o histórico financeiro e de pedidos será preservado.`)) {
+      const result = deleteTable(
+        table.id,
+        currentUser ? { id: currentUser.id, name: currentUser.name } : undefined
+      );
       if (result.success) {
         loadTables();
         setIsActionModalOpen(false);
@@ -281,17 +318,20 @@ export const TablesView: React.FC<TablesViewProps> = ({ onStartSaleForTable }) =
 
   // ADM: Exclusão em Lote das Selecionadas
   const handleExecuteBatchDelete = () => {
-    if (selectedIdsForBatch.length === 0) return;
+    if (!isAdm || selectedIdsForBatch.length === 0) return;
 
-    if (confirm(`Confirma a exclusão em lote de ${selectedIdsForBatch.length} mesa(s) selecionada(s)? Apenas mesas livres serão removidas.`)) {
-      const res = deleteTablesBatch(selectedIdsForBatch);
+    if (confirm(`Confirma a exclusão em lote de ${selectedIdsForBatch.length} mesa(s) selecionada(s)? Mesas ocupadas, com pedidos pendentes ou saldo em aberto serão protegidas.`)) {
+      const res = deleteTablesBatch(
+        selectedIdsForBatch,
+        currentUser ? { id: currentUser.id, name: currentUser.name } : undefined
+      );
       loadTables();
       setSelectedIdsForBatch([]);
       setIsBatchMode(false);
 
       if (res.blockedCount > 0) {
         showFeedback(
-          `✓ ${res.successCount} mesa(s) livre(s) excluída(s). ⚠️ ${res.blockedCount} mesa(s) NÃO foram excluídas por estarem ocupadas ou com saldo em aberto.`,
+          `✓ ${res.successCount} mesa(s) livre(s) excluída(s). ⚠️ ${res.blockedCount} mesa(s) protegida(s): ${res.blockedReasons[0]}`,
           'error'
         );
       } else {
@@ -302,23 +342,28 @@ export const TablesView: React.FC<TablesViewProps> = ({ onStartSaleForTable }) =
 
   // ADM: Excluir Todas as Mesas Disponíveis
   const handleDeleteAllAvailable = () => {
-    const availableTotal = tables.filter((t) => t.status === 'available' && (!t.currentTotal || t.currentTotal <= 0)).length;
+    if (!isAdm) return;
+    const orders = getOrders(currentTenant.id);
+    const availableTotal = tables.filter((t) => !getTableDeletionBlockReason(t, orders)).length;
     if (availableTotal === 0) {
-      showFeedback('Não há mesas disponíveis sem pedidos para excluir.', 'error');
+      showFeedback('Não há mesas livres sem pendências para excluir.', 'error');
       return;
     }
 
-    if (confirm(`ATENÇÃO: Deseja realmente excluir TODAS as ${availableTotal} mesas disponíveis do salão? Mesas ocupadas ou em atendimento permanecerão protegidas.`)) {
-      const res = deleteAllAvailableTables(currentTenant.id);
+    if (confirm(`ATENÇÃO: Deseja excluir TODAS as ${availableTotal} mesa(s) livre(s) do salão? Mesas ocupadas ou com pendências financeiras permanecerão protegidas.`)) {
+      const res = deleteAllAvailableTables(
+        currentTenant.id,
+        currentUser ? { id: currentUser.id, name: currentUser.name } : undefined
+      );
       loadTables();
-      showFeedback(`✓ ${res.successCount} mesas disponíveis foram removidas do salão.`);
+      showFeedback(`✓ ${res.successCount} mesa(s) livre(s) removida(s). ${res.blockedCount} mesa(s) em atendimento protegida(s).`);
     }
   };
 
   // ADM: Adicionar Valor Extra à Mesa
   const handleAddExtraChargeSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!selectedTable || !currentUser || !isAdm) return;
+    if (!selectedTable || !currentUser || !isAdm || isSubmittingExtra) return;
 
     if (!extraAmount || extraAmount <= 0) {
       showFeedback('Informe um valor válido em reais (R$).', 'error');
@@ -330,13 +375,56 @@ export const TablesView: React.FC<TablesViewProps> = ({ onStartSaleForTable }) =
       return;
     }
 
-    const res = addTableExtraCharge(
+    setIsSubmittingExtra(true);
+    try {
+      const res = addTableExtraCharge(
+        currentTenant.id,
+        selectedTable.id,
+        {
+          amount: extraAmount,
+          description: extraDescription.trim(),
+          isCashWithdrawal,
+        },
+        { id: currentUser.id, name: currentUser.name }
+      );
+
+      if (res.success && res.table) {
+        setSelectedTable(res.table);
+        loadTables();
+        setIsExtraChargeModalOpen(false);
+        setExtraAmount(10);
+        setExtraDescription('');
+        showFeedback(`✓ Lançamento extra de ${formatBRL(extraAmount)} adicionado à conta de "${res.table.label}"!`);
+      } else {
+        showFeedback(res.error || 'Erro ao adicionar valor extra.', 'error');
+      }
+    } finally {
+      setIsSubmittingExtra(false);
+    }
+  };
+
+  // ADM: Abrir Edição de Lançamento Extra
+  const handleOpenEditExtraCharge = (charge: TableExtraCharge) => {
+    if (!isAdm || charge.status === 'cancelled') return;
+    setEditingExtraCharge(charge);
+    setEditExtraAmount(charge.amount);
+    setEditExtraDescription(charge.description);
+    setEditExtraReason('');
+  };
+
+  // ADM: Salvar Edição de Lançamento Extra
+  const handleSaveEditExtraCharge = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedTable || !editingExtraCharge || !currentUser || !isAdm) return;
+
+    const res = editTableExtraCharge(
       currentTenant.id,
       selectedTable.id,
+      editingExtraCharge.id,
       {
-        amount: extraAmount,
-        description: extraDescription.trim(),
-        isCashWithdrawal,
+        amount: editExtraAmount,
+        description: editExtraDescription,
+        reason: editExtraReason || 'Correção administrativa',
       },
       { id: currentUser.id, name: currentUser.name }
     );
@@ -344,12 +432,10 @@ export const TablesView: React.FC<TablesViewProps> = ({ onStartSaleForTable }) =
     if (res.success && res.table) {
       setSelectedTable(res.table);
       loadTables();
-      setIsExtraChargeModalOpen(false);
-      setExtraAmount(10);
-      setExtraDescription('');
-      showFeedback(`✓ Lançamento extra de ${formatBRL(extraAmount)} adicionado à conta de "${res.table.label}"!`);
+      setEditingExtraCharge(null);
+      showFeedback('✓ Lançamento extra atualizado e ajuste financeiro registrado no histórico!');
     } else {
-      showFeedback(res.error || 'Erro ao adicionar valor extra.', 'error');
+      showFeedback(res.error || 'Erro ao editar lançamento extra.', 'error');
     }
   };
 
@@ -357,21 +443,25 @@ export const TablesView: React.FC<TablesViewProps> = ({ onStartSaleForTable }) =
   const handleCancelExtraCharge = (chargeId: string, chargeAmount: number) => {
     if (!selectedTable || !currentUser || !isAdm) return;
 
-    const reason = prompt(`Informe o motivo do cancelamento do valor extra de ${formatBRL(chargeAmount)}:`, 'Cancelamento solicitado pelo ADM');
+    const reason = prompt(`Informe a justificativa obrigatória para cancelar o valor extra de ${formatBRL(chargeAmount)}:`, '');
     if (reason === null) return;
+    if (!reason.trim()) {
+      showFeedback('É obrigatório informar a justificativa para cancelar e estornar o lançamento.', 'error');
+      return;
+    }
 
     const res = cancelTableExtraCharge(
       currentTenant.id,
       selectedTable.id,
       chargeId,
-      reason || 'Cancelado pelo ADM',
+      reason.trim(),
       { id: currentUser.id, name: currentUser.name }
     );
 
     if (res.success && res.table) {
       setSelectedTable(res.table);
       loadTables();
-      showFeedback(`✓ Lançamento extra cancelado e estornado com sucesso.`);
+      showFeedback(`✓ Lançamento extra cancelado e estorno registrado mantendo o histórico original!`);
     } else {
       showFeedback(res.error || 'Erro ao cancelar lançamento extra.', 'error');
     }
@@ -458,30 +548,65 @@ export const TablesView: React.FC<TablesViewProps> = ({ onStartSaleForTable }) =
     showFeedback(`Conta de "${table.label || `Mesa ${table.number}`}" solicitada (Aguardando Pagamento).`);
   };
 
-  const handleFreeTable = (table: RestaurantTable) => {
-    const updated: RestaurantTable = {
-      ...table,
-      status: 'available',
-      openedAt: undefined,
-      waiterId: undefined,
-      waiterName: undefined,
-      currentTotal: 0,
-      productsTotal: 0,
-      extraTotal: 0,
-      extraCharges: [],
-      timer: undefined,
-    };
-    saveTable(updated);
-    addAuditLog({
-      tenantId: currentTenant.id,
-      userId: currentUser?.id || 'garcom',
-      userName: currentUser?.name || 'Vendedor',
-      action: 'LIBEROU_MESA',
-      details: `Liberou a mesa "${table.label || `Mesa ${table.number}`}" após encerramento`,
-    });
+  const handleOpenSettlementModal = (table: RestaurantTable) => {
+    const remaining = Math.max(0, Number(((table.currentTotal || 0) - (table.paidAmount || 0)).toFixed(2)));
+    setSettlementMethod('dinheiro');
+    setSettlementPayAmount(remaining);
+    setSettlementCashReceived(remaining);
+    setSettlementNotes('');
+    setIsSettlementModalOpen(true);
+  };
+
+  const handleConfirmTableSettlement = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedTable || !currentUser) return;
+
+    const remaining = Math.max(0, Number(((selectedTable.currentTotal || 0) - (selectedTable.paidAmount || 0)).toFixed(2)));
+    const isEmptyTable = remaining <= 0.009 && (selectedTable.currentTotal || 0) <= 0.009;
+
+    const res = registerTablePaymentAndSettle(
+      currentTenant.id,
+      selectedTable.id,
+      {
+        method: settlementMethod,
+        amount: settlementPayAmount,
+        receivedAmount: settlementMethod === 'dinheiro' ? settlementCashReceived : settlementPayAmount,
+        notes: settlementNotes.trim() || undefined,
+        allowEmptyRelease: isEmptyTable,
+      },
+      { id: currentUser.id, name: currentUser.name }
+    );
+
+    if (!res.success) {
+      showFeedback(res.error || 'Erro ao registrar pagamento da mesa.', 'error');
+      return;
+    }
+
     loadTables();
-    setIsActionModalOpen(false);
-    showFeedback(`✓ "${table.label || `Mesa ${table.number}`}" liberada e disponível para novo atendimento.`);
+    if (res.settled) {
+      confetti({ particleCount: 35, spread: 60, origin: { y: 0.8 } });
+      setIsSettlementModalOpen(false);
+      setIsActionModalOpen(false);
+      setSelectedTable(null);
+      showFeedback(`✓ "${selectedTable.label || `Mesa ${selectedTable.number}`}" quitada, arquivada (${res.archive?.id}) e liberada!`);
+    } else if (res.table) {
+      setSelectedTable(res.table);
+      setSettlementPayAmount(res.remainingBalance);
+      setSettlementCashReceived(res.remainingBalance);
+      showFeedback(
+        `✓ Pagamento parcial registrado! Saldo restante: ${formatBRL(res.remainingBalance)}. A mesa permanece ocupada até quitação integral.`
+      );
+    }
+  };
+
+  const handleEnableNotifications = async () => {
+    const perm = await requestNotificationPermission();
+    setNotificationPerm(perm);
+    if (perm === 'granted') {
+      showFeedback('🔔 Notificações em segundo plano ativadas para alertas de mesas!');
+    } else {
+      showFeedback('Permissão de notificação negada ou indisponível neste dispositivo.', 'error');
+    }
   };
 
   // Contadores
@@ -576,6 +701,37 @@ export const TablesView: React.FC<TablesViewProps> = ({ onStartSaleForTable }) =
                 <span>Excluir Todas Livres</span>
               </button>
             )}
+
+            {/* Botão de Notificações Android / Segundo Plano */}
+            {isNotificationSupported() && (
+              <button
+                type="button"
+                onClick={handleEnableNotifications}
+                className={`flex items-center gap-1.5 rounded-xl border px-3 py-2.5 text-xs font-bold transition shadow-xs ${
+                  notificationPerm === 'granted'
+                    ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+                    : 'border-amber-200 bg-amber-50 text-amber-900 hover:bg-amber-100'
+                }`}
+                title="Ativar notificações no dispositivo quando o temporizador de uma mesa encerrar"
+              >
+                <Bell className="h-4 w-4" />
+                <span>{notificationPerm === 'granted' ? 'Alertas Ativos' : 'Ativar Alertas'}</span>
+              </button>
+            )}
+
+            {/* Histórico de Contas Arquivadas */}
+            <button
+              type="button"
+              onClick={() => {
+                setTableArchives(getTableArchives(currentTenant.id));
+                setIsArchivesModalOpen(true);
+              }}
+              className="flex items-center gap-1.5 rounded-xl border border-stone-200 bg-white px-3.5 py-2.5 text-xs font-bold text-stone-700 shadow-xs hover:bg-stone-50 transition"
+              title="Consultar contas encerradas e arquivadas (preservadas mesmo após exclusão de mesas)"
+            >
+              <Archive className="h-4 w-4 text-stone-500" />
+              <span>Contas Arquivadas</span>
+            </button>
 
             {/* Botão de Adicionar Nova Mesa */}
             <button
@@ -776,9 +932,11 @@ export const TablesView: React.FC<TablesViewProps> = ({ onStartSaleForTable }) =
                     <>
                       <div className="flex items-baseline justify-between">
                         <p className="text-sm font-black text-stone-900">
-                          {formatBRL(table.currentTotal || 0)}
+                          {formatBRL(Math.max(0, (table.currentTotal || 0) - (table.paidAmount || 0)))}
                         </p>
-                        <span className="text-[9px] text-stone-400">Total</span>
+                        <span className="text-[9px] text-stone-400">
+                          {table.paidAmount && table.paidAmount > 0 ? 'Restante' : 'Total'}
+                        </span>
                       </div>
 
                       <div className="mt-1 flex items-center justify-between text-[10px] text-stone-400">
@@ -897,10 +1055,30 @@ export const TablesView: React.FC<TablesViewProps> = ({ onStartSaleForTable }) =
 
                   {isAdm && (
                     <div className="flex items-center gap-1">
+                      {getTimerDisplay(selectedTable.timer)?.isExpired && !selectedTable.timer.acknowledged && (
+                        <button
+                          onClick={() => {
+                            const res = acknowledgeTableTimer(currentTenant.id, selectedTable.id);
+                            if (res) {
+                              setSelectedTable(res);
+                              loadTables();
+                              showFeedback('✓ Alerta visual/sonoro da mesa reconhecido.');
+                            }
+                          }}
+                          className="px-2 py-1.5 rounded-lg bg-rose-600 text-white text-[10px] font-bold hover:bg-rose-700"
+                          title="Silenciar alerta piscando"
+                        >
+                          Reconhecer
+                        </button>
+                      )}
+
                       <button
                         onClick={() => {
                           const res = pauseResumeTableTimer(currentTenant.id, selectedTable.id);
-                          if (res) setSelectedTable(res);
+                          if (res) {
+                            setSelectedTable(res);
+                            loadTables();
+                          }
                         }}
                         className="p-1.5 rounded-lg bg-white border border-stone-200 text-stone-700 hover:bg-stone-50"
                         title="Pausar / Retomar contagem"
@@ -911,7 +1089,10 @@ export const TablesView: React.FC<TablesViewProps> = ({ onStartSaleForTable }) =
                       <button
                         onClick={() => {
                           const res = resetTableTimer(currentTenant.id, selectedTable.id);
-                          if (res) setSelectedTable(res);
+                          if (res) {
+                            setSelectedTable(res);
+                            loadTables();
+                          }
                         }}
                         className="p-1.5 rounded-lg bg-white border border-stone-200 text-stone-700 hover:bg-stone-50"
                         title="Reiniciar tempo"
@@ -922,7 +1103,10 @@ export const TablesView: React.FC<TablesViewProps> = ({ onStartSaleForTable }) =
                       <button
                         onClick={() => {
                           const res = cancelTableTimer(currentTenant.id, selectedTable.id);
-                          if (res) setSelectedTable(res);
+                          if (res) {
+                            setSelectedTable(res);
+                            loadTables();
+                          }
                         }}
                         className="p-1.5 rounded-lg bg-white border border-stone-200 text-rose-600 hover:bg-rose-50"
                         title="Cancelar alerta"
@@ -946,11 +1130,11 @@ export const TablesView: React.FC<TablesViewProps> = ({ onStartSaleForTable }) =
                 </button>
               )}
 
-              {/* Resumo Financeiro da Mesa (Consumo vs Valores Extras) */}
+              {/* Resumo Financeiro da Mesa (Consumo vs Valores Extras vs Pagamentos vs Saldo) */}
               <div className="rounded-2xl bg-stone-50 p-4 border border-stone-200 space-y-2">
                 <div className="flex justify-between text-xs text-stone-600">
                   <span>Consumo de Produtos:</span>
-                  <strong>{formatBRL(selectedTable.productsTotal || (selectedTable.currentTotal - (selectedTable.extraTotal || 0)) || 0)}</strong>
+                  <strong>{formatBRL(selectedTable.productsTotal ?? Math.max(0, (selectedTable.currentTotal || 0) - (selectedTable.extraTotal || 0)))}</strong>
                 </div>
 
                 {selectedTable.extraTotal !== undefined && selectedTable.extraTotal > 0 && (
@@ -961,9 +1145,23 @@ export const TablesView: React.FC<TablesViewProps> = ({ onStartSaleForTable }) =
                 )}
 
                 <div className="border-t border-stone-200/80 pt-2 flex justify-between items-baseline">
-                  <span className="text-xs font-bold text-stone-700">Total da Conta</span>
-                  <span className="text-xl font-black text-stone-900">
+                  <span className="text-xs font-bold text-stone-700">Total Geral a Receber</span>
+                  <span className="text-base font-black text-stone-900">
                     {formatBRL(selectedTable.currentTotal || 0)}
+                  </span>
+                </div>
+
+                {(selectedTable.paidAmount || 0) > 0 && (
+                  <div className="flex justify-between text-xs text-emerald-700 font-semibold">
+                    <span>Pagamentos Registrados:</span>
+                    <span>-{formatBRL(selectedTable.paidAmount || 0)}</span>
+                  </div>
+                )}
+
+                <div className="border-t border-stone-200 pt-2 flex justify-between items-baseline">
+                  <span className="text-xs font-bold text-stone-800">Saldo Restante</span>
+                  <span className="text-xl font-black text-amber-700">
+                    {formatBRL(Math.max(0, (selectedTable.currentTotal || 0) - (selectedTable.paidAmount || 0)))}
                   </span>
                 </div>
 
@@ -1000,36 +1198,56 @@ export const TablesView: React.FC<TablesViewProps> = ({ onStartSaleForTable }) =
                     {selectedTable.extraCharges.map((charge) => {
                       const isCancelled = charge.status === 'cancelled';
                       return (
-                        <div key={charge.id} className={`p-2.5 flex items-center justify-between ${isCancelled ? 'bg-stone-50 opacity-60 line-through' : ''}`}>
-                          <div className="min-w-0 flex-1">
-                            <div className="flex items-center gap-1.5">
+                        <div key={charge.id} className={`p-2.5 flex items-start justify-between ${isCancelled ? 'bg-stone-50 opacity-70' : ''}`}>
+                          <div className={`min-w-0 flex-1 ${isCancelled ? 'line-through' : ''}`}>
+                            <div className="flex flex-wrap items-center gap-1.5">
                               <span className="font-bold text-stone-900">{formatBRL(charge.amount)}</span>
                               {charge.isCashWithdrawal && (
                                 <span className="rounded bg-rose-50 px-1 text-[9px] font-bold text-rose-700 border border-rose-200">
                                   Saída do Caixa
                                 </span>
                               )}
+                              {charge.editedAt && !isCancelled && (
+                                <span className="rounded bg-amber-50 px-1 text-[9px] font-bold text-amber-800 border border-amber-200">
+                                  Editado
+                                </span>
+                              )}
                               {isCancelled && (
-                                <span className="rounded bg-stone-200 px-1 text-[9px] font-bold text-stone-600">
-                                  Cancelado
+                                <span className="rounded bg-stone-200 px-1 text-[9px] font-bold text-stone-700">
+                                  Estornado
                                 </span>
                               )}
                             </div>
-                            <p className="text-stone-600 truncate mt-0.5">{charge.description}</p>
-                            <span className="text-[10px] text-stone-400">
+                            <p className="text-stone-700 truncate mt-0.5">{charge.description}</p>
+                            <span className="text-[10px] text-stone-400 block">
                               Por {charge.createdByName} às {formatTimeBR(charge.createdAt)}
                             </span>
+                            {isCancelled && charge.cancellationReason && (
+                              <span className="text-[10px] text-rose-700 block no-underline">
+                                Motivo estorno: {charge.cancellationReason}
+                              </span>
+                            )}
                           </div>
 
                           {isAdm && !isCancelled && (
-                            <button
-                              type="button"
-                              onClick={() => handleCancelExtraCharge(charge.id, charge.amount)}
-                              className="ml-2 text-stone-400 hover:text-rose-600 p-1"
-                              title="Cancelar e estornar valor extra"
-                            >
-                              <Ban className="h-3.5 w-3.5" />
-                            </button>
+                            <div className="ml-2 flex items-center gap-1">
+                              <button
+                                type="button"
+                                onClick={() => handleOpenEditExtraCharge(charge)}
+                                className="text-stone-400 hover:text-amber-700 p-1 rounded hover:bg-amber-50"
+                                title="Editar valor ou descrição"
+                              >
+                                <Edit2 className="h-3.5 w-3.5" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleCancelExtraCharge(charge.id, charge.amount)}
+                                className="text-stone-400 hover:text-rose-600 p-1 rounded hover:bg-rose-50"
+                                title="Cancelar e estornar valor extra"
+                              >
+                                <Ban className="h-3.5 w-3.5" />
+                              </button>
+                            </div>
                           )}
                         </div>
                       );
@@ -1104,11 +1322,15 @@ export const TablesView: React.FC<TablesViewProps> = ({ onStartSaleForTable }) =
                     )}
 
                     <button
-                      onClick={() => handleFreeTable(selectedTable)}
+                      onClick={() => handleOpenSettlementModal(selectedTable)}
                       className="flex w-full items-center justify-center gap-2 rounded-2xl bg-emerald-600 px-4 py-3 text-xs font-bold text-white shadow-xs hover:bg-emerald-700 active:scale-95 transition"
                     >
                       <CheckCircle2 className="h-4 w-4" />
-                      <span>Confirmar Pagamento & Liberar Mesa</span>
+                      <span>
+                        {(selectedTable.currentTotal || 0) <= 0
+                          ? 'Liberar Mesa Sem Consumo'
+                          : 'Conferir Conta & Registrar Pagamento'}
+                      </span>
                     </button>
                   </>
                 )}
@@ -1201,9 +1423,10 @@ export const TablesView: React.FC<TablesViewProps> = ({ onStartSaleForTable }) =
                 </button>
                 <button
                   type="submit"
-                  className="rounded-xl bg-emerald-600 px-5 py-2 text-xs font-bold text-white hover:bg-emerald-700 shadow-xs"
+                  disabled={isSubmittingExtra}
+                  className="rounded-xl bg-emerald-600 px-5 py-2 text-xs font-bold text-white hover:bg-emerald-700 disabled:opacity-50 shadow-xs"
                 >
-                  Confirmar Lançamento Extra
+                  {isSubmittingExtra ? 'Salvando...' : 'Confirmar Lançamento Extra'}
                 </button>
               </div>
             </form>
@@ -1503,6 +1726,337 @@ export const TablesView: React.FC<TablesViewProps> = ({ onStartSaleForTable }) =
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================================= */}
+      {/* MODAL: EDITAR VALOR EXTRA DA MESA (EXCLUSIVO ADM) */}
+      {/* ========================================================================= */}
+      {editingExtraCharge && selectedTable && isAdm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-900/60 p-4 backdrop-blur-xs">
+          <div className="w-full max-w-sm rounded-3xl border border-stone-200 bg-white p-6 shadow-2xl animate-in zoom-in-95">
+            <div className="flex items-center justify-between border-b border-stone-100 pb-3">
+              <div>
+                <span className="text-[10px] font-bold uppercase tracking-wider text-amber-600">
+                  Edição Auditada — ADM
+                </span>
+                <h3 className="font-black text-stone-900 text-base">Editar Valor Extra</h3>
+                <p className="text-xs text-stone-500">Mesa: {selectedTable.label || `Mesa ${selectedTable.number}`}</p>
+              </div>
+              <button
+                onClick={() => setEditingExtraCharge(null)}
+                className="rounded-lg p-1.5 text-stone-400 hover:bg-stone-100 font-bold"
+              >
+                ✕
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveEditExtraCharge} className="mt-4 space-y-3 text-xs">
+              <div>
+                <label className="block text-xs font-bold text-stone-700 mb-1">
+                  Novo Valor em Reais (R$) <span className="text-rose-500">*</span>
+                </label>
+                <input
+                  type="number"
+                  step="0.01"
+                  min="0.01"
+                  required
+                  value={editExtraAmount}
+                  onChange={(e) => setEditExtraAmount(parseFloat(e.target.value) || 0)}
+                  className="w-full rounded-xl border border-stone-200 px-3 py-2 text-sm font-bold text-stone-900 focus:border-amber-600 focus:outline-hidden"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-stone-700 mb-1">
+                  Descrição <span className="text-rose-500">*</span>
+                </label>
+                <textarea
+                  rows={2}
+                  required
+                  value={editExtraDescription}
+                  onChange={(e) => setEditExtraDescription(e.target.value)}
+                  className="w-full rounded-xl border border-stone-200 p-2.5 text-xs text-stone-900 focus:border-amber-600 focus:outline-hidden"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold text-stone-700 mb-1">
+                  Motivo da Alteração
+                </label>
+                <input
+                  type="text"
+                  value={editExtraReason}
+                  onChange={(e) => setEditExtraReason(e.target.value)}
+                  placeholder="Ex: Correção de valor entregue ao cliente"
+                  className="w-full rounded-xl border border-stone-200 px-3 py-2 text-xs text-stone-900 focus:border-amber-600 focus:outline-hidden"
+                />
+              </div>
+
+              {editingExtraCharge.isCashWithdrawal && (
+                <p className="rounded-xl bg-amber-50 border border-amber-200 p-2.5 text-[11px] text-amber-900">
+                  A diferença financeira será lançada como ajuste no caixa sem apagar a movimentação original.
+                </p>
+              )}
+
+              <div className="flex justify-end gap-2 pt-2 border-t border-stone-100">
+                <button
+                  type="button"
+                  onClick={() => setEditingExtraCharge(null)}
+                  className="rounded-xl border border-stone-200 px-4 py-2 text-xs font-semibold text-stone-600 hover:bg-stone-50"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="submit"
+                  className="rounded-xl bg-amber-600 px-5 py-2 text-xs font-bold text-white hover:bg-amber-700 shadow-xs"
+                >
+                  Salvar Ajuste
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================================= */}
+      {/* MODAL: CONFERÊNCIA DA CONTA & QUITAÇÃO / LIBERAÇÃO DA MESA */}
+      {/* ========================================================================= */}
+      {isSettlementModalOpen && selectedTable && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-900/65 p-4 backdrop-blur-xs">
+          <div className="w-full max-w-md rounded-3xl border border-stone-200 bg-white p-6 shadow-2xl animate-in zoom-in-95 max-h-[92vh] flex flex-col">
+            <div className="flex items-center justify-between border-b border-stone-100 pb-3">
+              <div>
+                <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-600">
+                  Conferência & Fechamento
+                </span>
+                <h3 className="font-black text-stone-900 text-lg">
+                  {selectedTable.label || `Mesa ${selectedTable.number}`}
+                </h3>
+              </div>
+              <button
+                onClick={() => setIsSettlementModalOpen(false)}
+                className="rounded-lg p-1.5 text-stone-400 hover:bg-stone-100 font-bold"
+              >
+                ✕
+              </button>
+            </div>
+
+            <form onSubmit={handleConfirmTableSettlement} className="mt-4 flex-1 overflow-y-auto space-y-4 text-xs">
+              {/* Detalhamento separado: Consumo vs Valores Extras vs Pagamentos */}
+              <div className="rounded-2xl bg-stone-50 border border-stone-200 p-4 space-y-2">
+                <div className="flex justify-between text-stone-600">
+                  <span>Consumo de Produtos:</span>
+                  <strong>
+                    {formatBRL(selectedTable.productsTotal ?? Math.max(0, (selectedTable.currentTotal || 0) - (selectedTable.extraTotal || 0)))}
+                  </strong>
+                </div>
+                <div className="flex justify-between text-indigo-700">
+                  <span>Valores Extras Ativos:</span>
+                  <strong>+{formatBRL(selectedTable.extraTotal || 0)}</strong>
+                </div>
+                <div className="border-t border-stone-200 pt-2 flex justify-between font-bold text-stone-900">
+                  <span>Total Geral a Receber:</span>
+                  <span>{formatBRL(selectedTable.currentTotal || 0)}</span>
+                </div>
+                {(selectedTable.paidAmount || 0) > 0 && (
+                  <div className="flex justify-between text-emerald-700 font-semibold">
+                    <span>Pagamentos Já Registrados:</span>
+                    <span>-{formatBRL(selectedTable.paidAmount || 0)}</span>
+                  </div>
+                )}
+                <div className="border-t border-stone-300 pt-2 flex justify-between items-baseline">
+                  <span className="font-bold text-stone-800">Saldo Restante:</span>
+                  <span className="text-xl font-black text-emerald-700">
+                    {formatBRL(Math.max(0, (selectedTable.currentTotal || 0) - (selectedTable.paidAmount || 0)))}
+                  </span>
+                </div>
+              </div>
+
+              {/* Lista de pagamentos parciais já feitos */}
+              {selectedTable.payments && selectedTable.payments.length > 0 && (
+                <div className="space-y-1">
+                  <p className="text-[11px] font-bold text-stone-600">Pagamentos Registrados nesta Conta:</p>
+                  <div className="rounded-xl border border-stone-200 divide-y divide-stone-100 bg-white">
+                    {selectedTable.payments.map((p) => (
+                      <div key={p.id} className="px-3 py-2 flex justify-between text-[11px]">
+                        <span>
+                          <strong className="uppercase">{p.method}</strong> • {p.receivedByName} ({formatTimeBR(p.paidAt)})
+                        </span>
+                        <strong className="text-emerald-700">{formatBRL(p.amount)}</strong>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {Math.max(0, (selectedTable.currentTotal || 0) - (selectedTable.paidAmount || 0)) > 0.009 ? (
+                <>
+                  <div>
+                    <label className="block font-bold text-stone-700 mb-1.5">Forma de Pagamento</label>
+                    <div className="grid grid-cols-2 gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setSettlementMethod('dinheiro')}
+                        className={`rounded-xl border py-2.5 font-bold transition ${
+                          settlementMethod === 'dinheiro'
+                            ? 'border-emerald-600 bg-emerald-50 text-emerald-900'
+                            : 'border-stone-200 text-stone-600 hover:bg-stone-50'
+                        }`}
+                      >
+                        Dinheiro
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setSettlementMethod('pix')}
+                        className={`rounded-xl border py-2.5 font-bold transition ${
+                          settlementMethod === 'pix'
+                            ? 'border-emerald-600 bg-emerald-50 text-emerald-900'
+                            : 'border-stone-200 text-stone-600 hover:bg-stone-50'
+                        }`}
+                      >
+                        PIX
+                      </button>
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block font-bold text-stone-700 mb-1">
+                      Valor a Registrar Agora (R$)
+                    </label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      min="0.01"
+                      max={Math.max(0.01, Number(((selectedTable.currentTotal || 0) - (selectedTable.paidAmount || 0)).toFixed(2)))}
+                      required
+                      value={settlementPayAmount}
+                      onChange={(e) => {
+                        const val = parseFloat(e.target.value) || 0;
+                        setSettlementPayAmount(val);
+                        setSettlementCashReceived(val);
+                      }}
+                      className="w-full rounded-xl border border-stone-200 px-3 py-2.5 text-sm font-black text-stone-900 focus:border-emerald-600 focus:outline-hidden"
+                    />
+                    {settlementPayAmount < Math.max(0, (selectedTable.currentTotal || 0) - (selectedTable.paidAmount || 0)) - 0.009 && (
+                      <p className="mt-1 text-[11px] font-semibold text-amber-700">
+                        Pagamento parcial: a mesa permanecerá ocupada até a quitação integral do saldo restante.
+                      </p>
+                    )}
+                  </div>
+
+                  {settlementMethod === 'dinheiro' && (
+                    <div>
+                      <label className="block font-bold text-stone-700 mb-1">Valor Entregue pelo Cliente (R$)</label>
+                      <input
+                        type="number"
+                        step="0.01"
+                        min={settlementPayAmount}
+                        value={settlementCashReceived}
+                        onChange={(e) => setSettlementCashReceived(parseFloat(e.target.value) || 0)}
+                        className="w-full rounded-xl border border-stone-200 px-3 py-2 text-xs font-bold text-stone-900 focus:border-emerald-600 focus:outline-hidden"
+                      />
+                      {settlementCashReceived > settlementPayAmount && (
+                        <p className="mt-1 text-xs font-bold text-emerald-700">
+                          Troco: {formatBRL(settlementCashReceived - settlementPayAmount)}
+                        </p>
+                      )}
+                    </div>
+                  )}
+
+                  <div>
+                    <label className="block font-bold text-stone-700 mb-1">Observação (Opcional)</label>
+                    <input
+                      type="text"
+                      value={settlementNotes}
+                      onChange={(e) => setSettlementNotes(e.target.value)}
+                      placeholder="Ex: Quitação na saída"
+                      className="w-full rounded-xl border border-stone-200 px-3 py-2 text-xs text-stone-900 focus:border-emerald-600 focus:outline-hidden"
+                    />
+                  </div>
+                </>
+              ) : (
+                <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-emerald-900">
+                  Não há saldo pendente nesta mesa. Confirme abaixo para arquivar e liberar a mesa.
+                </div>
+              )}
+
+              <div className="flex justify-end gap-2 pt-3 border-t border-stone-100">
+                <button
+                  type="button"
+                  onClick={() => setIsSettlementModalOpen(false)}
+                  className="rounded-xl border border-stone-200 px-4 py-2.5 text-xs font-semibold text-stone-600 hover:bg-stone-50"
+                >
+                  Voltar
+                </button>
+                <button
+                  type="submit"
+                  className="rounded-xl bg-emerald-600 px-5 py-2.5 text-xs font-bold text-white hover:bg-emerald-700 shadow-xs"
+                >
+                  {settlementPayAmount + (selectedTable.paidAmount || 0) >= (selectedTable.currentTotal || 0) - 0.009
+                    ? 'Quitar Conta & Liberar Mesa'
+                    : 'Registrar Pagamento Parcial'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================================= */}
+      {/* MODAL: HISTÓRICO DE CONTAS DE MESAS ARQUIVADAS (ADM) */}
+      {/* ========================================================================= */}
+      {isArchivesModalOpen && isAdm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-900/60 p-4 backdrop-blur-xs">
+          <div className="w-full max-w-2xl rounded-3xl border border-stone-200 bg-white p-6 shadow-2xl animate-in zoom-in-95 max-h-[90vh] flex flex-col">
+            <div className="flex items-center justify-between border-b border-stone-100 pb-3">
+              <div>
+                <h3 className="font-black text-stone-900 text-lg">Histórico de Contas de Mesas</h3>
+                <p className="text-xs text-stone-500">
+                  Registros preservados mesmo após liberação ou exclusão do cadastro das mesas
+                </p>
+              </div>
+              <button
+                onClick={() => setIsArchivesModalOpen(false)}
+                className="rounded-lg p-1.5 text-stone-400 hover:bg-stone-100 font-bold"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="mt-4 flex-1 overflow-y-auto space-y-2.5 text-xs">
+              {tableArchives.length === 0 ? (
+                <div className="rounded-2xl border border-stone-100 bg-stone-50 p-8 text-center text-stone-400">
+                  Nenhuma conta de mesa arquivada até o momento.
+                </div>
+              ) : (
+                tableArchives.map((arch) => (
+                  <div key={arch.id} className="rounded-2xl border border-stone-200 bg-stone-50/70 p-4 space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <span className="font-black text-stone-900 text-sm">
+                          {arch.tableName} (#{arch.tableNumber})
+                        </span>
+                        <span className="ml-2 text-[10px] text-stone-500 font-mono">{arch.id}</span>
+                      </div>
+                      <span className="text-[11px] font-bold text-emerald-700">
+                        Quitado: {formatBRL(arch.paidTotal)}
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-3 gap-2 text-[11px] text-stone-600 bg-white rounded-xl p-2.5 border border-stone-100">
+                      <div>Produtos: <strong>{formatBRL(arch.productsTotal)}</strong></div>
+                      <div>Extras: <strong>{formatBRL(arch.extraTotal)}</strong></div>
+                      <div>Total: <strong>{formatBRL(arch.grandTotal)}</strong></div>
+                    </div>
+                    <div className="flex flex-wrap justify-between text-[10px] text-stone-500">
+                      <span>Fechada em {formatDateTimeBR(arch.closedAt)} por {arch.closedByName}</span>
+                      <span>{arch.payments.length} pagamento(s) • {arch.extraCharges.length} lançamento(s) extra</span>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
           </div>
         </div>
       )}

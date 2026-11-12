@@ -52,6 +52,8 @@ import {
   getOrders,
   getTables,
   saveTable,
+  saveTableArchive,
+  recordPaymentInCashSession,
   validateOrderStock,
   deductStockForOrder,
   isSellerAuthorizedToSell,
@@ -86,7 +88,15 @@ export type SaleFlowStep =
   | 'step5_payment'
   | 'step6_success';
 
-export const PosView: React.FC = () => {
+interface PosViewProps {
+  preselectedTableNumber?: number | null;
+  onConsumePreselectedTable?: () => void;
+}
+
+export const PosView: React.FC<PosViewProps> = ({
+  preselectedTableNumber,
+  onConsumePreselectedTable,
+}) => {
   const { currentTenant } = useTenant();
   const { currentUser, isAdm, activeView } = useAuth();
 
@@ -97,6 +107,15 @@ export const PosView: React.FC = () => {
   const [saleModality, setSaleModality] = useState<'table' | 'counter' | 'comanda'>('counter');
   const [selectedTableNumber, setSelectedTableNumber] = useState<number | null>(null);
   const [comandaCode, setComandaCode] = useState<string>('');
+
+  useEffect(() => {
+    if (preselectedTableNumber) {
+      setSaleModality('table');
+      setSelectedTableNumber(preselectedTableNumber);
+      setCurrentStep('step3_catalog');
+      if (onConsumePreselectedTable) onConsumePreselectedTable();
+    }
+  }, [preselectedTableNumber, onConsumePreselectedTable]);
 
   // Produtos e Carrinho
   const [products, setProducts] = useState<Product[]>(getProducts(currentTenant.id));
@@ -413,28 +432,76 @@ export const PosView: React.FC = () => {
 
       saveOrder(newOrder);
 
+      // Registra pagamento no caixa ativo quando quitado (Dinheiro ou PIX)
+      if (!isPendente && (selectedMethod === 'dinheiro' || selectedMethod === 'pix')) {
+        recordPaymentInCashSession(currentTenant.id, selectedMethod, total);
+      }
+
       // Sincroniza a mesa se for modalidade mesa
       if (saleModality === 'table' && selectedTable) {
+        const addedProductsNet = Math.max(0, subtotal - discount + serviceFee);
         if (!isPendente) {
-          // Venda paga: mesa é liberada e valores extras quitados
+          // Arquiva histórico completo da conta antes de liberar a mesa
+          saveTableArchive({
+            id: `tarch-${selectedTable.id}-${Date.now()}`,
+            tenantId: currentTenant.id,
+            tableId: selectedTable.id,
+            tableNumber: selectedTable.number,
+            tableName: selectedTable.customerName || selectedTable.label || `Mesa ${selectedTable.number}`,
+            openedAt: selectedTable.openedAt || newOrder.createdAt,
+            closedAt: newOrder.closedAt || new Date().toISOString(),
+            closedById: currentUser?.id || 'vendedor',
+            closedByName: currentUser?.name || 'Vendedor',
+            productsTotal: (selectedTable.productsTotal || 0) + addedProductsNet,
+            extraTotal: tableExtraTotal,
+            grandTotal: (selectedTable.productsTotal || 0) + addedProductsNet + tableExtraTotal,
+            paidTotal: total,
+            orderIds: [newOrder.id],
+            extraCharges: selectedTable.extraCharges || [],
+            payments: [
+              {
+                id: `tpay-${Date.now()}`,
+                method: selectedMethod === 'pix' ? 'pix' : 'dinheiro',
+                amount: total,
+                receivedAmount: selectedMethod === 'dinheiro' ? receivedCash || total : total,
+                change: selectedMethod === 'dinheiro' ? Math.max(0, (receivedCash || total) - total) : 0,
+                paidAt: newOrder.createdAt,
+                receivedById: currentUser?.id || 'vendedor',
+                receivedByName: currentUser?.name || 'Vendedor',
+              },
+            ],
+          });
+
+          // Venda paga integralmente: mesa é liberada e valores/temporizador encerrados
           saveTable({
             ...selectedTable,
             status: 'available',
+            openedAt: undefined,
+            waiterId: undefined,
+            waiterName: undefined,
             currentTotal: 0,
             productsTotal: 0,
             extraTotal: 0,
+            paidAmount: 0,
+            payments: [],
             activeOrdersCount: 0,
             extraCharges: [],
             timer: undefined,
           });
         } else {
-          // Pendente: mesa continua ocupada com saldo
+          // Pendente: soma consumo de produtos sem duplicar extraTotal no currentTotal
+          const existingProducts =
+            selectedTable.productsTotal ?? Math.max(0, (selectedTable.currentTotal || 0) - tableExtraTotal);
+          const updatedProductsTotal = existingProducts + addedProductsNet;
           saveTable({
             ...selectedTable,
-            status: 'closing',
-            currentTotal: (selectedTable.currentTotal || 0) + total,
-            productsTotal: (selectedTable.productsTotal || 0) + subtotal,
+            status: 'occupied',
+            openedAt: selectedTable.openedAt || newOrder.createdAt,
+            waiterId: selectedTable.waiterId || currentUser?.id,
+            waiterName: selectedTable.waiterName || currentUser?.name,
+            productsTotal: updatedProductsTotal,
             extraTotal: tableExtraTotal,
+            currentTotal: updatedProductsTotal + tableExtraTotal,
             activeOrdersCount: (selectedTable.activeOrdersCount || 0) + 1,
           });
         }

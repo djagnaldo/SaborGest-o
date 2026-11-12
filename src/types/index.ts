@@ -207,6 +207,18 @@ export interface OrderPayment {
   receiptSellerName?: string;
 }
 
+export interface TableExtraChargeEditEntry {
+  editedAt: string;
+  editedById: string;
+  editedByName: string;
+  previousAmount: number;
+  newAmount: number;
+  previousDescription: string;
+  newDescription: string;
+  reason: string;
+  adjustmentTxId?: string;
+}
+
 export interface TableExtraCharge {
   id: string;
   tableId: string;
@@ -218,10 +230,45 @@ export interface TableExtraCharge {
   createdById: string;
   createdByName: string;
   financialTxId?: string; // ID da saída registrada no controle de gastos/caixa
+  estornoTxId?: string; // ID do estorno registrado ao cancelar
   status: 'active' | 'cancelled';
+  editedAt?: string;
+  editedBy?: string;
+  editHistory?: TableExtraChargeEditEntry[];
   cancelledAt?: string;
   cancelledBy?: string;
   cancellationReason?: string;
+}
+
+export interface TablePaymentRecord {
+  id: string;
+  method: 'dinheiro' | 'pix';
+  amount: number;
+  receivedAmount?: number;
+  change?: number;
+  paidAt: string;
+  receivedById: string;
+  receivedByName: string;
+  notes?: string;
+}
+
+export interface TableAccountArchive {
+  id: string;
+  tenantId: string;
+  tableId: string;
+  tableNumber: number;
+  tableName: string;
+  openedAt: string;
+  closedAt: string;
+  closedById: string;
+  closedByName: string;
+  productsTotal: number;
+  extraTotal: number;
+  grandTotal: number;
+  paidTotal: number;
+  orderIds: string[];
+  extraCharges: TableExtraCharge[];
+  payments: TablePaymentRecord[];
 }
 
 export interface TableTimer {
@@ -315,6 +362,8 @@ export interface RestaurantTable {
   currentTotal: number;
   productsTotal?: number;
   extraTotal?: number;
+  paidAmount?: number;
+  payments?: TablePaymentRecord[];
   extraCharges?: TableExtraCharge[];
   activeOrdersCount?: number;
   timer?: TableTimer;
@@ -359,6 +408,7 @@ export interface FinancialTransaction {
   paid: boolean;
   paymentMethod?: PaymentMethod;
   cashRegisterId?: string;
+  relatedChargeId?: string;
   userId: string;
   userName: string;
   notes?: string;
@@ -523,6 +573,7 @@ export interface SystemBackup {
     users: UserProfile[];
     savedReports: SavedReport[];
     archivedPeriods: ArchivedPeriod[];
+    tableArchives?: TableAccountArchive[];
     themeConfig?: SystemThemeConfig;
   };
   checksum: string;

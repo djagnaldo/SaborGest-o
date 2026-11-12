@@ -35,6 +35,7 @@ import {
   getAuditLogs,
   getExpenses,
   getCashSessions,
+  getOrderProductSalesTotal,
 } from '../../services/storage';
 import { ActiveTab } from '../layout/Sidebar';
 
@@ -69,9 +70,9 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({ onNavigate
     return () => window.removeEventListener('sabor_local_sync', handleSync);
   }, [currentTenant.id]);
 
-  // Métricas do Dia
+  // Métricas do Dia (exclui valores extras de mesa da venda de produtos)
   const paidOrders = orders.filter((o) => o.paid && o.status !== 'cancelled');
-  const totalSalesToday = paidOrders.reduce((acc, o) => acc + (o.total || 0), 0);
+  const totalSalesToday = paidOrders.reduce((acc, o) => acc + getOrderProductSalesTotal(o), 0);
   const totalExpenses = expenses.reduce((acc, e) => acc + (e.amount || 0), 0);
   const activeSession = cashSessions.find((c) => c.status === 'open');
   const cashBalance = activeSession ? activeSession.expectedAmount : 0;

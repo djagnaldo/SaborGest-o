@@ -68,6 +68,7 @@ const AppContent: React.FC = () => {
   const [activeDeviceView, setActiveDeviceView] = useState<'adm' | 'pc' | 'seller'>('adm');
   const [connStatus, setConnStatus] = useState(getConnectionStatus());
   const [isPcModalOpen, setIsPcModalOpen] = useState(false);
+  const [preselectedTableNumber, setPreselectedTableNumber] = useState<number | null>(null);
 
   // Inicialização do Banco Local Principal
   useEffect(() => {
@@ -309,12 +310,18 @@ const AppContent: React.FC = () => {
             {currentTab === 'products' && <ProductsView />}
             {currentTab === 'tables' && (
               <TablesView
-                onStartSaleForTable={(_tableNumber) => {
+                onStartSaleForTable={(tableNumber) => {
+                  setPreselectedTableNumber(tableNumber);
                   setCurrentTab('pos');
                 }}
               />
             )}
-            {currentTab === 'pos' && <PosView />}
+            {currentTab === 'pos' && (
+              <PosView
+                preselectedTableNumber={preselectedTableNumber}
+                onConsumePreselectedTable={() => setPreselectedTableNumber(null)}
+              />
+            )}
             {currentTab === 'cash' && <CashRegisterView />}
             {currentTab === 'expenses' && <ExpensesView />}
             {currentTab === 'financial' && <FinancialView />}

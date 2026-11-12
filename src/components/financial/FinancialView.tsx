@@ -16,7 +16,7 @@ import {
 } from 'lucide-react';
 import { useTenant } from '../../contexts/TenantContext';
 import { useAuth } from '../../contexts/AuthContext';
-import { getOrders, getExpenses } from '../../services/storage';
+import { getOrders, getExpenses, getOrderProductSalesTotal, getOrderExtraTotal } from '../../services/storage';
 import { formatBRL } from '../../utils/formatters';
 
 export const FinancialView: React.FC = () => {
@@ -38,15 +38,16 @@ export const FinancialView: React.FC = () => {
     return () => window.removeEventListener('sabor_local_sync', handleSync);
   }, [currentTenant.id]);
 
-  // Receitas Reais das Vendas Confirmadas
+  // Receitas Reais das Vendas de Produtos (exclui valores extras de mesa)
   const paidOrders = orders.filter((o) => o.paid && o.status !== 'cancelled');
-  const totalRevenue = paidOrders.reduce((acc, o) => acc + (o.total || 0), 0);
+  const totalRevenue = paidOrders.reduce((acc, o) => acc + getOrderProductSalesTotal(o), 0);
+  const totalExtraRecovered = paidOrders.reduce((acc, o) => acc + getOrderExtraTotal(o), 0);
   const totalCashSales = paidOrders
     .filter((o) => o.payments[0]?.method === 'dinheiro')
-    .reduce((acc, o) => acc + (o.total || 0), 0);
+    .reduce((acc, o) => acc + getOrderProductSalesTotal(o), 0);
   const totalPixSales = paidOrders
     .filter((o) => o.payments[0]?.method === 'pix')
-    .reduce((acc, o) => acc + (o.total || 0), 0);
+    .reduce((acc, o) => acc + getOrderProductSalesTotal(o), 0);
 
   // Gastos e Despesas Reais
   const totalExpenses = expenses.reduce((acc, e) => acc + (e.amount || 0), 0);
@@ -145,6 +146,13 @@ export const FinancialView: React.FC = () => {
               <span>· Vendas via PIX</span>
               <span className="font-mono">{formatBRL(totalPixSales)}</span>
             </div>
+
+            {totalExtraRecovered > 0 && (
+              <div className="flex justify-between py-1.5 border-b border-stone-100 text-indigo-700 text-[11px] font-semibold">
+                <span>(i) Valores Extras Ressarcidos (Mesas — não contabilizados como venda)</span>
+                <span className="font-mono">{formatBRL(totalExtraRecovered)}</span>
+              </div>
+            )}
 
             <div className="flex justify-between py-2 border-b border-stone-100 font-bold text-stone-900">
               <span>(-) Gastos & Despesas Operacionais</span>
