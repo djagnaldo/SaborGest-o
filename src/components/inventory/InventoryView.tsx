@@ -86,13 +86,13 @@ export const InventoryView: React.FC = () => {
     e.preventDefault();
     if (!adjustModalProduct) return;
     if (!adjustReason.trim()) {
-      alert('Informe o motivo da alteração de estoque.');
+      showFeedback('Informe o motivo da alteração de estoque.');
       return;
     }
 
     const res = updateProductStock(
       adjustModalProduct.id,
-      newStockInput,
+      Number(newStockInput.toFixed(3)),
       adjustReason.trim(),
       currentUser?.name || 'Administrador',
       currentUser?.id || 'admin',
@@ -102,9 +102,9 @@ export const InventoryView: React.FC = () => {
     if (res.success) {
       loadData();
       setAdjustModalProduct(null);
-      showFeedback(`✓ Estoque de "${adjustModalProduct.name}" corrigido para ${newStockInput} ${adjustModalProduct.unit}.`);
+      showFeedback(`Estoque de "${adjustModalProduct.name}" corrigido para ${newStockInput} ${adjustModalProduct.unit}.`);
     } else {
-      alert(res.error || 'Erro ao atualizar estoque.');
+      showFeedback(res.error || 'Erro ao atualizar estoque.');
     }
   };
 
@@ -114,12 +114,12 @@ export const InventoryView: React.FC = () => {
     const targetProd = products.find((p) => p.id === entryProductId);
     if (!targetProd) return;
     if (entryQuantity <= 0) {
-      alert('Informe uma quantidade positiva para a entrada.');
+      showFeedback('Informe uma quantidade positiva para a entrada.');
       return;
     }
 
     const currentStock = targetProd.stockQuantity ?? 0;
-    const newStock = currentStock + entryQuantity;
+    const newStock = Number((currentStock + entryQuantity).toFixed(3));
     const reasonText = entryReason.trim() || 'Entrada de compra de mercadoria';
 
     const res = updateProductStock(
@@ -134,9 +134,9 @@ export const InventoryView: React.FC = () => {
     if (res.success) {
       loadData();
       setIsEntryModalOpen(false);
-      showFeedback(`✓ Entrada de +${entryQuantity} ${targetProd.unit} registrada para "${targetProd.name}".`);
+      showFeedback(`Entrada de +${entryQuantity} ${targetProd.unit} registrada para "${targetProd.name}".`);
     } else {
-      alert(res.error || 'Erro ao registrar entrada.');
+      showFeedback(res.error || 'Erro ao registrar entrada.');
     }
   };
 
@@ -284,8 +284,8 @@ export const InventoryView: React.FC = () => {
 
       {/* ABA 1: POSIÇÃO DE ESTOQUE */}
       {activeTab === 'stock' && (
-        <div className="overflow-hidden rounded-2xl border border-stone-200 bg-white shadow-2xs">
-          <table className="w-full text-left text-xs text-stone-600">
+        <div className="overflow-x-auto rounded-2xl border border-stone-200 bg-white shadow-2xs">
+          <table className="w-full min-w-[640px] text-left text-xs text-stone-600">
             <thead className="border-b border-stone-200 bg-stone-50/70 text-[10px] font-semibold uppercase text-stone-500">
               <tr>
                 <th className="px-4 py-3">Código</th>
@@ -362,7 +362,7 @@ export const InventoryView: React.FC = () => {
 
       {/* ABA 2: HISTÓRICO DE MOVIMENTAÇÕES (OBRIGATÓRIO) */}
       {activeTab === 'history' && (
-        <div className="overflow-hidden rounded-2xl border border-stone-200 bg-white shadow-2xs">
+        <div className="overflow-x-auto rounded-2xl border border-stone-200 bg-white shadow-2xs">
           <div className="p-4 border-b border-stone-100 flex items-center justify-between">
             <h2 className="text-xs font-bold uppercase tracking-wider text-stone-700">
               Histórico Completo de Alterações de Estoque
@@ -373,7 +373,7 @@ export const InventoryView: React.FC = () => {
           </div>
 
           {filteredTransactions.length > 0 ? (
-            <table className="w-full text-left text-xs text-stone-600">
+            <table className="w-full min-w-[680px] text-left text-xs text-stone-600">
               <thead className="border-b border-stone-200 bg-stone-50/70 text-[10px] font-semibold uppercase text-stone-500">
                 <tr>
                   <th className="px-4 py-3">Data / Hora</th>
@@ -485,10 +485,11 @@ export const InventoryView: React.FC = () => {
                 <input
                   type="number"
                   min={0}
+                  step="0.01"
                   required
                   value={newStockInput}
-                  onChange={(e) => setNewStockInput(parseInt(e.target.value) || 0)}
-                  className="mt-1 w-full rounded-xl border border-stone-200 px-3.5 py-2.5 text-sm font-mono font-bold text-stone-900 focus:border-amber-500 focus:outline-none"
+                  onChange={(e) => setNewStockInput(parseFloat(e.target.value) || 0)}
+                  className="mt-1 w-full rounded-xl border border-stone-200 px-3.5 py-2.5 text-sm font-mono font-bold text-stone-900 focus:border-amber-500 focus:outline-none tabular-nums"
                 />
               </div>
 
@@ -568,11 +569,12 @@ export const InventoryView: React.FC = () => {
                   </label>
                   <input
                     type="number"
-                    min={1}
+                    min={0.01}
+                    step="0.01"
                     required
                     value={entryQuantity}
-                    onChange={(e) => setEntryQuantity(parseInt(e.target.value) || 0)}
-                    className="mt-1 w-full rounded-xl border border-stone-200 px-3.5 py-2.5 text-xs font-mono font-bold text-stone-900 focus:border-amber-500 focus:outline-none"
+                    onChange={(e) => setEntryQuantity(parseFloat(e.target.value) || 0)}
+                    className="mt-1 w-full rounded-xl border border-stone-200 px-3.5 py-2.5 text-xs font-mono font-bold text-stone-900 focus:border-amber-500 focus:outline-none tabular-nums"
                   />
                 </div>
 

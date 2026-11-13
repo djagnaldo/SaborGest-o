@@ -206,11 +206,11 @@ export const CashRegisterView: React.FC = () => {
                 <Unlock className="h-5 w-5" />
               </div>
               <div>
-                <span className="inline-flex items-center gap-1 text-[11px] font-bold text-emerald-700 uppercase tracking-wider">
-                  <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse" /> Caixa Aberto
+                <span className="inline-flex items-center gap-1.5 text-[11px] font-bold text-emerald-700 uppercase tracking-wider">
+                  <span className="h-2 w-2 rounded-full bg-emerald-500" /> Caixa Aberto
                 </span>
                 <p className="text-xs text-stone-500">
-                  Operador: <strong className="text-stone-800">{currentSession.openedByName}</strong> • Desde{' '}
+                  Operador: <strong className="text-stone-800">{currentSession.openedByName}</strong> · Desde{' '}
                   {formatDateTimeBR(currentSession.openedAt)}
                 </p>
               </div>
@@ -218,7 +218,7 @@ export const CashRegisterView: React.FC = () => {
 
             <div className="text-right">
               <span className="text-xs text-stone-400">Saldo Calculado em Gaveta (Espécie)</span>
-              <p className="text-2xl font-black text-stone-900">
+              <p className="text-2xl font-black text-stone-900 tabular-nums">
                 {formatBRL(currentSession.expectedAmount)}
               </p>
             </div>

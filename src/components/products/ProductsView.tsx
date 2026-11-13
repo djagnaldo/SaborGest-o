@@ -23,6 +23,7 @@ import {
   ShieldAlert,
   CheckCircle2,
   RotateCw,
+  Scale,
 } from 'lucide-react';
 import { useTenant } from '../../contexts/TenantContext';
 import { useAuth } from '../../contexts/AuthContext';
@@ -31,14 +32,12 @@ import {
   getProducts,
   getCategories,
   saveProduct,
-  deleteProduct,
   deleteProductSafely,
   addAuditLog,
 } from '../../services/storage';
 import {
   validateMasterAuthority,
   getMatrizInfo,
-  isDeviceMatriz,
 } from '../../services/local-db';
 import { formatBRL, calcProfitMargin } from '../../utils/formatters';
 import { processProductImage, PRESET_FOOD_PHOTOS } from '../../utils/image-processor';
@@ -48,12 +47,14 @@ export const ProductsView: React.FC = () => {
   const { isAdm, currentUser, activeView } = useAuth();
 
   const [products, setProducts] = useState<Product[]>(getProducts(currentTenant.id));
-  const categories = getCategories(currentTenant.id);
+  const [categories, setCategories] = useState<Category[]>(getCategories(currentTenant.id));
 
   const [selectedCategory, setSelectedCategory] = useState<string>('all');
   const [searchTerm, setSearchTerm] = useState('');
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingProduct, setEditingProduct] = useState<Product | null>(null);
+  const [confirmDeleteProd, setConfirmDeleteProd] = useState<Product | null>(null);
+  const [feedback, setFeedback] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
 
   // Estados de Imagem e Fotografia
   const cameraInputRef = useRef<HTMLInputElement>(null);
@@ -74,6 +75,7 @@ export const ProductsView: React.FC = () => {
     stockQuantity: number;
     minStock: number;
     unit: Product['unit'];
+    allowWeight: boolean;
     isComposite: boolean;
   }>({
     name: '',
@@ -86,15 +88,28 @@ export const ProductsView: React.FC = () => {
     stockQuantity: 10,
     minStock: 5,
     unit: 'un',
+    allowWeight: false,
     isComposite: false,
   });
 
-  const refreshList = () => {
-    setProducts(getProducts(currentTenant.id));
+  const showFeedback = (text: string, type: 'success' | 'error' = 'success') => {
+    setFeedback({ text, type });
+    setTimeout(() => setFeedback(null), 5000);
   };
 
+  const refreshList = () => {
+    setProducts(getProducts(currentTenant.id));
+    setCategories(getCategories(currentTenant.id));
+  };
+
+  React.useEffect(() => {
+    refreshList();
+    const handleSync = () => refreshList();
+    window.addEventListener('sabor_local_sync', handleSync);
+    return () => window.removeEventListener('sabor_local_sync', handleSync);
+  }, [currentTenant.id]);
+
   const matrizInfo = getMatrizInfo();
-  const isCurrentMatriz = isDeviceMatriz(activeView === 'admin' ? 'adm' : 'seller');
 
   // Validação prévia de autoridade da Matriz
   const checkMasterAuthority = (action: 'create_product' | 'update_product' | 'delete_product') => {
@@ -104,7 +119,7 @@ export const ProductsView: React.FC = () => {
       currentUser?.role || 'waiter'
     );
     if (!authority.allowed) {
-      alert(`⚠️ ${authority.reason}`);
+      showFeedback(authority.reason || 'Acesso restrito ao Administrador.', 'error');
       return false;
     }
     return true;
@@ -126,6 +141,7 @@ export const ProductsView: React.FC = () => {
       stockQuantity: 20,
       minStock: 5,
       unit: 'un',
+      allowWeight: false,
       isComposite: false,
     });
     setIsModalOpen(true);
@@ -147,20 +163,23 @@ export const ProductsView: React.FC = () => {
       stockQuantity: prod.stockQuantity,
       minStock: prod.minStock,
       unit: prod.unit,
+      allowWeight: Boolean(prod.allowWeight || prod.unit === 'kg' || prod.unit === 'g'),
       isComposite: prod.isComposite,
     });
     setIsModalOpen(true);
   };
 
-  const handleDelete = (id: string) => {
+  const handleRequestDelete = (prod: Product) => {
     if (!checkMasterAuthority('delete_product')) return;
+    setConfirmDeleteProd(prod);
+  };
 
-    const prod = products.find((p) => p.id === id);
-    if (confirm(`Deseja realmente remover o produto "${prod?.name}"?\n(Se o produto possuir vendas históricas, ele será desativado com segurança do cardápio ativo sem apagar o histórico).`)) {
-      const result = deleteProductSafely(id);
-      alert(result.message);
-      refreshList();
-    }
+  const handleConfirmDelete = () => {
+    if (!confirmDeleteProd) return;
+    const result = deleteProductSafely(confirmDeleteProd.id);
+    setConfirmDeleteProd(null);
+    showFeedback(result.message, result.success ? 'success' : 'error');
+    refreshList();
   };
 
   // Processamento e compressão local de foto (Câmera ou Galeria)
@@ -178,12 +197,11 @@ export const ProductsView: React.FC = () => {
       const compKb = Math.round(result.compressedSizeBytes / 1024);
       const savedPercent = Math.max(0, Math.round(((origKb - compKb) / origKb) * 100));
 
-      setCompressionBadge(`Foto comprimida: ${origKb}KB ➔ ${compKb}KB (${savedPercent}% economizado p/ SQLite local)`);
+      setCompressionBadge(`Foto comprimida: ${origKb}KB ➔ ${compKb}KB (${savedPercent}% economizado)`);
     } catch (err: any) {
-      alert(`Erro ao processar imagem: ${err.message}`);
+      showFeedback(`Erro ao processar imagem: ${err.message}`, 'error');
     } finally {
       setIsCompressing(false);
-      // Limpa input para permitir selecionar o mesmo arquivo se quiser
       if (e.target) e.target.value = '';
     }
   };
@@ -242,33 +260,59 @@ export const ProductsView: React.FC = () => {
 
   return (
     <div className="space-y-6">
+      {feedback && (
+        <div
+          className={`flex items-center justify-between rounded-2xl border px-4 py-3 text-xs font-semibold shadow-sm ${
+            feedback.type === 'error'
+              ? 'border-rose-300 bg-rose-50 text-rose-900'
+              : 'border-emerald-300 bg-emerald-50 text-emerald-950'
+          }`}
+        >
+          <span>{feedback.text}</span>
+          <button onClick={() => setFeedback(null)} className="p-1 opacity-70 hover:opacity-100">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+      )}
+
       {/* Header */}
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between border-b border-stone-200 pb-4">
         <div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             <h1 className="text-xl font-bold tracking-tight text-stone-900 sm:text-2xl">
               Cardápio & Catálogo Visual
             </h1>
-            <span className="rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-semibold text-amber-800">
-              {products.length} itens cadastrados
+            <span className="rounded-lg bg-amber-100 px-2.5 py-0.5 text-xs font-bold text-amber-900 tabular-nums">
+              {products.length} itens
             </span>
           </div>
           <p className="text-xs text-stone-500 mt-0.5">
             {isAdm
-              ? `Autoridade Central da Matriz Ativa: ${matrizInfo.activeHostLabel}`
-              : 'Terminal de Consulta do Vendedor • Alterações e exclusões restritas à Matriz'}
+              ? `Gerenciamento de produtos, preços por unidade/peso (kg/g) e fotos · ${matrizInfo.activeHostLabel}`
+              : 'Consulta do Cardápio · Alterações e exclusões restritas ao Administrador'}
           </p>
         </div>
 
         {isAdm && (
           <button
             onClick={handleOpenCreateModal}
-            className="inline-flex items-center gap-2 rounded-xl bg-amber-600 px-4 py-2.5 text-xs font-bold text-white shadow-sm hover:bg-amber-700 transition"
+            className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-xl bg-amber-600 px-4 py-2.5 text-xs font-bold text-white shadow-sm hover:bg-amber-700 transition"
           >
             <Plus className="h-4 w-4" />
-            Cadastrar Produto com Foto
+            <span>Cadastrar Produto</span>
           </button>
         )}
+      </div>
+
+      {/* Informativo sobre Balança e Venda por Peso */}
+      <div className="flex items-start gap-3 rounded-2xl border border-amber-200 bg-amber-50/70 p-3.5 text-xs text-amber-950">
+        <Scale className="h-5 w-5 text-amber-700 shrink-0 mt-0.5" />
+        <div>
+          <p className="font-bold">Suporte a Produtos por Peso (Balança — kg / g)</p>
+          <p className="mt-0.5 text-[11px] text-amber-900/90 leading-relaxed">
+            Produtos configurados com unidade <strong>kg</strong>, <strong>g</strong> ou marcados como <strong>Venda na Balança</strong> permitem digitar o peso exato com cálculo automático de preço e baixa proporcional de estoque no Balcão e nas Mesas. A leitura automática direta de balanças físicas USB/Bluetooth depende de driver Web Serial (PC) ou plugin nativo Android correspondente.
+          </p>
+        </div>
       </div>
 
       {/* Categorias Tabs */}
@@ -354,6 +398,11 @@ export const ProductsView: React.FC = () => {
                     <ChefHat className="h-3 w-3" /> Ficha Técnica
                   </span>
                 )}
+                {(prod.allowWeight || prod.unit === 'kg' || prod.unit === 'g') && (
+                  <span className="absolute bottom-2.5 right-2.5 rounded-lg bg-amber-600/95 px-2 py-0.5 text-[10px] font-bold text-white flex items-center gap-1">
+                    <Scale className="h-3 w-3" /> Balança ({prod.unit})
+                  </span>
+                )}
               </div>
 
               {/* Informações */}
@@ -368,17 +417,17 @@ export const ProductsView: React.FC = () => {
                       <div className="flex items-center gap-1 shrink-0">
                         <button
                           onClick={() => handleOpenEditModal(prod)}
-                          title="Editar na Matriz"
-                          className="rounded-lg p-1 text-stone-400 hover:bg-stone-100 hover:text-stone-800"
+                          title="Editar Produto"
+                          className="rounded-lg p-2 text-stone-400 hover:bg-stone-100 hover:text-stone-800"
                         >
-                          <Edit2 className="h-3.5 w-3.5" />
+                          <Edit2 className="h-4 w-4" />
                         </button>
                         <button
-                          onClick={() => handleDelete(prod.id)}
-                          title="Excluir na Matriz"
-                          className="rounded-lg p-1 text-stone-400 hover:bg-rose-50 hover:text-rose-600"
+                          onClick={() => handleRequestDelete(prod)}
+                          title="Excluir Produto"
+                          className="rounded-lg p-2 text-stone-400 hover:bg-rose-50 hover:text-rose-600"
                         >
-                          <Trash2 className="h-3.5 w-3.5" />
+                          <Trash2 className="h-4 w-4" />
                         </button>
                       </div>
                     )}
@@ -393,7 +442,12 @@ export const ProductsView: React.FC = () => {
                   <div className="flex items-baseline justify-between">
                     <div>
                       <span className="text-[10px] text-stone-400 font-semibold uppercase">Preço Oficial</span>
-                      <p className="text-lg font-black text-stone-900">{formatBRL(prod.sellingPrice)}</p>
+                      <p className="text-lg font-black text-stone-900 tabular-nums">
+                        {formatBRL(prod.sellingPrice)}
+                        {prod.unit !== 'un' && (
+                          <span className="text-xs font-semibold text-stone-500"> / {prod.unit}</span>
+                        )}
+                      </p>
                     </div>
 
                     {isAdm && (
@@ -630,11 +684,51 @@ export const ProductsView: React.FC = () => {
                 </div>
 
                 <div>
+                  <label className="block text-xs font-semibold text-stone-700">Unidade de Venda *</label>
+                  <select
+                    value={formData.unit}
+                    onChange={(e) => {
+                      const nextUnit = e.target.value as Product['unit'];
+                      setFormData({
+                        ...formData,
+                        unit: nextUnit,
+                        allowWeight: nextUnit === 'kg' || nextUnit === 'g' ? true : formData.allowWeight,
+                      });
+                    }}
+                    className="mt-1 w-full rounded-xl border border-stone-200 bg-white px-3 py-2 text-xs font-bold text-stone-900 focus:border-amber-500 focus:outline-none"
+                  >
+                    <option value="un">Unidade (un)</option>
+                    <option value="kg">Quilograma (kg — Balança)</option>
+                    <option value="g">Grama (g — Balança)</option>
+                    <option value="l">Litro (l)</option>
+                    <option value="ml">Mililitro (ml)</option>
+                    <option value="porcao">Porção</option>
+                    <option value="fatia">Fatia</option>
+                  </select>
+                </div>
+
+                <div className="flex items-end pb-1">
+                  <label className="flex w-full cursor-pointer items-center gap-2 rounded-xl border border-amber-200 bg-amber-50/70 px-3 py-2 text-xs font-semibold text-amber-950">
+                    <input
+                      type="checkbox"
+                      checked={formData.allowWeight}
+                      onChange={(e) => setFormData({ ...formData, allowWeight: e.target.checked })}
+                      className="rounded border-amber-400 text-amber-600 focus:ring-amber-500"
+                    />
+                    <span className="flex items-center gap-1">
+                      <Scale className="h-3.5 w-3.5 text-amber-700" />
+                      Venda na Balança (por peso)
+                    </span>
+                  </label>
+                </div>
+
+                <div>
                   <label className="block text-xs font-semibold text-stone-700">Estoque Físico Atual</label>
                   <input
                     type="number"
+                    step={formData.unit === 'kg' || formData.unit === 'l' || formData.allowWeight ? '0.01' : '1'}
                     value={formData.stockQuantity}
-                    onChange={(e) => setFormData({ ...formData, stockQuantity: parseInt(e.target.value) || 0 })}
+                    onChange={(e) => setFormData({ ...formData, stockQuantity: parseFloat(e.target.value) || 0 })}
                     className="mt-1 w-full rounded-xl border border-stone-200 px-3 py-2 text-xs font-bold text-stone-900 focus:border-amber-500 focus:outline-none"
                   />
                 </div>
@@ -643,8 +737,9 @@ export const ProductsView: React.FC = () => {
                   <label className="block text-xs font-semibold text-stone-700">Estoque Mínimo (Alerta)</label>
                   <input
                     type="number"
+                    step={formData.unit === 'kg' || formData.unit === 'l' || formData.allowWeight ? '0.01' : '1'}
                     value={formData.minStock}
-                    onChange={(e) => setFormData({ ...formData, minStock: parseInt(e.target.value) || 0 })}
+                    onChange={(e) => setFormData({ ...formData, minStock: parseFloat(e.target.value) || 0 })}
                     className="mt-1 w-full rounded-xl border border-stone-200 px-3 py-2 text-xs text-stone-900 focus:border-amber-500 focus:outline-none"
                   />
                 </div>
@@ -724,6 +819,42 @@ export const ProductsView: React.FC = () => {
                   </div>
                 </button>
               ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL DE CONFIRMAÇÃO DE EXCLUSÃO DE PRODUTO */}
+      {confirmDeleteProd && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-900/60 p-4 backdrop-blur-xs">
+          <div className="w-full max-w-sm rounded-3xl border border-stone-200 bg-white p-6 shadow-2xl space-y-4">
+            <div className="flex items-center gap-3">
+              <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-rose-100 text-rose-700 shrink-0">
+                <Trash2 className="h-5 w-5" />
+              </div>
+              <div>
+                <h3 className="text-sm font-black text-stone-900">Remover Produto</h3>
+                <p className="text-xs text-stone-500">{confirmDeleteProd.name}</p>
+              </div>
+            </div>
+            <p className="text-xs text-stone-600 leading-relaxed">
+              Deseja remover <strong>{confirmDeleteProd.name}</strong> do cardápio ativo? Se houver histórico de vendas, ele será apenas desativado sem apagar nenhum dado anterior.
+            </p>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => setConfirmDeleteProd(null)}
+                className="w-1/2 min-h-[44px] rounded-xl border border-stone-200 text-xs font-bold text-stone-700 hover:bg-stone-50"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmDelete}
+                className="w-1/2 min-h-[44px] rounded-xl bg-rose-600 text-xs font-bold text-white hover:bg-rose-700"
+              >
+                Confirmar
+              </button>
             </div>
           </div>
         </div>

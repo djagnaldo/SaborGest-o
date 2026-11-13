@@ -30,10 +30,19 @@ import {
   ShieldAlert,
   Info,
   Archive,
+  ShoppingBag,
 } from 'lucide-react';
 import { useTenant } from '../../contexts/TenantContext';
 import { useAuth } from '../../contexts/AuthContext';
-import { RestaurantTable, TableExtraCharge, TableTimer, TableAccountArchive } from '../../types';
+import {
+  RestaurantTable,
+  TableExtraCharge,
+  TableTimer,
+  TableAccountArchive,
+  Product,
+  Category,
+  Order,
+} from '../../types';
 import {
   getTables,
   saveTable,
@@ -48,12 +57,17 @@ import {
   resetTableTimer,
   cancelTableTimer,
   acknowledgeTableTimer,
-  registerTablePaymentAndSettle,
   getTableArchives,
   getOrders,
+  getProducts,
+  getCategories,
+  getOpenTableOrders,
+  addOrAccumulateTableItems,
   getTableDeletionBlockReason,
   addAuditLog,
 } from '../../services/storage';
+import { apiRequest } from '../../services/sync-client';
+import { QuantitySelectorModal } from '../pos/QuantitySelectorModal';
 import { formatBRL, formatTimeBR, formatDateTimeBR } from '../../utils/formatters';
 import { playTableAlarmSound } from '../../utils/soundAlert';
 import {
@@ -62,19 +76,27 @@ import {
   getNotificationPermission,
   isNotificationSupported,
 } from '../../utils/notifications';
-import confetti from 'canvas-confetti';
 
 interface TablesViewProps {
   onStartSaleForTable?: (tableNumber: number) => void;
+  onGoToSales?: () => void;
 }
 
-export const TablesView: React.FC<TablesViewProps> = ({ onStartSaleForTable }) => {
+export const TablesView: React.FC<TablesViewProps> = ({ onGoToSales }) => {
   const { currentTenant } = useTenant();
   const { currentUser, isAdm } = useAuth();
 
   const [tables, setTables] = useState<RestaurantTable[]>([]);
+  const [products, setProducts] = useState<Product[]>([]);
+  const [categories, setCategories] = useState<Category[]>([]);
+  const [openTableOrders, setOpenTableOrders] = useState<Order[]>([]);
   const [selectedTable, setSelectedTable] = useState<RestaurantTable | null>(null);
   const [isActionModalOpen, setIsActionModalOpen] = useState(false);
+  const [modalTab, setModalTab] = useState<'catalog' | 'summary'>('catalog');
+  const [catalogSearch, setCatalogSearch] = useState('');
+  const [catalogCategoryId, setCatalogCategoryId] = useState<string>('all');
+  const [productForQtyModal, setProductForQtyModal] = useState<Product | null>(null);
+  const [isAddingItem, setIsAddingItem] = useState(false);
 
   // Modais de Criação e Edição pelo ADM
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
@@ -106,13 +128,6 @@ export const TablesView: React.FC<TablesViewProps> = ({ onStartSaleForTable }) =
   const [customTimerMinutes, setCustomTimerMinutes] = useState<number>(15);
   const [notificationPerm, setNotificationPerm] = useState<NotificationPermission>(getNotificationPermission());
 
-  // Modal de Conferência e Quitação da Mesa (Item 4)
-  const [isSettlementModalOpen, setIsSettlementModalOpen] = useState(false);
-  const [settlementMethod, setSettlementMethod] = useState<'dinheiro' | 'pix'>('dinheiro');
-  const [settlementPayAmount, setSettlementPayAmount] = useState<number>(0);
-  const [settlementCashReceived, setSettlementCashReceived] = useState<number>(0);
-  const [settlementNotes, setSettlementNotes] = useState<string>('');
-
   // Modal de Histórico Arquivado de Mesas
   const [isArchivesModalOpen, setIsArchivesModalOpen] = useState(false);
   const [tableArchives, setTableArchives] = useState<TableAccountArchive[]>([]);
@@ -132,9 +147,14 @@ export const TablesView: React.FC<TablesViewProps> = ({ onStartSaleForTable }) =
     const list = getTables(currentTenant.id);
     list.sort((a, b) => a.number - b.number);
     setTables(list);
+    setProducts(getProducts(currentTenant.id).filter((p) => p.active));
+    setCategories(getCategories(currentTenant.id).filter((c) => c.active));
     if (selectedTable) {
       const updated = list.find((t) => t.id === selectedTable.id);
-      if (updated) setSelectedTable(updated);
+      if (updated) {
+        setSelectedTable(updated);
+        setOpenTableOrders(getOpenTableOrders(currentTenant.id, updated));
+      }
     }
   };
 
@@ -504,33 +524,88 @@ export const TablesView: React.FC<TablesViewProps> = ({ onStartSaleForTable }) =
     };
   };
 
-  // Ações Operacionais de Salão (Abertura, Pedido, Liberação)
-  const handleOpenTable = (table: RestaurantTable) => {
-    const updated: RestaurantTable = {
-      ...table,
-      status: 'occupied',
-      openedAt: new Date().toISOString(),
-      waiterId: currentUser?.id,
-      waiterName: currentUser?.name,
-      currentTotal: table.currentTotal || 0,
-    };
-    saveTable(updated);
-    addAuditLog({
-      tenantId: currentTenant.id,
-      userId: currentUser?.id || 'garcom',
-      userName: currentUser?.name || 'Vendedor',
-      action: 'ABRIU_MESA',
-      details: `Iniciou atendimento na mesa "${table.label || `Mesa ${table.number}`}"`,
-    });
-    loadTables();
-    setIsActionModalOpen(false);
+  const handleOpenTableModal = (table: RestaurantTable) => {
+    setSelectedTable(table);
+    setOpenTableOrders(getOpenTableOrders(currentTenant.id, table));
+    setModalTab('catalog');
+    setCatalogSearch('');
+    setCatalogCategoryId('all');
+    setIsActionModalOpen(true);
+  };
 
-    if (onStartSaleForTable) {
-      onStartSaleForTable(table.number);
+  const handleConfirmAddProductToTable = async (payload: {
+    product: Product;
+    quantity: number;
+    variationName?: string;
+    selectedAddons?: { name: string; price: number }[];
+    notes?: string;
+  }) => {
+    if (!selectedTable || !currentUser || isAddingItem) return;
+    if (!isAdm && (currentUser.canSell === false || currentUser.status === 'bloqueado')) {
+      showFeedback('Sua permissão de venda está bloqueada pelo Administrador.', 'error');
+      return;
+    }
+
+    setIsAddingItem(true);
+    const mutationId = `tbl-item-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const itemPayload = {
+      productId: payload.product.id,
+      quantity: payload.quantity,
+      variationName: payload.variationName,
+      selectedAddons: payload.selectedAddons,
+      notes: payload.notes,
+    };
+
+    try {
+      // Atualiza no armazenamento local imediatamente (offline-first)
+      const localRes = addOrAccumulateTableItems(
+        currentTenant.id,
+        selectedTable.id,
+        [itemPayload],
+        { id: currentUser.id, name: currentUser.name }
+      );
+      if (!localRes.success) {
+        showFeedback(localRes.error || 'Não foi possível adicionar o produto.', 'error');
+        return;
+      }
+
+      // Envia para o servidor autoritativo em tempo real (com fila se offline)
+      try {
+        const remoteRes = await apiRequest(`/api/tables/${encodeURIComponent(selectedTable.id)}/items`, {
+          method: 'POST',
+          activeUserId: currentUser.id,
+          queueOnOffline: true,
+          body: {
+            tenantId: currentTenant.id,
+            items: [itemPayload],
+            mutationId,
+          },
+        });
+        if (remoteRes?.table) {
+          setSelectedTable(remoteRes.table);
+        }
+      } catch (err: any) {
+        if (!String(err?.message || '').startsWith('OFFLINE_QUEUED:')) {
+          // Se servidor recusou por estoque, mostra feedback real
+          if (localRes.table) setSelectedTable(localRes.table);
+        }
+      }
+
+      setProductForQtyModal(null);
+      loadTables();
+      if (localRes.table) {
+        setSelectedTable(localRes.table);
+        setOpenTableOrders(getOpenTableOrders(currentTenant.id, localRes.table));
+      }
+      showFeedback(
+        `${payload.quantity}x ${payload.product.name} adicionado à ${selectedTable.label || `Mesa ${selectedTable.number}`} (quantidade acumulada).`
+      );
+    } finally {
+      setIsAddingItem(false);
     }
   };
 
-  const handleCloseBill = (table: RestaurantTable) => {
+  const handleMarkAwaitingPayment = (table: RestaurantTable) => {
     const updated: RestaurantTable = {
       ...table,
       status: 'closing',
@@ -541,62 +616,13 @@ export const TablesView: React.FC<TablesViewProps> = ({ onStartSaleForTable }) =
       userId: currentUser?.id || 'garcom',
       userName: currentUser?.name || 'Vendedor',
       action: 'SOLICITOU_CONTA',
-      details: `Solicitou fechamento de conta da mesa "${table.label || `Mesa ${table.number}`}"`,
+      details: `Marcou "${table.label || `Mesa ${table.number}`}" como Aguardando Pagamento (fechamento na aba Vendas).`,
     });
     loadTables();
-    setIsActionModalOpen(false);
-    showFeedback(`Conta de "${table.label || `Mesa ${table.number}`}" solicitada (Aguardando Pagamento).`);
-  };
-
-  const handleOpenSettlementModal = (table: RestaurantTable) => {
-    const remaining = Math.max(0, Number(((table.currentTotal || 0) - (table.paidAmount || 0)).toFixed(2)));
-    setSettlementMethod('dinheiro');
-    setSettlementPayAmount(remaining);
-    setSettlementCashReceived(remaining);
-    setSettlementNotes('');
-    setIsSettlementModalOpen(true);
-  };
-
-  const handleConfirmTableSettlement = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!selectedTable || !currentUser) return;
-
-    const remaining = Math.max(0, Number(((selectedTable.currentTotal || 0) - (selectedTable.paidAmount || 0)).toFixed(2)));
-    const isEmptyTable = remaining <= 0.009 && (selectedTable.currentTotal || 0) <= 0.009;
-
-    const res = registerTablePaymentAndSettle(
-      currentTenant.id,
-      selectedTable.id,
-      {
-        method: settlementMethod,
-        amount: settlementPayAmount,
-        receivedAmount: settlementMethod === 'dinheiro' ? settlementCashReceived : settlementPayAmount,
-        notes: settlementNotes.trim() || undefined,
-        allowEmptyRelease: isEmptyTable,
-      },
-      { id: currentUser.id, name: currentUser.name }
+    setSelectedTable(updated);
+    showFeedback(
+      `"${table.label || `Mesa ${table.number}`}" marcada como Aguardando Pagamento. Finalize o recebimento na aba Vendas.`
     );
-
-    if (!res.success) {
-      showFeedback(res.error || 'Erro ao registrar pagamento da mesa.', 'error');
-      return;
-    }
-
-    loadTables();
-    if (res.settled) {
-      confetti({ particleCount: 35, spread: 60, origin: { y: 0.8 } });
-      setIsSettlementModalOpen(false);
-      setIsActionModalOpen(false);
-      setSelectedTable(null);
-      showFeedback(`✓ "${selectedTable.label || `Mesa ${selectedTable.number}`}" quitada, arquivada (${res.archive?.id}) e liberada!`);
-    } else if (res.table) {
-      setSelectedTable(res.table);
-      setSettlementPayAmount(res.remainingBalance);
-      setSettlementCashReceived(res.remainingBalance);
-      showFeedback(
-        `✓ Pagamento parcial registrado! Saldo restante: ${formatBRL(res.remainingBalance)}. A mesa permanece ocupada até quitação integral.`
-      );
-    }
   };
 
   const handleEnableNotifications = async () => {
@@ -652,7 +678,7 @@ export const TablesView: React.FC<TablesViewProps> = ({ onStartSaleForTable }) =
             </span>
           </div>
           <p className="mt-1 text-xs text-stone-500">
-            Controle ilimitado de salão, comandas nominais, lançamentos extras e alertas com temporizador
+            Controle ilimitado de salão, mesas nominais, lançamento de consumo com acúmulo automático e temporizador
           </p>
         </div>
 
@@ -844,13 +870,12 @@ export const TablesView: React.FC<TablesViewProps> = ({ onStartSaleForTable }) =
                       setSelectedIdsForBatch((prev) => [...prev, table.id]);
                     }
                   } else {
-                    setSelectedTable(table);
-                    setIsActionModalOpen(true);
+                    handleOpenTableModal(table);
                   }
                 }}
                 className={`relative flex flex-col justify-between rounded-2xl border p-4 shadow-2xs transition cursor-pointer hover:shadow-md ${cardBaseStyle} ${
                   isFlashingAlert
-                    ? 'border-2 border-rose-600! animate-pulse ring-2 ring-rose-500/50 bg-rose-50/30'
+                    ? 'border-2 border-rose-600! ring-2 ring-rose-500/50 bg-rose-50/40'
                     : ''
                 } ${isSelectedInBatch ? 'ring-2 ring-indigo-600 bg-indigo-50/40' : ''}`}
               >
@@ -1009,38 +1034,185 @@ export const TablesView: React.FC<TablesViewProps> = ({ onStartSaleForTable }) =
       {/* MODAL PRINCIPAL: AÇÕES & DETALHES COMPLETOS DA MESA SELECIONADA */}
       {/* ========================================================================= */}
       {isActionModalOpen && selectedTable && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-900/60 p-4 backdrop-blur-xs">
-          <div className="w-full max-w-md rounded-3xl border border-stone-200 bg-white p-6 shadow-2xl animate-in zoom-in-95 max-h-[92vh] flex flex-col">
-            <div className="flex items-center justify-between border-b border-stone-100 pb-3">
-              <div>
-                <span className="text-[10px] font-bold uppercase tracking-wider text-amber-600">
-                  Mesa #{selectedTable.number}
+        <div className="fixed inset-0 z-40 flex items-end sm:items-center justify-center bg-stone-900/60 p-0 sm:p-4 backdrop-blur-xs">
+          <div className="w-full max-w-2xl rounded-t-3xl sm:rounded-3xl border border-stone-200 bg-white p-5 sm:p-6 shadow-2xl max-h-[94vh] flex flex-col">
+            <div className="flex items-center justify-between border-b border-stone-100 pb-3 gap-3">
+              <div className="min-w-0">
+                <span className="text-[11px] font-bold uppercase tracking-wider text-amber-600">
+                  Mesa #{selectedTable.number} • {selectedTable.status === 'available' ? 'Disponível' : selectedTable.status === 'closing' ? 'Aguardando Pagamento' : 'Ocupada'}
                 </span>
-                <h3 className="font-black text-stone-900 text-lg">
+                <h3 className="font-black text-stone-900 text-lg truncate">
                   {selectedTable.label || `Mesa ${selectedTable.number}`}
                 </h3>
-                <p className="text-xs text-stone-500">
-                  Capacidade para {selectedTable.capacity} pessoas • Status: <strong>{selectedTable.status}</strong>
-                </p>
               </div>
+              <div className="flex items-center gap-3 shrink-0">
+                <div className="text-right">
+                  <span className="text-[10px] uppercase font-bold text-stone-400 block">Consumo Total</span>
+                  <span className="text-lg font-extrabold text-stone-900 tabular-nums">
+                    {formatBRL(selectedTable.currentTotal || 0)}
+                  </span>
+                </div>
+                <button
+                  onClick={() => setIsActionModalOpen(false)}
+                  className="min-w-[44px] min-h-[44px] rounded-xl flex items-center justify-center text-stone-500 hover:bg-stone-100 font-bold cursor-pointer"
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+
+            {/* Navegação interna do Modal: Cardápio para Lançar vs Resumo & Extras */}
+            <div className="grid grid-cols-2 gap-2 mt-3 bg-stone-100 p-1 rounded-xl">
               <button
-                onClick={() => setIsActionModalOpen(false)}
-                className="rounded-lg p-1.5 text-stone-400 hover:bg-stone-100 font-bold"
+                type="button"
+                onClick={() => setModalTab('catalog')}
+                className={`min-h-[44px] rounded-lg text-xs font-bold flex items-center justify-center gap-1.5 transition cursor-pointer ${
+                  modalTab === 'catalog'
+                    ? 'bg-white text-stone-900 shadow-xs'
+                    : 'text-stone-600 hover:text-stone-900'
+                }`}
               >
-                ✕
+                <ShoppingBag className="w-4 h-4 text-amber-600" />
+                Adicionar Produtos
+              </button>
+              <button
+                type="button"
+                onClick={() => setModalTab('summary')}
+                className={`min-h-[44px] rounded-lg text-xs font-bold flex items-center justify-center gap-1.5 transition cursor-pointer ${
+                  modalTab === 'summary'
+                    ? 'bg-white text-stone-900 shadow-xs'
+                    : 'text-stone-600 hover:text-stone-900'
+                }`}
+              >
+                <Receipt className="w-4 h-4 text-emerald-600" />
+                Consumo & Detalhes ({openTableOrders.reduce((acc, o) => acc + o.items.length, 0)})
               </button>
             </div>
 
-            <div className="flex-1 overflow-y-auto py-3 space-y-3.5 text-xs">
-              {/* Alerta de Tempo / Temporizador Vencido no Modal */}
-              {selectedTable.timer && (
-                <div
-                  className={`rounded-2xl p-3 border flex items-center justify-between ${
-                    getTimerDisplay(selectedTable.timer)?.isExpired
-                      ? 'bg-rose-50 border-rose-300 text-rose-950 animate-pulse'
-                      : 'bg-amber-50 border-amber-200 text-amber-950'
-                  }`}
-                >
+            {modalTab === 'catalog' ? (
+              <div className="flex-1 overflow-y-auto py-3 space-y-3">
+                {/* Busca & Filtro por Categoria */}
+                <div className="flex flex-col sm:flex-row gap-2">
+                  <div className="relative flex-1">
+                    <Search className="w-4 h-4 text-stone-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                    <input
+                      type="text"
+                      value={catalogSearch}
+                      onChange={(e) => setCatalogSearch(e.target.value)}
+                      placeholder="Buscar item do cardápio..."
+                      className="w-full min-h-[44px] pl-9 pr-3 bg-stone-50 border border-stone-200 rounded-xl text-sm text-stone-900 focus:outline-none focus:ring-2 focus:ring-amber-500"
+                    />
+                  </div>
+                  <select
+                    value={catalogCategoryId}
+                    onChange={(e) => setCatalogCategoryId(e.target.value)}
+                    className="min-h-[44px] px-3 bg-stone-50 border border-stone-200 rounded-xl text-xs font-semibold text-stone-700"
+                  >
+                    <option value="all">Todas Categorias</option>
+                    {categories.map((cat) => (
+                      <option key={cat.id} value={cat.id}>
+                        {cat.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Grid do Catálogo na Mesa */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                  {products
+                    .filter((p) => {
+                      const matchesCat = catalogCategoryId === 'all' || p.categoryId === catalogCategoryId;
+                      const q = catalogSearch.trim().toLowerCase();
+                      const matchesSearch =
+                        !q || p.name.toLowerCase().includes(q) || p.internalCode.toLowerCase().includes(q);
+                      return matchesCat && matchesSearch;
+                    })
+                    .map((product) => {
+                      const outOfStock =
+                        !currentTenant.settings?.allowNegativeStock && (product.stockQuantity ?? 0) <= 0;
+                      return (
+                        <button
+                          key={product.id}
+                          type="button"
+                          disabled={outOfStock}
+                          onClick={() => setProductForQtyModal(product)}
+                          className="min-h-[76px] p-2.5 rounded-xl border border-stone-200 bg-white hover:border-amber-500 hover:bg-amber-50/40 disabled:opacity-45 text-left flex items-center gap-3 transition cursor-pointer"
+                        >
+                          {product.imageUrl ? (
+                            <img
+                              src={product.imageUrl}
+                              alt={product.name}
+                              className="w-14 h-14 rounded-lg object-cover shrink-0 border border-stone-200"
+                            />
+                          ) : (
+                            <div className="w-14 h-14 rounded-lg bg-stone-100 flex items-center justify-center shrink-0 text-xs font-bold text-stone-500">
+                              {product.name.slice(0, 2).toUpperCase()}
+                            </div>
+                          )}
+                          <div className="min-w-0 flex-1">
+                            <p className="text-sm font-bold text-stone-900 line-clamp-1">{product.name}</p>
+                            <p className="text-xs font-extrabold text-amber-600 tabular-nums mt-0.5">
+                              {formatBRL(product.sellingPrice)} / {product.unit}
+                            </p>
+                            <p className="text-[11px] text-stone-500 tabular-nums">
+                              Estoque: {product.stockQuantity ?? 0} {product.unit}
+                            </p>
+                          </div>
+                          <span className="min-w-[36px] min-h-[36px] rounded-lg bg-stone-900 text-white flex items-center justify-center shrink-0">
+                            <Plus className="w-4 h-4" />
+                          </span>
+                        </button>
+                      );
+                    })}
+                </div>
+              </div>
+            ) : (
+              <div className="flex-1 overflow-y-auto py-3 space-y-3.5 text-xs">
+                {/* Itens Consumidos (Acumulados) */}
+                <div className="space-y-2">
+                  <p className="font-bold text-stone-800 text-xs">Itens Lançados nesta Mesa</p>
+                  {openTableOrders.length === 0 ||
+                  openTableOrders.every((o) => o.items.length === 0) ? (
+                    <div className="rounded-xl border border-stone-200 bg-stone-50 p-3 text-center text-stone-500">
+                      Nenhum produto lançado ainda. Use a aba "Adicionar Produtos".
+                    </div>
+                  ) : (
+                    <div className="rounded-xl border border-stone-200 divide-y divide-stone-100 bg-white">
+                      {openTableOrders.flatMap((ord) =>
+                        ord.items.map((item, idx) => (
+                          <div key={`${ord.id}-${idx}`} className="p-2.5 flex items-center justify-between gap-2">
+                            <div className="min-w-0">
+                              <p className="font-bold text-stone-900 truncate">
+                                <span className="text-amber-700 font-mono mr-1.5 tabular-nums">
+                                  {item.quantity}x
+                                </span>
+                                {item.productName}
+                              </p>
+                              <p className="text-[11px] text-stone-500 tabular-nums">
+                                Unitário: {formatBRL(item.unitPrice)}
+                                {item.variationName ? ` • ${item.variationName}` : ''}
+                                {item.notes ? ` • Obs: ${item.notes}` : ''}
+                              </p>
+                            </div>
+                            <span className="font-bold text-stone-900 tabular-nums shrink-0">
+                              {formatBRL(item.total)}
+                            </span>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                {/* Alerta de Tempo / Temporizador Vencido no Modal */}
+                {selectedTable.timer && (
+                  <div
+                    className={`rounded-2xl p-3 border flex items-center justify-between ${
+                      getTimerDisplay(selectedTable.timer)?.isExpired
+                        ? 'bg-rose-50 border-rose-300 text-rose-950'
+                        : 'bg-amber-50 border-amber-200 text-amber-950'
+                    }`}
+                  >
                   <div className="flex items-center gap-2">
                     <Timer className="h-5 w-5 text-amber-600" />
                     <div>
@@ -1260,85 +1432,81 @@ export const TablesView: React.FC<TablesViewProps> = ({ onStartSaleForTable }) =
                 )}
               </div>
 
-              {/* Ações de Salão */}
-              <div className="space-y-2 pt-2 border-t border-stone-100">
-                {selectedTable.status === 'available' ? (
+              {/* Ações de Salão (SEM fechamento/pagamento — recebimentos ficam exclusivamente na aba Vendas) */}
+              <div className="space-y-2.5 pt-2 border-t border-stone-100">
+                {selectedTable.status !== 'available' ? (
                   <>
-                    <button
-                      onClick={() => handleOpenTable(selectedTable)}
-                      className="flex w-full items-center justify-center gap-2 rounded-2xl bg-amber-600 px-4 py-3 text-xs font-bold text-white shadow-xs hover:bg-amber-700 active:scale-95 transition"
-                    >
-                      <Plus className="h-4 w-4" />
-                      <span>Iniciar Atendimento nesta Mesa</span>
-                    </button>
-
-                    {isAdm && (
-                      <div className="grid grid-cols-2 gap-2 pt-2 border-t border-stone-100">
-                        <button
-                          onClick={() => {
-                            setIsActionModalOpen(false);
-                            handleOpenEdit(selectedTable);
-                          }}
-                          className="flex items-center justify-center gap-1.5 rounded-xl border border-stone-200 bg-stone-50 py-2.5 text-xs font-semibold text-stone-700 hover:bg-stone-100"
-                        >
-                          <Edit2 className="h-3.5 w-3.5" />
-                          <span>Editar</span>
-                        </button>
-
-                        <button
-                          onClick={() => handleDeleteTable(selectedTable)}
-                          className="flex items-center justify-center gap-1.5 rounded-xl border border-rose-200 bg-rose-50 py-2.5 text-xs font-semibold text-rose-700 hover:bg-rose-100"
-                        >
-                          <Trash2 className="h-3.5 w-3.5" />
-                          <span>Excluir</span>
-                        </button>
-                      </div>
-                    )}
-                  </>
-                ) : (
-                  <>
-                    {/* Continuar Pedido / Ir para o PDV */}
-                    {onStartSaleForTable && (
-                      <button
-                        onClick={() => {
-                          setIsActionModalOpen(false);
-                          onStartSaleForTable(selectedTable.number);
-                        }}
-                        className="flex w-full items-center justify-center gap-2 rounded-2xl bg-stone-900 px-4 py-3 text-xs font-bold text-white hover:bg-stone-800 active:scale-95 transition shadow-xs"
-                      >
-                        <Receipt className="h-4 w-4 text-amber-400" />
-                        <span>Adicionar Mais Itens ao Pedido (PDV)</span>
-                      </button>
-                    )}
-
                     {selectedTable.status === 'occupied' && (
                       <button
-                        onClick={() => handleCloseBill(selectedTable)}
-                        className="flex w-full items-center justify-center gap-2 rounded-2xl border border-blue-300 bg-blue-50 px-4 py-2.5 text-xs font-bold text-blue-900 hover:bg-blue-100 transition"
+                        type="button"
+                        onClick={() => handleMarkAwaitingPayment(selectedTable)}
+                        className="flex w-full min-h-[44px] items-center justify-center gap-2 rounded-xl border border-blue-300 bg-blue-50 px-4 text-xs font-bold text-blue-900 hover:bg-blue-100 transition cursor-pointer"
                       >
                         <Receipt className="h-4 w-4 text-blue-700" />
-                        <span>Solicitar Conta / Aguardando Pagamento</span>
+                        <span>Marcar como Aguardando Pagamento</span>
                       </button>
                     )}
 
-                    <button
-                      onClick={() => handleOpenSettlementModal(selectedTable)}
-                      className="flex w-full items-center justify-center gap-2 rounded-2xl bg-emerald-600 px-4 py-3 text-xs font-bold text-white shadow-xs hover:bg-emerald-700 active:scale-95 transition"
-                    >
-                      <CheckCircle2 className="h-4 w-4" />
-                      <span>
-                        {(selectedTable.currentTotal || 0) <= 0
-                          ? 'Liberar Mesa Sem Consumo'
-                          : 'Conferir Conta & Registrar Pagamento'}
+                    <div className="rounded-xl border border-stone-200 bg-stone-50 p-3 flex items-center justify-between gap-2">
+                      <span className="text-[11px] text-stone-600">
+                        Recebimento e quitação da conta são realizados na aba <strong>Vendas</strong>.
                       </span>
-                    </button>
+                      {onGoToSales && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setIsActionModalOpen(false);
+                            onGoToSales();
+                          }}
+                          className="min-h-[38px] px-3 rounded-lg bg-stone-900 text-white text-[11px] font-bold shrink-0 flex items-center gap-1 cursor-pointer"
+                        >
+                          Ir para Vendas
+                          <ArrowRight className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
                   </>
+                ) : (
+                  isAdm && (
+                    <div className="grid grid-cols-2 gap-2 pt-1">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsActionModalOpen(false);
+                          handleOpenEdit(selectedTable);
+                        }}
+                        className="min-h-[44px] flex items-center justify-center gap-1.5 rounded-xl border border-stone-200 bg-stone-50 text-xs font-semibold text-stone-700 hover:bg-stone-100 cursor-pointer"
+                      >
+                        <Edit2 className="h-3.5 w-3.5" />
+                        <span>Editar Mesa</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteTable(selectedTable)}
+                        className="min-h-[44px] flex items-center justify-center gap-1.5 rounded-xl border border-rose-200 bg-rose-50 text-xs font-semibold text-rose-700 hover:bg-rose-100 cursor-pointer"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                        <span>Excluir Mesa</span>
+                      </button>
+                    </div>
+                  )
                 )}
               </div>
             </div>
+            )}
           </div>
         </div>
       )}
+
+      {/* MODAL DE SELEÇÃO DE QUANTIDADE / PESO PARA MESA */}
+      <QuantitySelectorModal
+        product={productForQtyModal}
+        allowNegativeStock={Boolean(currentTenant.settings?.allowNegativeStock)}
+        confirmLabel="Lançar na Mesa"
+        onClose={() => setProductForQtyModal(null)}
+        onConfirm={handleConfirmAddProductToTable}
+      />
 
       {/* ========================================================================= */}
       {/* MODAL: ADICIONAR VALOR EXTRA À MESA (EXCLUSIVO ADM) */}
@@ -1820,189 +1988,7 @@ export const TablesView: React.FC<TablesViewProps> = ({ onStartSaleForTable }) =
         </div>
       )}
 
-      {/* ========================================================================= */}
-      {/* MODAL: CONFERÊNCIA DA CONTA & QUITAÇÃO / LIBERAÇÃO DA MESA */}
-      {/* ========================================================================= */}
-      {isSettlementModalOpen && selectedTable && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-900/65 p-4 backdrop-blur-xs">
-          <div className="w-full max-w-md rounded-3xl border border-stone-200 bg-white p-6 shadow-2xl animate-in zoom-in-95 max-h-[92vh] flex flex-col">
-            <div className="flex items-center justify-between border-b border-stone-100 pb-3">
-              <div>
-                <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-600">
-                  Conferência & Fechamento
-                </span>
-                <h3 className="font-black text-stone-900 text-lg">
-                  {selectedTable.label || `Mesa ${selectedTable.number}`}
-                </h3>
-              </div>
-              <button
-                onClick={() => setIsSettlementModalOpen(false)}
-                className="rounded-lg p-1.5 text-stone-400 hover:bg-stone-100 font-bold"
-              >
-                ✕
-              </button>
-            </div>
 
-            <form onSubmit={handleConfirmTableSettlement} className="mt-4 flex-1 overflow-y-auto space-y-4 text-xs">
-              {/* Detalhamento separado: Consumo vs Valores Extras vs Pagamentos */}
-              <div className="rounded-2xl bg-stone-50 border border-stone-200 p-4 space-y-2">
-                <div className="flex justify-between text-stone-600">
-                  <span>Consumo de Produtos:</span>
-                  <strong>
-                    {formatBRL(selectedTable.productsTotal ?? Math.max(0, (selectedTable.currentTotal || 0) - (selectedTable.extraTotal || 0)))}
-                  </strong>
-                </div>
-                <div className="flex justify-between text-indigo-700">
-                  <span>Valores Extras Ativos:</span>
-                  <strong>+{formatBRL(selectedTable.extraTotal || 0)}</strong>
-                </div>
-                <div className="border-t border-stone-200 pt-2 flex justify-between font-bold text-stone-900">
-                  <span>Total Geral a Receber:</span>
-                  <span>{formatBRL(selectedTable.currentTotal || 0)}</span>
-                </div>
-                {(selectedTable.paidAmount || 0) > 0 && (
-                  <div className="flex justify-between text-emerald-700 font-semibold">
-                    <span>Pagamentos Já Registrados:</span>
-                    <span>-{formatBRL(selectedTable.paidAmount || 0)}</span>
-                  </div>
-                )}
-                <div className="border-t border-stone-300 pt-2 flex justify-between items-baseline">
-                  <span className="font-bold text-stone-800">Saldo Restante:</span>
-                  <span className="text-xl font-black text-emerald-700">
-                    {formatBRL(Math.max(0, (selectedTable.currentTotal || 0) - (selectedTable.paidAmount || 0)))}
-                  </span>
-                </div>
-              </div>
-
-              {/* Lista de pagamentos parciais já feitos */}
-              {selectedTable.payments && selectedTable.payments.length > 0 && (
-                <div className="space-y-1">
-                  <p className="text-[11px] font-bold text-stone-600">Pagamentos Registrados nesta Conta:</p>
-                  <div className="rounded-xl border border-stone-200 divide-y divide-stone-100 bg-white">
-                    {selectedTable.payments.map((p) => (
-                      <div key={p.id} className="px-3 py-2 flex justify-between text-[11px]">
-                        <span>
-                          <strong className="uppercase">{p.method}</strong> • {p.receivedByName} ({formatTimeBR(p.paidAt)})
-                        </span>
-                        <strong className="text-emerald-700">{formatBRL(p.amount)}</strong>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {Math.max(0, (selectedTable.currentTotal || 0) - (selectedTable.paidAmount || 0)) > 0.009 ? (
-                <>
-                  <div>
-                    <label className="block font-bold text-stone-700 mb-1.5">Forma de Pagamento</label>
-                    <div className="grid grid-cols-2 gap-2">
-                      <button
-                        type="button"
-                        onClick={() => setSettlementMethod('dinheiro')}
-                        className={`rounded-xl border py-2.5 font-bold transition ${
-                          settlementMethod === 'dinheiro'
-                            ? 'border-emerald-600 bg-emerald-50 text-emerald-900'
-                            : 'border-stone-200 text-stone-600 hover:bg-stone-50'
-                        }`}
-                      >
-                        Dinheiro
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setSettlementMethod('pix')}
-                        className={`rounded-xl border py-2.5 font-bold transition ${
-                          settlementMethod === 'pix'
-                            ? 'border-emerald-600 bg-emerald-50 text-emerald-900'
-                            : 'border-stone-200 text-stone-600 hover:bg-stone-50'
-                        }`}
-                      >
-                        PIX
-                      </button>
-                    </div>
-                  </div>
-
-                  <div>
-                    <label className="block font-bold text-stone-700 mb-1">
-                      Valor a Registrar Agora (R$)
-                    </label>
-                    <input
-                      type="number"
-                      step="0.01"
-                      min="0.01"
-                      max={Math.max(0.01, Number(((selectedTable.currentTotal || 0) - (selectedTable.paidAmount || 0)).toFixed(2)))}
-                      required
-                      value={settlementPayAmount}
-                      onChange={(e) => {
-                        const val = parseFloat(e.target.value) || 0;
-                        setSettlementPayAmount(val);
-                        setSettlementCashReceived(val);
-                      }}
-                      className="w-full rounded-xl border border-stone-200 px-3 py-2.5 text-sm font-black text-stone-900 focus:border-emerald-600 focus:outline-hidden"
-                    />
-                    {settlementPayAmount < Math.max(0, (selectedTable.currentTotal || 0) - (selectedTable.paidAmount || 0)) - 0.009 && (
-                      <p className="mt-1 text-[11px] font-semibold text-amber-700">
-                        Pagamento parcial: a mesa permanecerá ocupada até a quitação integral do saldo restante.
-                      </p>
-                    )}
-                  </div>
-
-                  {settlementMethod === 'dinheiro' && (
-                    <div>
-                      <label className="block font-bold text-stone-700 mb-1">Valor Entregue pelo Cliente (R$)</label>
-                      <input
-                        type="number"
-                        step="0.01"
-                        min={settlementPayAmount}
-                        value={settlementCashReceived}
-                        onChange={(e) => setSettlementCashReceived(parseFloat(e.target.value) || 0)}
-                        className="w-full rounded-xl border border-stone-200 px-3 py-2 text-xs font-bold text-stone-900 focus:border-emerald-600 focus:outline-hidden"
-                      />
-                      {settlementCashReceived > settlementPayAmount && (
-                        <p className="mt-1 text-xs font-bold text-emerald-700">
-                          Troco: {formatBRL(settlementCashReceived - settlementPayAmount)}
-                        </p>
-                      )}
-                    </div>
-                  )}
-
-                  <div>
-                    <label className="block font-bold text-stone-700 mb-1">Observação (Opcional)</label>
-                    <input
-                      type="text"
-                      value={settlementNotes}
-                      onChange={(e) => setSettlementNotes(e.target.value)}
-                      placeholder="Ex: Quitação na saída"
-                      className="w-full rounded-xl border border-stone-200 px-3 py-2 text-xs text-stone-900 focus:border-emerald-600 focus:outline-hidden"
-                    />
-                  </div>
-                </>
-              ) : (
-                <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-emerald-900">
-                  Não há saldo pendente nesta mesa. Confirme abaixo para arquivar e liberar a mesa.
-                </div>
-              )}
-
-              <div className="flex justify-end gap-2 pt-3 border-t border-stone-100">
-                <button
-                  type="button"
-                  onClick={() => setIsSettlementModalOpen(false)}
-                  className="rounded-xl border border-stone-200 px-4 py-2.5 text-xs font-semibold text-stone-600 hover:bg-stone-50"
-                >
-                  Voltar
-                </button>
-                <button
-                  type="submit"
-                  className="rounded-xl bg-emerald-600 px-5 py-2.5 text-xs font-bold text-white hover:bg-emerald-700 shadow-xs"
-                >
-                  {settlementPayAmount + (selectedTable.paidAmount || 0) >= (selectedTable.currentTotal || 0) - 0.009
-                    ? 'Quitar Conta & Liberar Mesa'
-                    : 'Registrar Pagamento Parcial'}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
 
       {/* ========================================================================= */}
       {/* MODAL: HISTÓRICO DE CONTAS DE MESAS ARQUIVADAS (ADM) */}

@@ -159,9 +159,9 @@ export const MySalesView: React.FC = () => {
             myOrders.map((ord) => {
               const modalityLabel =
                 ord.type === 'table'
-                  ? `Mesa ${ord.tableNumber || ''}`
+                  ? ord.tableName || `Mesa ${ord.tableNumber || ''}`
                   : ord.type === 'comanda'
-                  ? `Comanda ${ord.comandaNumber || ord.orderNumber}`
+                  ? `Registro Histórico${ord.comandaNumber ? ` #${ord.comandaNumber}` : ''}`
                   : 'Balcão';
 
               const paymentMethodLabel = ord.payments[0]?.method

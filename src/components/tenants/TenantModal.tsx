@@ -251,7 +251,7 @@ export const TenantModal: React.FC<TenantModalProps> = ({ isOpen, onClose, mode 
                 onChange={(e) => setFormData({ ...formData, requireTableWaiter: e.target.checked })}
                 className="rounded border-stone-300 text-amber-600 focus:ring-amber-500"
               />
-              <span>Exigir garçom identificado ao abrir comandas e mesas</span>
+              <span>Exigir operador identificado ao abrir mesas</span>
             </label>
 
             <label className="flex items-center gap-2.5 text-xs text-stone-800 cursor-pointer">

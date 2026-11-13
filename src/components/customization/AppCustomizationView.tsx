@@ -60,12 +60,10 @@ export const AppCustomizationView: React.FC = () => {
   };
 
   const handleReset = () => {
-    if (window.confirm('Deseja restaurar as cores originais oficiais do SaborGestão?')) {
-      resetThemeToDefault();
-      setDraftTheme(DEFAULT_THEME_CONFIG);
-      setSaveSuccess(true);
-      setTimeout(() => setSaveSuccess(false), 4000);
-    }
+    resetThemeToDefault();
+    setDraftTheme(DEFAULT_THEME_CONFIG);
+    setSaveSuccess(true);
+    setTimeout(() => setSaveSuccess(false), 4000);
   };
 
   const colorSections = [
@@ -91,7 +89,7 @@ export const AppCustomizationView: React.FC = () => {
       key: 'tablesColor' as const,
       label: 'Seção de Mesas & Atendimento',
       icon: Grid2X2,
-      description: 'Mapa do salão, comandas e status das mesas',
+      description: 'Mapa do salão, consumo e status das mesas',
     },
     {
       key: 'cashColor' as const,

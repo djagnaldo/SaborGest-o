@@ -5,7 +5,7 @@ const config: CapacitorConfig = {
   appName: 'SaborGestão ERP & PDV',
   webDir: 'dist',
   server: {
-    androidScheme: 'https',
+    androidScheme: 'http',
     cleartext: true,
   },
   android: {

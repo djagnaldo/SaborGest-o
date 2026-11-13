@@ -189,9 +189,9 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({ onNavigate
               <Receipt className="h-5 w-5" />
             </div>
             <div>
-              <p className="text-sm font-black text-stone-900">Ponto de Venda (PDV)</p>
+              <p className="text-sm font-black text-stone-900">Vendas & Balcão</p>
               <p className="text-[11px] text-stone-500">
-                Balcão, mesas e comandas com baixa no estoque
+                Fechamento de mesas e venda direta no balcão
               </p>
             </div>
           </button>
@@ -308,9 +308,9 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({ onNavigate
               <Monitor className="h-5 w-5" />
             </div>
             <div>
-              <p className="text-sm font-black text-stone-900">Acesso PC pelo Navegador</p>
+              <p className="text-sm font-black text-stone-900">Acesso pelo Navegador</p>
               <p className="text-[11px] text-stone-500">
-                Servidor web local na rede Wi-Fi
+                Chaves de acesso, QR Code e sessões em rede
               </p>
             </div>
           </button>

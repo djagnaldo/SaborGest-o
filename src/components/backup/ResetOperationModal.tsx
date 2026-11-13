@@ -170,7 +170,7 @@ export const ResetOperationModal: React.FC<ResetOperationModalProps> = ({
                 />
                 <div>
                   <p className="font-bold text-stone-800">Mesas & Atendimento</p>
-                  <p className="text-[10px] text-stone-500">Libera mesas e zera comandas em aberto</p>
+                  <p className="text-[10px] text-stone-500">Libera mesas e zera contas em aberto</p>
                 </div>
               </label>
 

@@ -130,6 +130,7 @@ export interface Product {
   sellingPrice: number;
   profitMargin: number; // calculada: ((sellingPrice - costPrice) / sellingPrice) * 100
   unit: 'un' | 'kg' | 'g' | 'l' | 'ml' | 'porcao' | 'fatia';
+  allowWeight?: boolean; // Produto vendido por peso na balança (kg/g)
   stockQuantity: number;
   minStock: number;
   supplierId?: string;
@@ -143,6 +144,7 @@ export interface Product {
   isDemo?: boolean;
 }
 
+/** 'comanda' mantido apenas para leitura compatível de registros históricos legados */
 export type OrderType = 'counter' | 'table' | 'comanda';
 
 export type OrderStatus =
@@ -606,3 +608,68 @@ export interface ResetOperationOptions {
   confirmationText: string;
   reason?: string;
 }
+
+export type WebAccessMode = 'admin' | 'seller';
+
+export interface WebAccessKeySummary {
+  id: string;
+  tenantId: string;
+  mode: WebAccessMode;
+  userId?: string;
+  userName: string;
+  keyPreview: string;
+  createdAt: string;
+  expiresAt: string;
+  revoked: boolean;
+  revokedAt?: string;
+  lastUsedAt?: string;
+}
+
+export interface WebSessionInfo {
+  id: string;
+  tenantId: string;
+  mode: WebAccessMode;
+  userId: string;
+  userName: string;
+  deviceLabel: string;
+  ipAddress: string;
+  userAgent: string;
+  connectedAt: string;
+  lastActivityAt: string;
+  wsConnected: boolean;
+}
+
+export interface ConnectionAuditLog {
+  id: string;
+  tenantId: string;
+  timestamp: string;
+  event:
+    | 'login'
+    | 'logout'
+    | 'disconnect'
+    | 'revoked'
+    | 'blocked'
+    | 'key_created'
+    | 'key_renewed'
+    | 'access_toggled';
+  mode?: WebAccessMode;
+  userId?: string;
+  userName: string;
+  deviceLabel: string;
+  ipAddress: string;
+  details: string;
+}
+
+export interface WebAccessStatusResponse {
+  webAccessEnabled: boolean;
+  port: number;
+  primaryIp: string;
+  lanIps: string[];
+  urls: string[];
+  activeSessionsCount: number;
+  sessions: WebSessionInfo[];
+  keys: WebAccessKeySummary[];
+  logs: ConnectionAuditLog[];
+  revision: number;
+}
+

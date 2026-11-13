@@ -3,292 +3,322 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   Receipt,
   Search,
   Plus,
   Minus,
   Trash2,
-  DollarSign,
   QrCode,
   Banknote,
-  FileText,
   CheckCircle2,
   Printer,
-  Sparkles,
   ShoppingBag,
-  AlertCircle,
   X,
-  User,
-  Phone,
-  MapPin,
-  Clock,
-  WifiOff,
-  Wifi,
   Image as ImageIcon,
   ShieldAlert,
-  ArrowRight,
-  ArrowLeft,
-  RotateCw,
-  XCircle,
   Camera,
   Upload,
-  Eye,
-  Check,
   Grid2X2,
-  CreditCard,
-  Edit3,
+  Scale,
+  Clock,
+  ArrowRight,
+  Ban,
+  Eye,
+  AlertTriangle,
 } from 'lucide-react';
+import confetti from 'canvas-confetti';
 import { useTenant } from '../../contexts/TenantContext';
 import { useAuth } from '../../contexts/AuthContext';
-import { Product, OrderItem, PaymentMethod, Order, DebtRecord, RestaurantTable } from '../../types';
+import { Product, OrderItem, Order, RestaurantTable, Category } from '../../types';
 import {
   getProducts,
   getCategories,
-  saveOrder,
-  saveDebt,
-  addAuditLog,
   getOrders,
   getTables,
-  saveTable,
-  saveTableArchive,
+  getOpenTableOrders,
+  registerTablePaymentAndSettle,
+  saveOrder,
   recordPaymentInCashSession,
   validateOrderStock,
   deductStockForOrder,
   isSellerAuthorizedToSell,
+  getOrderProductSalesTotal,
+  getOrderExtraTotal,
 } from '../../services/storage';
-import {
-  isServerOnline,
-  enqueueSyncOperation,
-  getMatrizInfo,
-  isDeviceMatriz,
-  cancelOrderWithAuthority,
-  recordDeltaTransfer,
-  broadcastDeltaUpdate,
-} from '../../services/local-db';
+import { cancelOrderWithAuthority, recordDeltaTransfer } from '../../services/local-db';
+import { apiRequest, refreshSnapshotFromServer, getWsConnectionStatus } from '../../services/sync-client';
 import { processProductImage, PRESET_RECEIPT_PHOTOS } from '../../utils/image-processor';
-import { formatBRL, formatDateTimeBR, formatTimeBR, getTableStatusLabel } from '../../utils/formatters';
-import confetti from 'canvas-confetti';
-
-// ETAPAS DO NOVO FLUXO DE VENDAS OBRIGATÓRIO:
-// 1. Escolher modalidade (Mesas, Balcão, Comandas)
-// 2. Selecionar a mesa quando aplicável
-// 3. Selecionar os produtos do cardápio
-// 4. Definir quantidades e observações
-// 5. Conferir o pedido
-// 6. Selecionar a forma de pagamento
-// 7. Confirmar a operação
-export type SaleFlowStep =
-  | 'step1_modality'
-  | 'step2_table'
-  | 'step2_comanda'
-  | 'step3_catalog'
-  | 'step4_review'
-  | 'step5_payment'
-  | 'step6_success';
+import { formatBRL, formatDateTimeBR, formatTimeBR } from '../../utils/formatters';
+import { QuantitySelectorModal } from './QuantitySelectorModal';
 
 interface PosViewProps {
+  mode?: 'sales' | 'counter';
   preselectedTableNumber?: number | null;
   onConsumePreselectedTable?: () => void;
+  onNavigateToTables?: () => void;
+  onNavigateToCounter?: () => void;
 }
 
+const formatUnitStock = (qty: number, unit?: string) => {
+  if (unit === 'kg') return `${Number(qty || 0).toFixed(2)} kg`;
+  if (unit === 'l') return `${Number(qty || 0).toFixed(2)} L`;
+  if (unit === 'g') return `${Math.round(qty || 0)} g`;
+  if (unit === 'ml') return `${Math.round(qty || 0)} ml`;
+  return `${qty || 0} ${unit || 'un'}`;
+};
+
+const formatModalityBadge = (ord: Order) => {
+  if (ord.type === 'table') {
+    return ord.tableName || `Mesa #${ord.tableNumber || ''}`;
+  }
+  if (ord.type === 'comanda') {
+    return `Registro Histórico${ord.comandaNumber ? ` #${ord.comandaNumber}` : ''}`;
+  }
+  return 'Balcão';
+};
+
 export const PosView: React.FC<PosViewProps> = ({
+  mode = 'sales',
   preselectedTableNumber,
   onConsumePreselectedTable,
+  onNavigateToTables,
+  onNavigateToCounter,
 }) => {
   const { currentTenant } = useTenant();
-  const { currentUser, isAdm, activeView } = useAuth();
+  const { currentUser, isAdm } = useAuth();
 
-  // Estado da etapa do fluxo dinâmico
-  const [currentStep, setCurrentStep] = useState<SaleFlowStep>('step1_modality');
+  const [products, setProducts] = useState<Product[]>([]);
+  const [categories, setCategories] = useState<Category[]>([]);
+  const [tables, setTables] = useState<RestaurantTable[]>([]);
+  const [orders, setOrders] = useState<Order[]>([]);
 
-  // Modalidade e Destino
-  const [saleModality, setSaleModality] = useState<'table' | 'counter' | 'comanda'>('counter');
-  const [selectedTableNumber, setSelectedTableNumber] = useState<number | null>(null);
-  const [comandaCode, setComandaCode] = useState<string>('');
+  // Feedback toast inline (substitui qualquer window.alert)
+  const [feedback, setFeedback] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
+  const showFeedback = (text: string, type: 'success' | 'error' = 'success') => {
+    setFeedback({ text, type });
+    setTimeout(() => setFeedback(null), 5000);
+  };
+
+  const loadData = () => {
+    setProducts(getProducts(currentTenant.id).filter((p) => p.active));
+    setCategories(getCategories(currentTenant.id).filter((c) => c.active));
+    const sortedTables = [...getTables(currentTenant.id)].sort((a, b) => a.number - b.number);
+    setTables(sortedTables);
+    setOrders(getOrders(currentTenant.id));
+  };
 
   useEffect(() => {
-    if (preselectedTableNumber) {
-      setSaleModality('table');
-      setSelectedTableNumber(preselectedTableNumber);
-      setCurrentStep('step3_catalog');
-      if (onConsumePreselectedTable) onConsumePreselectedTable();
-    }
-  }, [preselectedTableNumber, onConsumePreselectedTable]);
+    loadData();
+    const handleSync = () => loadData();
+    window.addEventListener('sabor_local_sync', handleSync);
+    return () => window.removeEventListener('sabor_local_sync', handleSync);
+  }, [currentTenant.id]);
 
-  // Produtos e Carrinho
-  const [products, setProducts] = useState<Product[]>(getProducts(currentTenant.id));
-  const [categories, setCategories] = useState(getCategories(currentTenant.id));
-  const [tables, setTables] = useState<RestaurantTable[]>(getTables(currentTenant.id));
+  const isSellerBlocked = !isAdm && !isSellerAuthorizedToSell(currentUser?.id);
+
+  // =========================================================================
+  // ESTADOS EXCLUSIVOS DO MODO BALCÃO (mode === 'counter')
+  // =========================================================================
   const [selectedCategory, setSelectedCategory] = useState<string>('all');
   const [searchTerm, setSearchTerm] = useState('');
+  const [productForModal, setProductForModal] = useState<Product | null>(null);
   const [cartItems, setCartItems] = useState<OrderItem[]>([]);
-  const [discount, setDiscount] = useState<number>(0);
-  const [includeServiceFee, setIncludeServiceFee] = useState(false);
+  const [counterCustomerName, setCounterCustomerName] = useState('');
+  const [counterMethod, setCounterMethod] = useState<'dinheiro' | 'pix'>('dinheiro');
+  const [counterReceivedCash, setCounterReceivedCash] = useState<number>(0);
+  const [isSubmittingCounter, setIsSubmittingCounter] = useState(false);
+  const [finishedCounterOrder, setFinishedCounterOrder] = useState<Order | null>(null);
 
-  // Modal de Adição com Observação (Item customizado)
-  const [activeItemForNotes, setActiveItemForNotes] = useState<{ product: Product; notes: string; quantity: number } | null>(null);
-
-  // Pagamento (As 3 Formas Exclusivas: Dinheiro, PIX, Devendo)
-  const [selectedMethod, setSelectedMethod] = useState<PaymentMethod>('dinheiro');
-  const [receivedCash, setReceivedCash] = useState<number>(0);
-  const [finishedOrder, setFinishedOrder] = useState<Order | null>(null);
-
-  // Comprovantes fotográficos
+  // Comprovantes fotográficos (Balcão)
   const [receiptImage, setReceiptImage] = useState<string | null>(null);
   const [receiptSizeKb, setReceiptSizeKb] = useState<number | null>(null);
   const [isProcessingReceipt, setIsProcessingReceipt] = useState(false);
   const [showPresetReceiptModal, setShowPresetReceiptModal] = useState(false);
 
-  // Regras de Comprovante definidas pela Matriz
   const pixRule = currentTenant.settings?.pixReceiptRule || 'optional';
   const cashRule = currentTenant.settings?.cashReceiptRule || 'optional';
-  const activeReceiptRule =
-    selectedMethod === 'pix' ? pixRule : selectedMethod === 'dinheiro' ? cashRule : 'disabled';
+  const activeReceiptRule = counterMethod === 'pix' ? pixRule : cashRule;
   const isReceiptMandatory = activeReceiptRule === 'required';
 
-  // DEVENDO (Campos Obrigatórios)
-  const [debtCustomerName, setDebtCustomerName] = useState('');
-  const [debtCustomerPhone, setDebtCustomerPhone] = useState('');
-  const [debtCustomerCpf, setDebtCustomerCpf] = useState('');
-  const [debtCustomerAddress, setDebtCustomerAddress] = useState('');
-  const [debtNotes, setDebtNotes] = useState('');
+  // =========================================================================
+  // ESTADOS EXCLUSIVOS DO MODO VENDAS / FECHAMENTO DE MESAS (mode === 'sales')
+  // =========================================================================
+  const [settlingTable, setSettlingTable] = useState<RestaurantTable | null>(null);
+  const [settleMethod, setSettleMethod] = useState<'dinheiro' | 'pix'>('dinheiro');
+  const [settleAmount, setSettleAmount] = useState<number>(0);
+  const [settleReceivedCash, setSettleReceivedCash] = useState<number>(0);
+  const [settleNotes, setSettleNotes] = useState('');
+  const [isSubmittingSettle, setIsSubmittingSettle] = useState(false);
 
-  // Histórico recente e cancelamento
-  const [isHistoryModalOpen, setIsHistoryModalOpen] = useState(false);
-  const [securityBlockMessage, setSecurityBlockMessage] = useState<string | null>(null);
+  // Filtros e histórico de vendas
+  const [historyFilter, setHistoryFilter] = useState<'today' | 'all' | 'counter' | 'table' | 'cancelled'>('today');
+  const [historySearch, setHistorySearch] = useState('');
+  const [viewingOrder, setViewingOrder] = useState<Order | null>(null);
+  const [cancellingOrder, setCancellingOrder] = useState<Order | null>(null);
+  const [cancelReason, setCancelReason] = useState('');
 
-  const matrizInfo = getMatrizInfo();
-  const serverOnline = isServerOnline();
-
-  // Verifica se o vendedor atual está bloqueado pelo ADM
-  const isSellerBlocked = !isSellerAuthorizedToSell(currentUser?.id);
-
-  // Sincronização em tempo real de estoque, mesas e usuários
+  // Se vier mesa pré-selecionada na aba Vendas, abre fechamento da conta diretamente
   useEffect(() => {
-    setProducts(getProducts(currentTenant.id));
-    setCategories(getCategories(currentTenant.id));
-    setTables(getTables(currentTenant.id));
-
-    const handleSync = () => {
-      setProducts(getProducts(currentTenant.id));
-      setCategories(getCategories(currentTenant.id));
-      setTables(getTables(currentTenant.id));
-    };
-
-    window.addEventListener('sabor_local_sync', handleSync);
-    return () => window.removeEventListener('sabor_local_sync', handleSync);
-  }, [currentTenant.id]);
-
-  // Formatação didática de quantidade de estoque
-  const formatStockQuantity = (qty: number, unit?: string) => {
-    const formattedNum = qty < 10 && qty >= 0 ? `0${qty}` : `${qty}`;
-    if (!unit || unit === 'un') {
-      return `${formattedNum} ${qty === 1 ? 'UNIDADE' : 'UNIDADES'}`;
+    if (mode === 'sales' && preselectedTableNumber) {
+      const target = tables.find((t) => t.number === preselectedTableNumber);
+      if (target) {
+        openTableSettlementModal(target);
+      }
+      onConsumePreselectedTable?.();
     }
-    if (unit === 'kg') return `${qty.toFixed(2)} KG`;
-    if (unit === 'g') return `${qty} G`;
-    if (unit === 'l') return `${qty} L`;
-    if (unit === 'ml') return `${qty} ML`;
-    if (unit === 'porcao') return `${formattedNum} ${qty === 1 ? 'PORÇÃO' : 'PORÇÕES'}`;
-    if (unit === 'fatia') return `${formattedNum} ${qty === 1 ? 'FATIA' : 'FATIAS'}`;
-    return `${formattedNum} ${unit.toUpperCase()}`;
+  }, [mode, preselectedTableNumber, tables]);
+
+  const openTableSettlementModal = (table: RestaurantTable) => {
+    const productsTotal = table.productsTotal ?? Math.max(0, (table.currentTotal || 0) - (table.extraTotal || 0));
+    const extraTotal = table.extraTotal || 0;
+    const grandTotal = Number((productsTotal + extraTotal).toFixed(2));
+    const paidAlready = Number((table.paidAmount || 0).toFixed(2));
+    const remaining = Number(Math.max(0, grandTotal - paidAlready).toFixed(2));
+
+    setSettlingTable(table);
+    setSettleMethod('dinheiro');
+    setSettleAmount(remaining);
+    setSettleReceivedCash(remaining);
+    setSettleNotes('');
   };
 
-  // ADICIONAR ITEM AO PEDIDO (Validação de Estoque Físico)
-  const handleAddToCart = (product: Product, customNotes?: string, customQty: number = 1) => {
+  // Mantém settlingTable sincronizada se outro dispositivo atualizar durante modal aberto
+  useEffect(() => {
+    if (settlingTable) {
+      const refreshed = tables.find((t) => t.id === settlingTable.id);
+      if (refreshed) {
+        setSettlingTable(refreshed);
+      }
+    }
+  }, [tables]);
+
+  // =========================================================================
+  // LÓGICA DO BALCÃO
+  // =========================================================================
+  const filteredCatalog = useMemo(() => {
+    return products.filter((p) => {
+      const matchCat = selectedCategory === 'all' || p.categoryId === selectedCategory;
+      const q = searchTerm.trim().toLowerCase();
+      const matchQuery =
+        !q ||
+        p.name.toLowerCase().includes(q) ||
+        p.internalCode.toLowerCase().includes(q);
+      return matchCat && matchQuery;
+    });
+  }, [products, selectedCategory, searchTerm]);
+
+  const cartSubtotal = useMemo(
+    () => Number(cartItems.reduce((acc, i) => acc + i.total, 0).toFixed(2)),
+    [cartItems]
+  );
+
+  const handleConfirmAddBalcao = (payload: {
+    product: Product;
+    quantity: number;
+    variationName?: string;
+    selectedAddons?: { name: string; price: number }[];
+    notes?: string;
+  }) => {
     if (isSellerBlocked) {
-      alert('⛔ OPERAÇÃO BLOQUEADA: Sua permissão para vender foi desligada pelo Administrador.');
+      showFeedback('Sua permissão para vender está bloqueada pelo Administrador.', 'error');
       return;
     }
 
-    const existing = cartItems.find((item) => item.productId === product.id && item.notes === (customNotes || ''));
-    const currentQtyInCart = existing ? existing.quantity : 0;
-    const confirmedStock = product.stockQuantity ?? 0;
+    const allowNeg = Boolean(currentTenant.settings?.allowNegativeStock);
+    const currentInCartForProduct = cartItems
+      .filter((i) => i.productId === payload.product.id)
+      .reduce((acc, i) => acc + i.quantity, 0);
+    const available = payload.product.stockQuantity ?? 0;
 
-    if (currentQtyInCart + customQty > confirmedStock) {
-      alert(
-        `Limite de estoque atingido! O item "${product.name}" possui apenas ${confirmedStock} unidades disponíveis na Matriz.`
+    if (!allowNeg && currentInCartForProduct + payload.quantity > available + 0.0001) {
+      showFeedback(
+        `Estoque insuficiente para "${payload.product.name}". Disponível: ${formatUnitStock(available, payload.product.unit)}.`,
+        'error'
       );
       return;
     }
 
+    const variationPrice =
+      payload.variationName && payload.product.variations?.length
+        ? payload.product.variations.find((v) => v.name === payload.variationName)?.price ??
+          payload.product.sellingPrice
+        : payload.product.sellingPrice;
+    const addonsTotal = (payload.selectedAddons || []).reduce((acc, a) => acc + a.price, 0);
+    const unitPrice = Number((variationPrice + addonsTotal).toFixed(2));
+    const cleanNotes = (payload.notes || '').trim();
+    const addonsKey = JSON.stringify(payload.selectedAddons || []);
+
     setCartItems((prev) => {
-      const matchIndex = prev.findIndex((i) => i.productId === product.id && i.notes === (customNotes || ''));
-      if (matchIndex >= 0) {
-        return prev.map((item, idx) =>
-          idx === matchIndex
-            ? {
-                ...item,
-                quantity: item.quantity + customQty,
-                total: (item.quantity + customQty) * item.unitPrice,
-              }
-            : item
-        );
+      const matchIdx = prev.findIndex(
+        (existing) =>
+          existing.productId === payload.product.id &&
+          (existing.variationName || '') === (payload.variationName || '') &&
+          (existing.notes || '').trim() === cleanNotes &&
+          JSON.stringify(existing.selectedAddons || []) === addonsKey
+      );
+      if (matchIdx >= 0) {
+        return prev.map((it, idx) => {
+          if (idx !== matchIdx) return it;
+          const nextQty = Number((it.quantity + payload.quantity).toFixed(3));
+          return {
+            ...it,
+            quantity: nextQty,
+            total: Number((nextQty * it.unitPrice).toFixed(2)),
+          };
+        });
       }
       return [
         ...prev,
         {
-          productId: product.id,
-          productName: product.name,
-          quantity: customQty,
-          unitPrice: product.sellingPrice,
-          total: customQty * product.sellingPrice,
-          notes: customNotes || undefined,
+          productId: payload.product.id,
+          productName: payload.product.name,
+          quantity: payload.quantity,
+          unitPrice,
+          variationName: payload.variationName,
+          selectedAddons: payload.selectedAddons,
+          notes: cleanNotes || undefined,
+          total: Number((payload.quantity * unitPrice).toFixed(2)),
         },
       ];
     });
 
-    setActiveItemForNotes(null);
+    setProductForModal(null);
   };
 
-  // Alterar Quantidade no Carrinho
-  const handleUpdateQuantity = (index: number, delta: number) => {
-    const item = cartItems[index];
+  const handleUpdateCartQty = (idx: number, delta: number) => {
+    const item = cartItems[idx];
     if (!item) return;
     const prod = products.find((p) => p.id === item.productId);
-    const confirmedStock = prod?.stockQuantity ?? 999;
+    const allowNeg = Boolean(currentTenant.settings?.allowNegativeStock);
+    const otherQtyInCart = cartItems
+      .filter((i, iIdx) => iIdx !== idx && i.productId === item.productId)
+      .reduce((acc, i) => acc + i.quantity, 0);
+    const nextQty = Number((item.quantity + delta).toFixed(3));
+
+    if (nextQty <= 0) {
+      setCartItems((prev) => prev.filter((_, i) => i !== idx));
+      return;
+    }
+
+    if (!allowNeg && prod && otherQtyInCart + nextQty > (prod.stockQuantity ?? 0) + 0.0001) {
+      showFeedback(
+        `Limite de estoque atingido (${formatUnitStock(prod.stockQuantity, prod.unit)}).`,
+        'error'
+      );
+      return;
+    }
 
     setCartItems((prev) =>
-      prev
-        .map((it, idx) => {
-          if (idx === index) {
-            const nextQty = it.quantity + delta;
-            if (nextQty > confirmedStock) {
-              alert(`Limite de estoque da Matriz atingido: ${confirmedStock} unidades.`);
-              return it;
-            }
-            return nextQty > 0 ? { ...it, quantity: nextQty, total: nextQty * it.unitPrice } : null;
-          }
-          return it;
-        })
-        .filter(Boolean) as OrderItem[]
+      prev.map((it, i) =>
+        i === idx
+          ? { ...it, quantity: nextQty, total: Number((nextQty * it.unitPrice).toFixed(2)) }
+          : it
+      )
     );
   };
 
-  const handleRemoveFromCart = (index: number) => {
-    setCartItems((prev) => prev.filter((_, idx) => idx !== index));
-  };
-
-  // Mesa selecionada e Valores Extras da Mesa
-  const selectedTable =
-    saleModality === 'table' && selectedTableNumber !== null
-      ? tables.find((t) => t.number === selectedTableNumber)
-      : null;
-
-  const tableActiveExtraCharges =
-    selectedTable?.extraCharges?.filter((c) => c.status === 'active') || [];
-  const tableExtraTotal = tableActiveExtraCharges.reduce((acc, c) => acc + c.amount, 0);
-
-  // Cálculos de Totais
-  const subtotal = cartItems.reduce((acc, item) => acc + item.total, 0);
-  const serviceFee = includeServiceFee
-    ? (subtotal * (currentTenant.settings?.serviceFeePercentage || 10)) / 100
-    : 0;
-  const total = Math.max(0, subtotal - discount + serviceFee + tableExtraTotal);
-
-  // Processamento de Comprovante de Pagamento
   const handleReceiptFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -299,1292 +329,1471 @@ export const PosView: React.FC<PosViewProps> = ({
       setReceiptSizeKb(Math.round(res.compressedSizeBytes / 1024));
       recordDeltaTransfer(res.compressedSizeBytes, res.originalSizeBytes);
     } catch {
-      alert('Falha ao processar e comprimir imagem do comprovante.');
+      showFeedback('Falha ao processar imagem do comprovante.', 'error');
     } finally {
       setIsProcessingReceipt(false);
       e.target.value = '';
     }
   };
 
-  const handlePickPresetReceipt = (url: string) => {
-    setReceiptImage(url);
-    setReceiptSizeKb(34);
-    recordDeltaTransfer(34 * 1024, 750 * 1024);
-    setShowPresetReceiptModal(false);
-  };
+  const handleFinalizeCounterSale = async () => {
+    if (cartItems.length === 0 || isSubmittingCounter) return;
 
-  // ETAPA 7: CONFIRMAR OPERAÇÃO & FINALIZAR VENDA
-  const handleFinalizeSale = (e?: React.FormEvent) => {
-    if (e) e.preventDefault();
-    if (cartItems.length === 0) return;
-
-    // 1. Validação estrita de Bloqueio do Vendedor pela Matriz
     if (isSellerBlocked) {
-      alert('⛔ ACESSO DE VENDA BLOQUEADO: Sua permissão para vender foi desligada pelo Administrador.');
+      showFeedback('Operação bloqueada: sua permissão para vender foi desligada pelo Administrador.', 'error');
       return;
     }
 
-    // 2. Validação da Modalidade de Mesa
-    if (saleModality === 'table' && !selectedTableNumber) {
-      alert('É proibido finalizar venda de mesa sem selecionar a mesa correspondente.');
-      setCurrentStep('step2_table');
-      return;
-    }
-
-    // 3. Validação de Comprovante Obrigatório (PIX e Dinheiro)
-    if (
-      isReceiptMandatory &&
-      (selectedMethod === 'dinheiro' || selectedMethod === 'pix') &&
-      !receiptImage
-    ) {
-      alert(
-        `⚠️ COMPROVANTE OBRIGATÓRIO: A Matriz Administrativa exige fotografia do comprovante para pagamentos em ${selectedMethod.toUpperCase()}.`
+    if (isReceiptMandatory && !receiptImage) {
+      showFeedback(
+        `Comprovante obrigatório para pagamentos em ${counterMethod.toUpperCase()}.`,
+        'error'
       );
       return;
     }
 
-    // 4. Validação de Estoque Físico Centralizado na Matriz
-    const stockValidation = validateOrderStock(currentTenant.id, cartItems);
-    if (!stockValidation.valid) {
-      alert(`⚠️ BLOQUEIO DE ESTOQUE NA MATRIZ: ${stockValidation.error}`);
+    const stockCheck = validateOrderStock(currentTenant.id, cartItems);
+    if (!stockCheck.valid) {
+      showFeedback(stockCheck.error || 'Estoque insuficiente para concluir a venda.', 'error');
       return;
     }
 
-    const orderId = `ord-${Date.now()}`;
-    const orderNumber = Math.floor(Math.random() * 900 + 100);
-    const isPendente = selectedMethod === 'pendente' || selectedMethod === 'devendo';
-    const isDraft = !serverOnline;
+    setIsSubmittingCounter(true);
+    const mutationId = `cnt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const itemsPayload = cartItems.map((i) => ({
+      productId: i.productId,
+      quantity: i.quantity,
+      variationName: i.variationName,
+      selectedAddons: i.selectedAddons,
+      notes: i.notes,
+    }));
 
-    const newOrder: Order = {
-      id: orderId,
-      tenantId: currentTenant.id,
-      orderNumber,
-      type: saleModality,
-      tableNumber: saleModality === 'table' ? selectedTableNumber || undefined : undefined,
-      tableName:
-        saleModality === 'table' && selectedTable
-          ? selectedTable.customerName || selectedTable.label || `Mesa ${selectedTable.number}`
-          : undefined,
-      extraTotal: tableExtraTotal > 0 ? tableExtraTotal : undefined,
-      extraCharges: tableActiveExtraCharges.length > 0 ? tableActiveExtraCharges : undefined,
-      comandaNumber:
-        saleModality === 'comanda'
-          ? comandaCode.trim() || `CMD-${orderNumber}`
-          : undefined,
-      status: isPendente ? 'received' : isDraft ? 'preparing' : 'closed',
-      waiterId: currentUser?.id,
-      waiterName: currentUser?.name || 'Vendedor',
-      customerName: debtCustomerName.trim() || undefined,
-      customerPhone: debtCustomerPhone.trim() || undefined,
-      items: cartItems,
-      subtotal,
-      discount,
-      serviceFee,
-      total,
-      payments: [
-        {
-          method: isPendente ? 'pendente' : selectedMethod,
-          amount: total,
-          receivedAmount: selectedMethod === 'dinheiro' ? receivedCash || total : total,
-          change: selectedMethod === 'dinheiro' ? Math.max(0, (receivedCash || total) - total) : 0,
+    try {
+      const res = await apiRequest<{ ok: boolean; order: Order }>('/api/pos/counter-sale', {
+        method: 'POST',
+        activeUserId: currentUser?.id,
+        queueOnOffline: true,
+        body: {
+          tenantId: currentTenant.id,
+          items: itemsPayload,
+          paymentMethod: counterMethod,
+          receivedAmount: counterMethod === 'dinheiro' ? counterReceivedCash || cartSubtotal : cartSubtotal,
+          customerName: counterCustomerName.trim() || undefined,
           receiptImageUrl: receiptImage || undefined,
-          receiptType: selectedMethod === 'pix' ? 'pix' : selectedMethod === 'dinheiro' ? 'cash' : undefined,
-          receiptCapturedAt: receiptImage ? new Date().toISOString() : undefined,
-          receiptSellerName: receiptImage ? currentUser?.name || 'Vendedor' : undefined,
+          mutationId,
         },
-      ],
-      paid: !isPendente,
-      receiptImageUrl: receiptImage || undefined,
-      receiptCapturedAt: receiptImage ? new Date().toISOString() : undefined,
-      receiptSellerName: receiptImage ? currentUser?.name || 'Vendedor' : undefined,
-      notes: isPendente
-        ? `PENDENTE DE PAGAMENTO${debtNotes ? `: ${debtNotes}` : ''}${isDraft ? ' [RASCUNHO OFFLINE]' : ''}`
-        : isDraft
-        ? '[RASCUNHO LOCAL OFFLINE - Aguardando confirmação da Matriz]'
-        : undefined,
-      createdAt: new Date().toISOString(),
-      closedAt: !isDraft && !isPendente ? new Date().toISOString() : undefined,
-      isDemo: false,
-    };
+      });
 
-    if (isDraft) {
-      enqueueSyncOperation({
-        deviceId: 'dev-seller-terminal',
-        userEmail: currentUser?.email || 'vendedor@sabor.com.br',
-        entity: 'orders',
-        action: 'create',
-        payload: { ...newOrder, isDraft: true },
-      });
-      addAuditLog({
-        tenantId: currentTenant.id,
-        userId: currentUser?.id || 'vendedor',
-        userName: currentUser?.name || 'Vendedor',
-        action: 'RASCUNHO_OFFLINE',
-        details: `Venda #${orderNumber} (${formatBRL(total)}) salva como RASCUNHO LOCAL (Matriz offline).`,
-      });
-    } else {
-      // Baixa física definitiva de estoque na Matriz
-      const deduct = deductStockForOrder(currentTenant.id, cartItems);
-      if (!deduct.success) {
-        alert(`⚠️ Bloqueio de estoque na Matriz: ${deduct.error}`);
-        return;
+      if (!getWsConnectionStatus().connected) {
+        await refreshSnapshotFromServer(currentTenant.id, currentUser?.id);
       }
 
-      saveOrder(newOrder);
-
-      // Registra pagamento no caixa ativo quando quitado (Dinheiro ou PIX)
-      if (!isPendente && (selectedMethod === 'dinheiro' || selectedMethod === 'pix')) {
-        recordPaymentInCashSession(currentTenant.id, selectedMethod, total);
+      setFinishedCounterOrder(res.order);
+      setCartItems([]);
+      setCounterCustomerName('');
+      setCounterReceivedCash(0);
+      setReceiptImage(null);
+      setReceiptSizeKb(null);
+      loadData();
+      try {
+        confetti({ particleCount: 55, spread: 60, origin: { y: 0.7 } });
+      } catch {
+        // noop
       }
-
-      // Sincroniza a mesa se for modalidade mesa
-      if (saleModality === 'table' && selectedTable) {
-        const addedProductsNet = Math.max(0, subtotal - discount + serviceFee);
-        if (!isPendente) {
-          // Arquiva histórico completo da conta antes de liberar a mesa
-          saveTableArchive({
-            id: `tarch-${selectedTable.id}-${Date.now()}`,
-            tenantId: currentTenant.id,
-            tableId: selectedTable.id,
-            tableNumber: selectedTable.number,
-            tableName: selectedTable.customerName || selectedTable.label || `Mesa ${selectedTable.number}`,
-            openedAt: selectedTable.openedAt || newOrder.createdAt,
-            closedAt: newOrder.closedAt || new Date().toISOString(),
-            closedById: currentUser?.id || 'vendedor',
-            closedByName: currentUser?.name || 'Vendedor',
-            productsTotal: (selectedTable.productsTotal || 0) + addedProductsNet,
-            extraTotal: tableExtraTotal,
-            grandTotal: (selectedTable.productsTotal || 0) + addedProductsNet + tableExtraTotal,
-            paidTotal: total,
-            orderIds: [newOrder.id],
-            extraCharges: selectedTable.extraCharges || [],
-            payments: [
-              {
-                id: `tpay-${Date.now()}`,
-                method: selectedMethod === 'pix' ? 'pix' : 'dinheiro',
-                amount: total,
-                receivedAmount: selectedMethod === 'dinheiro' ? receivedCash || total : total,
-                change: selectedMethod === 'dinheiro' ? Math.max(0, (receivedCash || total) - total) : 0,
-                paidAt: newOrder.createdAt,
-                receivedById: currentUser?.id || 'vendedor',
-                receivedByName: currentUser?.name || 'Vendedor',
-              },
-            ],
-          });
-
-          // Venda paga integralmente: mesa é liberada e valores/temporizador encerrados
-          saveTable({
-            ...selectedTable,
-            status: 'available',
-            openedAt: undefined,
-            waiterId: undefined,
-            waiterName: undefined,
-            currentTotal: 0,
-            productsTotal: 0,
-            extraTotal: 0,
-            paidAmount: 0,
-            payments: [],
-            activeOrdersCount: 0,
-            extraCharges: [],
-            timer: undefined,
-          });
-        } else {
-          // Pendente: soma consumo de produtos sem duplicar extraTotal no currentTotal
-          const existingProducts =
-            selectedTable.productsTotal ?? Math.max(0, (selectedTable.currentTotal || 0) - tableExtraTotal);
-          const updatedProductsTotal = existingProducts + addedProductsNet;
-          saveTable({
-            ...selectedTable,
-            status: 'occupied',
-            openedAt: selectedTable.openedAt || newOrder.createdAt,
-            waiterId: selectedTable.waiterId || currentUser?.id,
-            waiterName: selectedTable.waiterName || currentUser?.name,
-            productsTotal: updatedProductsTotal,
-            extraTotal: tableExtraTotal,
-            currentTotal: updatedProductsTotal + tableExtraTotal,
-            activeOrdersCount: (selectedTable.activeOrdersCount || 0) + 1,
-          });
+      showFeedback(`Venda no Balcão #${res.order.orderNumber} confirmada com sucesso!`);
+    } catch (err: any) {
+      const msg = String(err?.message || '');
+      if (msg.startsWith('OFFLINE_QUEUED:')) {
+        // Fallback offline local preservando estoque e pedido
+        const deduct = deductStockForOrder(currentTenant.id, cartItems);
+        if (!deduct.success) {
+          showFeedback(deduct.error || 'Falha ao baixar estoque local.', 'error');
+          setIsSubmittingCounter(false);
+          return;
         }
+        const orderNumber = Math.floor(Math.random() * 900 + 100);
+        const nowIso = new Date().toISOString();
+        const receivedVal =
+          counterMethod === 'dinheiro' ? counterReceivedCash || cartSubtotal : cartSubtotal;
+        const offlineOrder: Order = {
+          id: `ord-cnt-${Date.now()}`,
+          tenantId: currentTenant.id,
+          orderNumber,
+          type: 'counter',
+          status: 'closed',
+          waiterId: currentUser?.id,
+          waiterName: currentUser?.name || 'Operador',
+          customerName: counterCustomerName.trim() || undefined,
+          items: cartItems,
+          subtotal: cartSubtotal,
+          discount: 0,
+          serviceFee: 0,
+          total: cartSubtotal,
+          payments: [
+            {
+              method: counterMethod,
+              amount: cartSubtotal,
+              receivedAmount: receivedVal,
+              change: counterMethod === 'dinheiro' ? Math.max(0, receivedVal - cartSubtotal) : 0,
+              receiptImageUrl: receiptImage || undefined,
+              receiptType: counterMethod === 'pix' ? 'pix' : 'cash',
+              receiptCapturedAt: receiptImage ? nowIso : undefined,
+              receiptSellerName: receiptImage ? currentUser?.name : undefined,
+            },
+          ],
+          paid: true,
+          receiptImageUrl: receiptImage || undefined,
+          notes: '[SINCRONIZAÇÃO PENDENTE]',
+          createdAt: nowIso,
+          closedAt: nowIso,
+          isDemo: false,
+        };
+        saveOrder(offlineOrder);
+        recordPaymentInCashSession(currentTenant.id, counterMethod, cartSubtotal);
+        setFinishedCounterOrder(offlineOrder);
+        setCartItems([]);
+        setCounterCustomerName('');
+        setCounterReceivedCash(0);
+        setReceiptImage(null);
+        setReceiptSizeKb(null);
+        loadData();
+        showFeedback('Venda salva offline no Balcão e enfileirada para sincronização.');
+      } else {
+        showFeedback(msg || 'Não foi possível concluir a venda no balcão.', 'error');
       }
+    } finally {
+      setIsSubmittingCounter(false);
+    }
+  };
 
-      broadcastDeltaUpdate({
-        tenantId: currentTenant.id,
-        type: 'stock_updated',
-        title: 'Estoque Atualizado',
-        message: `Venda #${orderNumber} confirmada pela Matriz. Baixa em ${cartItems.length} produto(s).`,
-        priority: 2,
-      });
+  // =========================================================================
+  // LÓGICA DA ABA VENDAS: FECHAMENTO DE MESAS + HISTÓRICO
+  // =========================================================================
+  const openTables = useMemo(
+    () =>
+      tables.filter(
+        (t) =>
+          t.status !== 'available' ||
+          (t.currentTotal || 0) > 0 ||
+          (t.productsTotal || 0) > 0 ||
+          (t.extraTotal || 0) > 0
+      ),
+    [tables]
+  );
 
-      addAuditLog({
-        tenantId: currentTenant.id,
-        userId: currentUser?.id || 'vendedor',
-        userName: currentUser?.name || 'Vendedor',
-        action: 'VENDA_CONFIRMADA_MATRIZ',
-        details: `Venda #${orderNumber} (${formatBRL(total)}) validada e confirmada oficialmente pela Matriz.`,
-      });
+  const handleConfirmTableSettlement = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!settlingTable || !currentUser || isSubmittingSettle) return;
+    if (isSellerBlocked) {
+      showFeedback('Operação bloqueada: sua permissão de venda foi desligada pelo Administrador.', 'error');
+      return;
     }
 
-    confetti({ particleCount: 35, spread: 60, origin: { y: 0.8 } });
+    const productsTotal =
+      settlingTable.productsTotal ??
+      Math.max(0, (settlingTable.currentTotal || 0) - (settlingTable.extraTotal || 0));
+    const extraTotal = settlingTable.extraTotal || 0;
+    const grandTotal = Number((productsTotal + extraTotal).toFixed(2));
+    const paidAlready = Number((settlingTable.paidAmount || 0).toFixed(2));
+    const remaining = Number(Math.max(0, grandTotal - paidAlready).toFixed(2));
 
-    setFinishedOrder(newOrder);
-    setCurrentStep('step6_success');
+    if (remaining > 0.009 && (!settleAmount || settleAmount <= 0)) {
+      showFeedback('Informe um valor de pagamento positivo.', 'error');
+      return;
+    }
+
+    setIsSubmittingSettle(true);
+    const mutationId = `stl-${settlingTable.id}-${Date.now()}`;
+
+    try {
+      const res = await apiRequest<{
+        ok: boolean;
+        settled: boolean;
+        remainingBalance: number;
+        table: RestaurantTable;
+      }>(`/api/tables/${encodeURIComponent(settlingTable.id)}/settle`, {
+        method: 'POST',
+        activeUserId: currentUser.id,
+        queueOnOffline: true,
+        body: {
+          tenantId: currentTenant.id,
+          method: settleMethod,
+          amount: remaining <= 0.009 ? 0 : settleAmount,
+          receivedAmount: settleMethod === 'dinheiro' ? settleReceivedCash || settleAmount : settleAmount,
+          notes: settleNotes.trim() || undefined,
+          allowEmptyRelease: remaining <= 0.009,
+          mutationId,
+        },
+      });
+
+      if (!getWsConnectionStatus().connected) {
+        await refreshSnapshotFromServer(currentTenant.id, currentUser.id);
+      }
+
+      loadData();
+      if (res.settled) {
+        setSettlingTable(null);
+        showFeedback(
+          `Conta da ${settlingTable.label || `Mesa ${settlingTable.number}`} quitada e liberada!`
+        );
+      } else {
+        setSettlingTable(res.table);
+        setSettleAmount(res.remainingBalance);
+        setSettleReceivedCash(res.remainingBalance);
+        showFeedback(
+          `Pagamento parcial registrado. Saldo restante: ${formatBRL(res.remainingBalance)}.`
+        );
+      }
+    } catch (err: any) {
+      const msg = String(err?.message || '');
+      if (msg.startsWith('OFFLINE_QUEUED:')) {
+        const localRes = registerTablePaymentAndSettle(
+          currentTenant.id,
+          settlingTable.id,
+          {
+            method: settleMethod,
+            amount: settleAmount,
+            receivedAmount: settleMethod === 'dinheiro' ? settleReceivedCash || settleAmount : settleAmount,
+            notes: settleNotes.trim() || undefined,
+            allowEmptyRelease: remaining <= 0.009,
+          },
+          { id: currentUser.id, name: currentUser.name }
+        );
+        if (localRes.success) {
+          loadData();
+          if (localRes.settled) {
+            setSettlingTable(null);
+            showFeedback('Mesa quitada offline e enfileirada para sincronização.');
+          } else if (localRes.table) {
+            setSettlingTable(localRes.table);
+            setSettleAmount(localRes.remainingBalance);
+            setSettleReceivedCash(localRes.remainingBalance);
+            showFeedback(
+              `Pagamento parcial salvo offline. Saldo restante: ${formatBRL(localRes.remainingBalance)}.`
+            );
+          }
+        } else {
+          showFeedback(localRes.error || 'Erro ao processar pagamento.', 'error');
+        }
+      } else {
+        showFeedback(msg || 'Não foi possível registrar o pagamento da mesa.', 'error');
+      }
+    } finally {
+      setIsSubmittingSettle(false);
+    }
   };
 
-  // Resetar e Iniciar Nova Venda (Retorna para a Etapa 1 da Ordem Obrigatória)
-  const handleResetForNewSale = () => {
-    setCartItems([]);
-    setDiscount(0);
-    setIncludeServiceFee(false);
-    setSelectedTableNumber(null);
-    setComandaCode('');
-    setFinishedOrder(null);
-    setReceiptImage(null);
-    setReceiptSizeKb(null);
-    setDebtCustomerName('');
-    setDebtCustomerPhone('');
-    setDebtCustomerCpf('');
-    setDebtCustomerAddress('');
-    setDebtNotes('');
-    setSelectedMethod('dinheiro');
-    setCurrentStep('step1_modality');
+  const handleConfirmCancelOrder = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!cancellingOrder || !currentUser || !isAdm) return;
+
+    try {
+      await apiRequest(`/api/orders/${encodeURIComponent(cancellingOrder.id)}/cancel`, {
+        method: 'POST',
+        activeUserId: currentUser.id,
+        queueOnOffline: true,
+        body: {
+          reason: cancelReason.trim() || 'Cancelado pelo Administrador',
+        },
+      });
+      if (!getWsConnectionStatus().connected) {
+        await refreshSnapshotFromServer(currentTenant.id, currentUser.id);
+      }
+      setCancellingOrder(null);
+      setCancelReason('');
+      loadData();
+      showFeedback(`Venda #${cancellingOrder.orderNumber} cancelada com estorno automático de estoque.`);
+    } catch (err: any) {
+      const msg = String(err?.message || '');
+      if (msg.startsWith('OFFLINE_QUEUED:')) {
+        const localRes = cancelOrderWithAuthority(
+          cancellingOrder.id,
+          cancelReason.trim() || 'Cancelado pelo Administrador',
+          'adm',
+          currentUser.role,
+          currentUser.name
+        );
+        if (localRes.success) {
+          setCancellingOrder(null);
+          setCancelReason('');
+          loadData();
+          showFeedback('Venda cancelada localmente e enfileirada.');
+        } else {
+          showFeedback(localRes.message || 'Não foi possível cancelar a venda.', 'error');
+        }
+      } else {
+        showFeedback(msg || 'Erro ao cancelar venda.', 'error');
+      }
+    }
   };
 
-  const filteredProducts = products.filter((p) => {
-    const matchesCategory = selectedCategory === 'all' || p.categoryId === selectedCategory;
-    const matchesSearch =
-      p.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      p.internalCode.toLowerCase().includes(searchTerm.toLowerCase());
-    return matchesCategory && matchesSearch;
-  });
+  const filteredOrders = useMemo(() => {
+    const todayStr = new Date().toDateString();
+    const q = historySearch.trim().toLowerCase();
+    return orders.filter((o) => {
+      if (historyFilter === 'today' && new Date(o.createdAt).toDateString() !== todayStr) return false;
+      if (historyFilter === 'counter' && o.type !== 'counter') return false;
+      if (historyFilter === 'table' && o.type !== 'table') return false;
+      if (historyFilter === 'cancelled' && o.status !== 'cancelled') return false;
+      if (q) {
+        const matchNum = String(o.orderNumber).includes(q);
+        const matchWaiter = o.waiterName?.toLowerCase().includes(q);
+        const matchCustomer = o.customerName?.toLowerCase().includes(q);
+        const matchTable = o.tableName?.toLowerCase().includes(q);
+        if (!matchNum && !matchWaiter && !matchCustomer && !matchTable) return false;
+      }
+      return true;
+    });
+  }, [orders, historyFilter, historySearch]);
 
-  // TELA DE BLOQUEIO SE O ADM DESLIGOU A PERMISSÃO DESTE VENDEDOR
-  if (isSellerBlocked) {
+  // =========================================================================
+  // RENDER: MODO BALCÃO INDEPENDENTE
+  // =========================================================================
+  if (mode === 'counter') {
+    const counterChange =
+      counterMethod === 'dinheiro' && counterReceivedCash > cartSubtotal
+        ? counterReceivedCash - cartSubtotal
+        : 0;
+
     return (
-      <div className="mx-auto max-w-lg rounded-3xl border-2 border-rose-300 bg-white p-8 text-center shadow-xl animate-in zoom-in-95 my-8">
-        <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-2xl bg-rose-100 text-rose-700">
-          <ShieldAlert className="h-9 w-9" />
-        </div>
-        <h2 className="mt-4 text-xl font-black uppercase text-stone-900 tracking-tight">
-          Acesso de Venda Bloqueado
-        </h2>
-        <div className="mt-2 inline-flex items-center gap-1.5 rounded-lg border border-rose-300 bg-rose-100 px-3.5 py-1 text-xs font-black uppercase tracking-wider text-rose-800">
-          Permissão para vender: DESLIGADA
-        </div>
-        <p className="mt-4 text-xs leading-relaxed text-stone-600">
-          O Administrador da Matriz desligou a autorização de venda para o seu usuário (
-          <strong>{currentUser?.name}</strong>). Novas vendas e pedidos estão bloqueados até que o ADM ligue a permissão novamente no Painel do ADM.
-        </p>
-        <div className="mt-6 rounded-2xl bg-stone-50 p-4 border border-stone-200 text-left text-xs space-y-1">
-          <div className="flex justify-between text-stone-500">
-            <span>Terminal:</span>
-            <span className="font-bold text-stone-900">{currentUser?.deviceModel || 'Celular Android'}</span>
-          </div>
-          <div className="flex justify-between text-stone-500">
-            <span>Status na Matriz:</span>
-            <span className="font-bold text-rose-700 uppercase">BLOQUEADO</span>
-          </div>
-          <div className="flex justify-between text-stone-500">
-            <span>Vendas Confirmadas Anteriores:</span>
-            <span className="font-bold text-stone-900">Preservadas com Segurança</span>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div className="mx-auto max-w-5xl space-y-4">
-      {/* Top Banner de Status da Matriz e Conexão (Minimalista) */}
-      <div className="flex flex-wrap items-center justify-between gap-2 rounded-2xl bg-white border border-stone-200 px-4 py-2.5 shadow-2xs">
-        <div className="flex items-center gap-2.5">
+      <div className="space-y-5">
+        {feedback && (
           <div
-            className={`flex h-8 w-8 items-center justify-center rounded-xl text-white font-bold text-xs shadow-xs ${
-              serverOnline ? 'bg-emerald-600' : 'bg-rose-600'
+            className={`flex items-center justify-between rounded-2xl border px-4 py-3 text-xs font-semibold shadow-sm ${
+              feedback.type === 'error'
+                ? 'border-rose-300 bg-rose-50 text-rose-900'
+                : 'border-emerald-300 bg-emerald-50 text-emerald-950'
             }`}
           >
-            {serverOnline ? <Wifi className="h-4 w-4" /> : <WifiOff className="h-4 w-4" />}
+            <span>{feedback.text}</span>
+            <button onClick={() => setFeedback(null)} className="p-1 opacity-70 hover:opacity-100">
+              <X className="h-4 w-4" />
+            </button>
           </div>
-          <div>
-            <div className="flex items-center gap-2">
-              <span className="text-xs font-black uppercase text-stone-900">Ponto de Venda</span>
-              <span
-                className={`text-[10px] font-bold ${
-                  serverOnline ? 'text-emerald-700' : 'text-rose-700 animate-pulse'
-                }`}
-              >
-                {serverOnline ? '● Matriz Conectada' : '● Matriz Offline (Modo Rascunho)'}
-              </span>
+        )}
+
+        {isSellerBlocked && (
+          <div className="flex items-center gap-3 rounded-2xl border border-rose-300 bg-rose-50 p-4 text-rose-950">
+            <ShieldAlert className="h-6 w-6 text-rose-600 shrink-0" />
+            <div>
+              <h3 className="text-sm font-bold">Permissão de Venda Bloqueada</h3>
+              <p className="text-xs text-rose-800">
+                O Administrador bloqueou sua operação de vendas no momento.
+              </p>
             </div>
-            <p className="text-[11px] text-stone-500">
-              Operador: <strong>{currentUser?.name}</strong> • Matriz: {matrizInfo.activeHostLabel}
-            </p>
           </div>
-        </div>
+        )}
 
-        <button
-          onClick={() => setIsHistoryModalOpen(true)}
-          className="flex items-center gap-1.5 rounded-xl border border-stone-200 bg-stone-50 px-3 py-1.5 text-xs font-semibold text-stone-700 hover:bg-stone-100 transition"
-        >
-          <Clock className="h-3.5 w-3.5 text-stone-500" />
-          <span>Vendas Recentes</span>
-        </button>
-      </div>
-
-      {/* ========================================================================= */}
-      {/* ETAPA 1 DA ORDEM OBRIGATÓRIA: ESCOLHER MODALIDADE (MESAS, BALCÃO, COMANDAS) */}
-      {/* ========================================================================= */}
-      {currentStep === 'step1_modality' && (
-        <div className="space-y-4 animate-in fade-in duration-200">
-          <div className="text-center py-2">
-            <span className="text-xs font-bold uppercase tracking-wider text-amber-700">
-              Passo 1 de 5
-            </span>
-            <h2 className="text-xl font-black text-stone-900 tracking-tight sm:text-2xl mt-0.5">
-              Escolha a Modalidade de Atendimento
-            </h2>
-            <p className="text-xs text-stone-500 max-w-md mx-auto mt-1">
-              Selecione o local de consumo para iniciar o atendimento.
+        {/* Header Balcão */}
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between border-b border-stone-200 pb-4">
+          <div>
+            <h1 className="text-xl font-bold tracking-tight text-stone-900 sm:text-2xl">
+              Balcão — Venda Rápida
+            </h1>
+            <p className="mt-0.5 text-xs text-stone-500">
+              Venda direta no balcão sem vínculo com mesas. Aceita Dinheiro ou PIX com baixa imediata de estoque.
             </p>
           </div>
 
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-3 max-w-3xl mx-auto">
-            {/* 1. MESAS */}
+          {onNavigateToTables && (
             <button
               type="button"
-              onClick={() => {
-                setSaleModality('table');
-                setCurrentStep('step2_table');
-              }}
-              className="group flex flex-col items-center justify-between rounded-3xl border-2 border-stone-200 bg-white p-6 text-center shadow-xs hover:border-amber-500 hover:shadow-md transition active:scale-98 min-h-[180px]"
+              onClick={onNavigateToTables}
+              className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-xl border border-stone-200 bg-white px-4 py-2 text-xs font-bold text-stone-700 hover:bg-stone-50"
             >
-              <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-amber-100 text-amber-800 group-hover:scale-110 transition">
-                <Grid2X2 className="h-7 w-7" />
-              </div>
-              <div className="my-2">
-                <h3 className="text-base font-black uppercase text-stone-900">Mesas</h3>
-                <p className="text-xs text-stone-500 mt-1">
-                  Atendimento em mesas do salão com seleção obrigatória da mesa
-                </p>
-              </div>
-              <span className="text-xs font-bold text-amber-600 group-hover:underline">
-                Selecionar Mesa ➔
-              </span>
+              <Grid2X2 className="h-4 w-4 text-amber-600" />
+              <span>Ir para Mesas</span>
             </button>
-
-            {/* 2. BALCÃO */}
-            <button
-              type="button"
-              onClick={() => {
-                setSaleModality('counter');
-                setSelectedTableNumber(null);
-                setCurrentStep('step3_catalog');
-              }}
-              className="group flex flex-col items-center justify-between rounded-3xl border-2 border-stone-200 bg-white p-6 text-center shadow-xs hover:border-amber-500 hover:shadow-md transition active:scale-98 min-h-[180px]"
-            >
-              <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-stone-100 text-stone-800 group-hover:scale-110 transition">
-                <Receipt className="h-7 w-7" />
-              </div>
-              <div className="my-2">
-                <h3 className="text-base font-black uppercase text-stone-900">Balcão</h3>
-                <p className="text-xs text-stone-500 mt-1">
-                  Venda direta no balcão e atendimento rápido sem mesa
-                </p>
-              </div>
-              <span className="text-xs font-bold text-amber-600 group-hover:underline">
-                Abrir Cardápio ➔
-              </span>
-            </button>
-
-            {/* 3. COMANDAS */}
-            <button
-              type="button"
-              onClick={() => {
-                setSaleModality('comanda');
-                setSelectedTableNumber(null);
-                setCurrentStep('step2_comanda');
-              }}
-              className="group flex flex-col items-center justify-between rounded-3xl border-2 border-stone-200 bg-white p-6 text-center shadow-xs hover:border-amber-500 hover:shadow-md transition active:scale-98 min-h-[180px]"
-            >
-              <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-blue-100 text-blue-800 group-hover:scale-110 transition">
-                <CreditCard className="h-7 w-7" />
-              </div>
-              <div className="my-2">
-                <h3 className="text-base font-black uppercase text-stone-900">Comandas</h3>
-                <p className="text-xs text-stone-500 mt-1">
-                  Cartão de consumo individual ou número de comanda física
-                </p>
-              </div>
-              <span className="text-xs font-bold text-amber-600 group-hover:underline">
-                Informar Comanda ➔
-              </span>
-            </button>
-          </div>
+          )}
         </div>
-      )}
 
-      {/* ========================================================================= */}
-      {/* ETAPA 2 DA ORDEM OBRIGATÓRIA: SELECIONAR A MESA (OBRIGATÓRIO PARA MESAS) */}
-      {/* ========================================================================= */}
-      {currentStep === 'step2_table' && (
-        <div className="space-y-4 animate-in fade-in duration-200">
-          <div className="flex items-center justify-between border-b border-stone-200 pb-3">
-            <div className="flex items-center gap-2">
+        {/* Tela de Sucesso do Balcão */}
+        {finishedCounterOrder ? (
+          <div className="mx-auto max-w-md rounded-3xl border border-emerald-200 bg-white p-6 text-center shadow-lg space-y-4">
+            <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-emerald-100 text-emerald-700">
+              <CheckCircle2 className="h-8 w-8" />
+            </div>
+            <div>
+              <span className="text-[11px] font-bold uppercase tracking-wider text-emerald-700">
+                Venda Concluída no Balcão
+              </span>
+              <h2 className="mt-1 text-2xl font-black text-stone-900 tabular-nums">
+                Pedido #{finishedCounterOrder.orderNumber}
+              </h2>
+            </div>
+
+            <div className="rounded-2xl border border-stone-200 bg-stone-50 p-4 text-left text-xs space-y-2">
+              <div className="flex justify-between">
+                <span className="text-stone-500">Modalidade:</span>
+                <span className="font-bold text-stone-900">Balcão</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-stone-500">Forma de Pagamento:</span>
+                <span className="font-bold uppercase text-stone-900">
+                  {finishedCounterOrder.payments[0]?.method || 'Dinheiro'}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-stone-500">Total Recebido:</span>
+                <span className="font-black text-emerald-700 tabular-nums">
+                  {formatBRL(finishedCounterOrder.total)}
+                </span>
+              </div>
+              {(finishedCounterOrder.payments[0]?.change || 0) > 0 && (
+                <div className="flex justify-between">
+                  <span className="text-stone-500">Troco:</span>
+                  <span className="font-bold text-amber-700 tabular-nums">
+                    {formatBRL(finishedCounterOrder.payments[0]?.change || 0)}
+                  </span>
+                </div>
+              )}
+              <div className="flex justify-between">
+                <span className="text-stone-500">Operador:</span>
+                <span className="font-semibold text-stone-900">{finishedCounterOrder.waiterName}</span>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2.5">
               <button
                 type="button"
-                onClick={() => setCurrentStep('step1_modality')}
-                className="flex items-center gap-1 rounded-xl border border-stone-200 bg-white px-3 py-1.5 text-xs font-bold text-stone-700 hover:bg-stone-50"
+                onClick={() => window.print()}
+                className="flex min-h-[48px] items-center justify-center gap-2 rounded-xl border border-stone-200 bg-white text-xs font-bold text-stone-700 hover:bg-stone-50"
               >
-                <ArrowLeft className="h-4 w-4" />
-                <span>Voltar</span>
+                <Printer className="h-4 w-4" />
+                <span>Imprimir</span>
               </button>
-              <div>
-                <h2 className="text-base font-black text-stone-900 sm:text-lg">
-                  Passo 2: Selecione a Mesa Obrigatória
-                </h2>
-                <p className="text-xs text-stone-500">
-                  É obrigatório escolher a mesa antes de selecionar produtos.
-                </p>
+              <button
+                type="button"
+                onClick={() => setFinishedCounterOrder(null)}
+                className="flex min-h-[48px] items-center justify-center gap-2 rounded-xl bg-amber-600 text-xs font-bold text-white hover:bg-amber-700"
+              >
+                <Plus className="h-4 w-4" />
+                <span>Nova Venda</span>
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
+            {/* Esquerda: Catálogo de Produtos */}
+            <div className="lg:col-span-7 xl:col-span-8 space-y-4">
+              {/* Busca e Categorias */}
+              <div className="space-y-2.5">
+                <div className="relative">
+                  <Search className="absolute left-3.5 top-3.5 h-4 w-4 text-stone-400" />
+                  <input
+                    type="text"
+                    placeholder="Buscar produto por nome ou código..."
+                    value={searchTerm}
+                    onChange={(e) => setSearchTerm(e.target.value)}
+                    className="w-full min-h-[46px] rounded-xl border border-stone-200 bg-white py-2.5 pl-10 pr-4 text-sm text-stone-900 placeholder-stone-400 focus:border-amber-500 focus:outline-none"
+                  />
+                </div>
+
+                <div className="flex gap-2 overflow-x-auto pb-1 no-scrollbar">
+                  <button
+                    type="button"
+                    onClick={() => setSelectedCategory('all')}
+                    className={`min-h-[40px] shrink-0 rounded-xl px-4 text-xs font-bold transition ${
+                      selectedCategory === 'all'
+                        ? 'bg-stone-900 text-white'
+                        : 'border border-stone-200 bg-white text-stone-700 hover:bg-stone-50'
+                    }`}
+                  >
+                    Todos ({products.length})
+                  </button>
+                  {categories.map((cat) => (
+                    <button
+                      key={cat.id}
+                      type="button"
+                      onClick={() => setSelectedCategory(cat.id)}
+                      className={`min-h-[40px] shrink-0 rounded-xl px-4 text-xs font-bold transition ${
+                        selectedCategory === cat.id
+                          ? 'bg-amber-600 text-white'
+                          : 'border border-stone-200 bg-white text-stone-700 hover:bg-stone-50'
+                      }`}
+                    >
+                      {cat.name}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Grid de Produtos */}
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+                {filteredCatalog.map((prod) => {
+                  const isWeight = prod.allowWeight || prod.unit === 'kg' || prod.unit === 'g';
+                  const outOfStock = !currentTenant.settings?.allowNegativeStock && (prod.stockQuantity ?? 0) <= 0;
+
+                  return (
+                    <button
+                      key={prod.id}
+                      type="button"
+                      disabled={outOfStock || isSellerBlocked}
+                      onClick={() => setProductForModal(prod)}
+                      className={`flex flex-col overflow-hidden rounded-2xl border bg-white text-left transition ${
+                        outOfStock || isSellerBlocked
+                          ? 'border-stone-200 opacity-50 cursor-not-allowed'
+                          : 'border-stone-200 hover:border-amber-500 hover:shadow-md active:scale-[0.98]'
+                      }`}
+                    >
+                      <div className="relative h-28 w-full bg-stone-100 overflow-hidden">
+                        {prod.imageUrl ? (
+                          <img
+                            src={prod.imageUrl}
+                            alt={prod.name}
+                            className="h-full w-full object-cover"
+                            loading="lazy"
+                          />
+                        ) : (
+                          <div className="flex h-full w-full items-center justify-center text-stone-300">
+                            <ImageIcon className="h-7 w-7" />
+                          </div>
+                        )}
+                        <span className="absolute top-2 left-2 rounded-md bg-stone-900/80 px-1.5 py-0.5 font-mono text-[10px] font-bold text-white">
+                          {prod.internalCode}
+                        </span>
+                        {isWeight && (
+                          <span className="absolute bottom-2 left-2 inline-flex items-center gap-1 rounded-md bg-amber-600/95 px-1.5 py-0.5 text-[10px] font-bold text-white">
+                            <Scale className="h-3 w-3" /> Balança
+                          </span>
+                        )}
+                      </div>
+
+                      <div className="flex flex-1 flex-col justify-between p-3">
+                        <p className="text-xs font-bold text-stone-900 line-clamp-2 leading-snug">
+                          {prod.name}
+                        </p>
+                        <div className="mt-2 flex items-baseline justify-between gap-1">
+                          <span className="text-sm font-black text-amber-700 tabular-nums">
+                            {formatBRL(prod.sellingPrice)}
+                            {prod.unit !== 'un' && (
+                              <span className="text-[10px] font-semibold text-stone-500">/{prod.unit}</span>
+                            )}
+                          </span>
+                          <span
+                            className={`text-[10px] font-semibold tabular-nums ${
+                              outOfStock ? 'text-rose-600' : 'text-stone-500'
+                            }`}
+                          >
+                            {outOfStock ? 'Sem estoque' : formatUnitStock(prod.stockQuantity, prod.unit)}
+                          </span>
+                        </div>
+                      </div>
+                    </button>
+                  );
+                })}
               </div>
             </div>
-            <span className="rounded-full bg-amber-100 px-3 py-1 text-xs font-bold text-amber-900">
-              {tables.length} Mesas no Salão
-            </span>
-          </div>
 
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 md:grid-cols-6 max-h-[500px] overflow-y-auto p-1">
-            {tables.map((tbl) => {
-              const { label, badgeClass, cardClass } = getTableStatusLabel(tbl.status);
+            {/* Direita: Carrinho & Pagamento do Balcão */}
+            <div className="lg:col-span-5 xl:col-span-4">
+              <div className="sticky top-20 rounded-2xl border border-stone-200 bg-white p-4 sm:p-5 shadow-sm space-y-4">
+                <div className="flex items-center justify-between border-b border-stone-100 pb-3">
+                  <div className="flex items-center gap-2">
+                    <ShoppingBag className="h-5 w-5 text-amber-600" />
+                    <h2 className="text-sm font-bold text-stone-900">Carrinho do Balcão</h2>
+                  </div>
+                  <span className="rounded-lg bg-stone-100 px-2.5 py-1 text-xs font-bold text-stone-700 tabular-nums">
+                    {cartItems.length} {cartItems.length === 1 ? 'item' : 'itens'}
+                  </span>
+                </div>
 
-              return (
-                <button
-                  key={tbl.id}
-                  type="button"
-                  onClick={() => {
-                    setSelectedTableNumber(tbl.number);
-                    setCurrentStep('step3_catalog');
-                  }}
-                  className={`flex flex-col justify-between rounded-2xl border p-4 text-left shadow-2xs transition hover:shadow-md active:scale-95 min-h-[110px] ${cardClass}`}
-                >
-                  <div className="flex items-center justify-between w-full">
-                    <span className="text-lg font-black text-stone-900">#{tbl.number}</span>
-                    <span className={`rounded-md border px-1.5 py-0.5 text-[9px] font-bold ${badgeClass}`}>
-                      {label}
+                {/* Lista de Itens */}
+                {cartItems.length === 0 ? (
+                  <div className="py-8 text-center text-stone-400">
+                    <Receipt className="mx-auto h-9 w-9 text-stone-300" />
+                    <p className="mt-2 text-xs font-semibold text-stone-600">Carrinho vazio</p>
+                    <p className="text-[11px] text-stone-400">
+                      Toque nos produtos do catálogo ao lado para lançar.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="max-h-64 overflow-y-auto divide-y divide-stone-100 pr-1">
+                    {cartItems.map((item, idx) => (
+                      <div key={`${item.productId}-${idx}`} className="py-2.5 flex items-center justify-between gap-2">
+                        <div className="min-w-0 flex-1">
+                          <p className="text-xs font-bold text-stone-900 truncate">
+                            {item.productName}
+                            {item.variationName ? ` (${item.variationName})` : ''}
+                          </p>
+                          <p className="text-[11px] text-stone-500 tabular-nums">
+                            {item.quantity} × {formatBRL(item.unitPrice)}
+                          </p>
+                          {item.notes && (
+                            <p className="text-[10px] italic text-amber-700 truncate">Obs: {item.notes}</p>
+                          )}
+                        </div>
+
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => handleUpdateCartQty(idx, -1)}
+                            className="flex h-9 w-9 items-center justify-center rounded-lg border border-stone-200 bg-stone-50 text-stone-700 hover:bg-stone-100"
+                            aria-label="Diminuir"
+                          >
+                            <Minus className="h-3.5 w-3.5" />
+                          </button>
+                          <span className="w-8 text-center text-xs font-bold tabular-nums">
+                            {item.quantity}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => handleUpdateCartQty(idx, 1)}
+                            className="flex h-9 w-9 items-center justify-center rounded-lg border border-stone-200 bg-stone-50 text-stone-700 hover:bg-stone-100"
+                            aria-label="Aumentar"
+                          >
+                            <Plus className="h-3.5 w-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setCartItems((prev) => prev.filter((_, i) => i !== idx))}
+                            className="flex h-9 w-9 items-center justify-center rounded-lg text-stone-400 hover:bg-rose-50 hover:text-rose-600"
+                            aria-label="Remover"
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </button>
+                        </div>
+
+                        <span className="w-16 text-right text-xs font-black text-stone-900 tabular-nums">
+                          {formatBRL(item.total)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {/* Cliente opcional */}
+                <div>
+                  <label className="block text-[11px] font-bold text-stone-600">
+                    Nome do Cliente (Opcional)
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="Ex: Balcão / Carlos"
+                    value={counterCustomerName}
+                    onChange={(e) => setCounterCustomerName(e.target.value)}
+                    className="mt-1 w-full min-h-[42px] rounded-xl border border-stone-200 px-3 py-2 text-xs text-stone-900 focus:border-amber-500 focus:outline-none"
+                  />
+                </div>
+
+                {/* Forma de Pagamento (Dinheiro / PIX) */}
+                <div>
+                  <span className="block text-[11px] font-bold text-stone-600 mb-1.5">
+                    Forma de Pagamento
+                  </span>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setCounterMethod('dinheiro')}
+                      className={`flex min-h-[48px] items-center justify-center gap-2 rounded-xl border text-xs font-bold transition ${
+                        counterMethod === 'dinheiro'
+                          ? 'border-amber-600 bg-amber-50 text-amber-950 ring-2 ring-amber-500/20'
+                          : 'border-stone-200 bg-white text-stone-700 hover:bg-stone-50'
+                      }`}
+                    >
+                      <Banknote className="h-4 w-4" />
+                      <span>Dinheiro</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setCounterMethod('pix')}
+                      className={`flex min-h-[48px] items-center justify-center gap-2 rounded-xl border text-xs font-bold transition ${
+                        counterMethod === 'pix'
+                          ? 'border-emerald-600 bg-emerald-50 text-emerald-950 ring-2 ring-emerald-500/20'
+                          : 'border-stone-200 bg-white text-stone-700 hover:bg-stone-50'
+                      }`}
+                    >
+                      <QrCode className="h-4 w-4" />
+                      <span>PIX</span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* Dinheiro recebido & Troco */}
+                {counterMethod === 'dinheiro' && cartItems.length > 0 && (
+                  <div className="rounded-xl border border-stone-200 bg-stone-50 p-3 space-y-2 text-xs">
+                    <div className="flex items-center justify-between gap-2">
+                      <label className="font-semibold text-stone-700">Valor Recebido (R$):</label>
+                      <input
+                        type="number"
+                        step="0.50"
+                        min="0"
+                        value={counterReceivedCash || ''}
+                        onChange={(e) => setCounterReceivedCash(parseFloat(e.target.value) || 0)}
+                        placeholder={cartSubtotal.toFixed(2)}
+                        className="w-28 min-h-[38px] rounded-lg border border-stone-300 bg-white px-2.5 text-right font-mono text-xs font-bold text-stone-900"
+                      />
+                    </div>
+                    {counterChange > 0 && (
+                      <div className="flex justify-between font-black text-emerald-700">
+                        <span>Troco:</span>
+                        <span className="tabular-nums">{formatBRL(counterChange)}</span>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Comprovante quando habilitado */}
+                {activeReceiptRule !== 'disabled' && cartItems.length > 0 && (
+                  <div className="rounded-xl border border-stone-200 bg-stone-50 p-3 space-y-2 text-xs">
+                    <div className="flex items-center justify-between">
+                      <span className="font-bold text-stone-700">
+                        Comprovante {isReceiptMandatory ? '(Obrigatório)' : '(Opcional)'}
+                      </span>
+                      {receiptImage && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setReceiptImage(null);
+                            setReceiptSizeKb(null);
+                          }}
+                          className="text-[11px] font-semibold text-rose-600 hover:underline"
+                        >
+                          Remover
+                        </button>
+                      )}
+                    </div>
+
+                    {receiptImage ? (
+                      <div className="flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 p-2">
+                        <img
+                          src={receiptImage}
+                          alt="Comprovante"
+                          className="h-10 w-10 rounded object-cover"
+                        />
+                        <span className="text-[11px] font-semibold text-emerald-800">
+                          Comprovante anexado ({receiptSizeKb || 32} KB)
+                        </span>
+                      </div>
+                    ) : (
+                      <div className="grid grid-cols-2 gap-2">
+                        <label className="flex min-h-[40px] cursor-pointer items-center justify-center gap-1.5 rounded-lg border border-stone-300 bg-white px-2 text-[11px] font-bold text-stone-700 hover:bg-stone-50">
+                          <Camera className="h-3.5 w-3.5" />
+                          <span>{isProcessingReceipt ? 'Lendo...' : 'Foto / Galeria'}</span>
+                          <input
+                            type="file"
+                            accept="image/*"
+                            className="hidden"
+                            onChange={handleReceiptFileChange}
+                          />
+                        </label>
+                        <button
+                          type="button"
+                          onClick={() => setShowPresetReceiptModal(true)}
+                          className="flex min-h-[40px] items-center justify-center gap-1.5 rounded-lg border border-stone-300 bg-white px-2 text-[11px] font-bold text-stone-700 hover:bg-stone-50"
+                        >
+                          <Upload className="h-3.5 w-3.5" />
+                          <span>Modelo</span>
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Total & Botão Finalizar */}
+                <div className="border-t border-stone-200 pt-3 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-bold uppercase text-stone-500">Total a Receber</span>
+                    <span className="text-2xl font-black text-stone-900 tabular-nums">
+                      {formatBRL(cartSubtotal)}
                     </span>
                   </div>
-                  <div className="mt-2 text-stone-600">
-                    <p className="text-xs font-bold truncate">
-                      {tbl.customerName ? `👤 ${tbl.customerName}` : tbl.label || `Mesa ${tbl.number}`}
-                    </p>
-                    {tbl.currentTotal && tbl.currentTotal > 0 ? (
-                      <p className="text-[11px] font-black text-amber-700">Saldo: {formatBRL(tbl.currentTotal)}</p>
-                    ) : (
-                      <p className="text-[10px] text-stone-400">Capacidade: {tbl.capacity} p</p>
-                    )}
-                    {tbl.extraTotal && tbl.extraTotal > 0 ? (
-                      <span className="inline-block mt-0.5 rounded bg-purple-100 px-1 text-[9px] font-bold text-purple-800">
-                        + Extra: {formatBRL(tbl.extraTotal)}
-                      </span>
-                    ) : null}
-                  </div>
-                  <span className="mt-2 text-[10px] font-bold text-amber-700">
-                    Toque para abrir ➔
-                  </span>
-                </button>
-              );
-            })}
-          </div>
-        </div>
-      )}
 
-      {/* ========================================================================= */}
-      {/* ETAPA 2 (COMANDAS): INFORMAR NÚMERO DA COMANDA */}
-      {/* ========================================================================= */}
-      {currentStep === 'step2_comanda' && (
-        <div className="max-w-md mx-auto space-y-4 animate-in fade-in duration-200">
-          <div className="flex items-center justify-between border-b border-stone-200 pb-3">
-            <button
-              type="button"
-              onClick={() => setCurrentStep('step1_modality')}
-              className="flex items-center gap-1 rounded-xl border border-stone-200 bg-white px-3 py-1.5 text-xs font-bold text-stone-700 hover:bg-stone-50"
-            >
-              <ArrowLeft className="h-4 w-4" />
-              <span>Voltar</span>
-            </button>
-            <h2 className="text-base font-black text-stone-900">Identificação da Comanda</h2>
-          </div>
-
-          <div className="rounded-2xl border border-stone-200 bg-white p-5 shadow-xs space-y-4">
-            <div>
-              <label className="block text-xs font-bold text-stone-700">
-                Número ou Código da Comanda
-              </label>
-              <input
-                type="text"
-                autoFocus
-                placeholder="Ex: 104 ou Cartão 12"
-                value={comandaCode}
-                onChange={(e) => setComandaCode(e.target.value)}
-                className="mt-1 w-full rounded-xl border border-stone-200 px-3.5 py-3 text-base font-mono font-black text-stone-900 focus:border-amber-500 focus:outline-none"
-              />
-            </div>
-
-            <div>
-              <span className="text-[11px] font-bold uppercase text-stone-400">
-                Atalhos Rápidos:
-              </span>
-              <div className="mt-1.5 grid grid-cols-4 gap-2">
-                {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].map((n) => (
                   <button
-                    key={n}
                     type="button"
-                    onClick={() => setComandaCode(`CMD-${n < 10 ? `0${n}` : n}`)}
-                    className="rounded-xl border border-stone-200 bg-stone-50 py-2 text-xs font-black text-stone-700 hover:bg-amber-50 hover:border-amber-300"
+                    disabled={cartItems.length === 0 || isSubmittingCounter || isSellerBlocked}
+                    onClick={handleFinalizeCounterSale}
+                    className="flex min-h-[50px] w-full items-center justify-center gap-2 rounded-xl bg-emerald-600 px-4 text-xs font-black uppercase text-white shadow-sm hover:bg-emerald-700 disabled:opacity-40 active:scale-[0.99] transition"
                   >
-                    #{n}
+                    <CheckCircle2 className="h-5 w-5" />
+                    <span>
+                      {isSubmittingCounter ? 'Finalizando...' : 'Finalizar Venda no Balcão'}
+                    </span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Modal de Quantidade / Peso */}
+        {productForModal && (
+          <QuantitySelectorModal
+            product={productForModal}
+            allowNegativeStock={Boolean(currentTenant.settings?.allowNegativeStock)}
+            onClose={() => setProductForModal(null)}
+            onConfirm={handleConfirmAddBalcao}
+          />
+        )}
+
+        {/* Modal de Comprovante de Exemplo */}
+        {showPresetReceiptModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-900/60 p-4 backdrop-blur-xs">
+            <div className="w-full max-w-md rounded-2xl border border-stone-200 bg-white p-5 shadow-2xl space-y-3">
+              <div className="flex items-center justify-between border-b border-stone-100 pb-2.5">
+                <h3 className="text-sm font-bold text-stone-900">Selecionar Modelo de Comprovante</h3>
+                <button
+                  onClick={() => setShowPresetReceiptModal(false)}
+                  className="p-1 text-stone-400 hover:text-stone-700"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                {PRESET_RECEIPT_PHOTOS.map((preset, idx) => (
+                  <button
+                    key={idx}
+                    type="button"
+                    onClick={() => {
+                      setReceiptImage(preset.url);
+                      setReceiptSizeKb(34);
+                      setShowPresetReceiptModal(false);
+                    }}
+                    className="rounded-xl border border-stone-200 p-2 text-left hover:border-amber-500"
+                  >
+                    <img
+                      src={preset.url}
+                      alt={preset.name}
+                      className="h-24 w-full rounded-lg object-cover"
+                    />
+                    <p className="mt-1.5 text-xs font-bold text-stone-800 truncate">{preset.name}</p>
                   </button>
                 ))}
               </div>
             </div>
+          </div>
+        )}
+      </div>
+    );
+  }
 
-            <button
-              type="button"
-              onClick={() => {
-                if (!comandaCode.trim()) {
-                  setComandaCode(`CMD-${Math.floor(100 + Math.random() * 900)}`);
-                }
-                setCurrentStep('step3_catalog');
-              }}
-              className="w-full flex items-center justify-center gap-2 rounded-xl bg-amber-600 py-3 text-xs font-black uppercase text-white hover:bg-amber-700 transition"
-            >
-              <span>Avançar para o Cardápio ➔</span>
-            </button>
+  // =========================================================================
+  // RENDER: MODO VENDAS (FECHAMENTO DE CONTAS DE MESAS + HISTÓRICO)
+  // =========================================================================
+  const settlingProductsTotal = settlingTable
+    ? settlingTable.productsTotal ??
+      Math.max(0, (settlingTable.currentTotal || 0) - (settlingTable.extraTotal || 0))
+    : 0;
+  const settlingExtraTotal = settlingTable?.extraTotal || 0;
+  const settlingGrandTotal = Number((settlingProductsTotal + settlingExtraTotal).toFixed(2));
+  const settlingPaidAlready = Number((settlingTable?.paidAmount || 0).toFixed(2));
+  const settlingRemaining = Number(Math.max(0, settlingGrandTotal - settlingPaidAlready).toFixed(2));
+  const settlingOpenOrders = settlingTable ? getOpenTableOrders(currentTenant.id, settlingTable) : [];
+  const settlingChange =
+    settleMethod === 'dinheiro' && settleReceivedCash > settleAmount
+      ? settleReceivedCash - settleAmount
+      : 0;
+
+  return (
+    <div className="space-y-6">
+      {feedback && (
+        <div
+          className={`flex items-center justify-between rounded-2xl border px-4 py-3 text-xs font-semibold shadow-sm ${
+            feedback.type === 'error'
+              ? 'border-rose-300 bg-rose-50 text-rose-900'
+              : 'border-emerald-300 bg-emerald-50 text-emerald-950'
+          }`}
+        >
+          <span>{feedback.text}</span>
+          <button onClick={() => setFeedback(null)} className="p-1 opacity-70 hover:opacity-100">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+      )}
+
+      {isSellerBlocked && (
+        <div className="flex items-center gap-3 rounded-2xl border border-rose-300 bg-rose-50 p-4 text-rose-950">
+          <ShieldAlert className="h-6 w-6 text-rose-600 shrink-0" />
+          <div>
+            <h3 className="text-sm font-bold">Permissão de Venda Bloqueada</h3>
+            <p className="text-xs text-rose-800">
+              Você pode consultar o histórico, mas não pode finalizar pagamentos ou recebimentos.
+            </p>
           </div>
         </div>
       )}
 
-      {/* ========================================================================= */}
-      {/* ETAPA 3 DA ORDEM OBRIGATÓRIA: SELECIONAR OS PRODUTOS DO CARDÁPIO */}
-      {/* ========================================================================= */}
-      {currentStep === 'step3_catalog' && (
-        <div className="space-y-3 animate-in fade-in duration-200">
-          {/* Barra de Contexto do Atendimento Atual */}
-          <div className="flex flex-wrap items-center justify-between gap-2 rounded-2xl bg-amber-50 border border-amber-200 px-4 py-2.5">
-            <div className="flex items-center gap-2">
-              <span className="text-xs font-black uppercase text-amber-950">Atendimento:</span>
-              <span className="rounded-lg bg-amber-600 px-2.5 py-1 text-xs font-black text-white shadow-xs">
-                {saleModality === 'table'
-                  ? `🍽️ Mesa #${selectedTableNumber}`
-                  : saleModality === 'comanda'
-                  ? `📋 Comanda ${comandaCode ? `#${comandaCode}` : ''}`
-                  : '🏷️ Balcão Rápido'}
-              </span>
-            </div>
+      {/* Header da Aba Vendas */}
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between border-b border-stone-200 pb-4">
+        <div>
+          <h1 className="text-xl font-bold tracking-tight text-stone-900 sm:text-2xl">
+            Vendas & Fechamento de Contas
+          </h1>
+          <p className="mt-0.5 text-xs text-stone-500">
+            Receba pagamentos das mesas em aberto (Dinheiro ou PIX) e acompanhe as vendas registradas.
+          </p>
+        </div>
 
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => setCurrentStep('step1_modality')}
-                className="text-[11px] font-bold text-amber-900 underline hover:text-amber-950"
-              >
-                Trocar Local
-              </button>
-
-              {cartItems.length > 0 && (
-                <button
-                  type="button"
-                  onClick={() => setCurrentStep('step4_review')}
-                  className="flex items-center gap-1.5 rounded-xl bg-amber-600 px-3.5 py-1.5 text-xs font-black text-white shadow-xs hover:bg-amber-700"
-                >
-                  <ShoppingBag className="h-4 w-4" />
-                  <span>Conferir Pedido ({cartItems.reduce((a, b) => a + b.quantity, 0)}) ➔</span>
-                </button>
-              )}
-            </div>
-          </div>
-
-          {/* Categorias & Busca */}
-          <div className="flex gap-2 overflow-x-auto pb-1 scrollbar-none">
+        <div className="flex flex-wrap items-center gap-2">
+          {onNavigateToTables && (
             <button
-              onClick={() => setSelectedCategory('all')}
-              className={`shrink-0 rounded-xl px-3.5 py-2 text-xs font-bold transition ${
-                selectedCategory === 'all'
-                  ? 'bg-stone-900 text-white shadow-xs'
-                  : 'bg-white border border-stone-200 text-stone-600 hover:bg-stone-50'
-              }`}
+              type="button"
+              onClick={onNavigateToTables}
+              className="inline-flex min-h-[44px] items-center gap-2 rounded-xl border border-stone-200 bg-white px-4 py-2 text-xs font-bold text-stone-700 hover:bg-stone-50"
             >
-              Todos ({products.length})
+              <Grid2X2 className="h-4 w-4 text-amber-600" />
+              <span>Lançar Itens em Mesas</span>
             </button>
-            {categories.map((c) => (
-              <button
-                key={c.id}
-                onClick={() => setSelectedCategory(c.id)}
-                className={`shrink-0 rounded-xl px-3.5 py-2 text-xs font-bold transition ${
-                  selectedCategory === c.id
-                    ? 'bg-amber-600 text-white font-bold shadow-xs'
-                    : 'bg-white border border-stone-200 text-stone-600 hover:bg-stone-50'
-                }`}
-              >
-                {c.name}
-              </button>
-            ))}
-          </div>
+          )}
+          {onNavigateToCounter && (
+            <button
+              type="button"
+              onClick={onNavigateToCounter}
+              className="inline-flex min-h-[44px] items-center gap-2 rounded-xl bg-amber-600 px-4 py-2 text-xs font-bold text-white shadow-xs hover:bg-amber-700"
+            >
+              <ShoppingBag className="h-4 w-4" />
+              <span>Ir para Balcão</span>
+            </button>
+          )}
+        </div>
+      </div>
 
-          <div className="relative">
-            <Search className="absolute left-3.5 top-2.5 h-4 w-4 text-stone-400" />
-            <input
-              type="text"
-              placeholder="Buscar item pelo nome ou código..."
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              className="w-full rounded-xl border border-stone-200 bg-white py-2 pl-9 pr-3 text-xs text-stone-900 placeholder-stone-400 focus:border-amber-500 focus:outline-none"
-            />
+      {/* SEÇÃO 1: CONTAS DE MESAS EM ABERTO PARA PAGAMENTO */}
+      <section className="space-y-3">
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="text-sm font-bold text-stone-900">
+              Contas de Mesas em Aberto ({openTables.length})
+            </h2>
+            <p className="text-xs text-stone-500">
+              Toque em uma mesa para conferir os itens consumidos, valores extras e registrar pagamento.
+            </p>
           </div>
+        </div>
 
-          {/* Grid de Produtos com Estoque Visível Obrigatório */}
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 max-h-[520px] overflow-y-auto pr-1">
-            {filteredProducts.map((p) => {
-              const reservedQty = cartItems
-                .filter((ci) => ci.productId === p.id)
-                .reduce((acc, i) => acc + i.quantity, 0);
-              const confirmedStock = p.stockQuantity ?? 0;
-              const remainingStock = Math.max(0, confirmedStock - reservedQty);
-              const isOutOfStock = remainingStock <= 0;
+        {openTables.length === 0 ? (
+          <div className="rounded-2xl border border-dashed border-stone-300 bg-white p-8 text-center">
+            <Grid2X2 className="mx-auto h-9 w-9 text-stone-300" />
+            <p className="mt-2 text-sm font-bold text-stone-700">
+              Nenhuma mesa com conta em aberto no momento
+            </p>
+            <p className="mt-0.5 text-xs text-stone-500">
+              Para iniciar atendimento em mesa, abra a aba <strong>Mesas</strong> e adicione produtos.
+            </p>
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {openTables.map((table) => {
+              const pTotal =
+                table.productsTotal ?? Math.max(0, (table.currentTotal || 0) - (table.extraTotal || 0));
+              const eTotal = table.extraTotal || 0;
+              const grand = Number((pTotal + eTotal).toFixed(2));
+              const paid = Number((table.paidAmount || 0).toFixed(2));
+              const rem = Number(Math.max(0, grand - paid).toFixed(2));
 
               return (
                 <div
-                  key={p.id}
-                  className={`group flex flex-col justify-between overflow-hidden rounded-2xl border text-left shadow-2xs transition ${
-                    isOutOfStock
-                      ? 'border-rose-200 bg-stone-50/70 opacity-85'
-                      : reservedQty > 0
-                      ? 'border-amber-500 bg-white ring-2 ring-amber-500/20'
-                      : 'border-stone-200 bg-white hover:border-amber-500'
-                  }`}
+                  key={table.id}
+                  className="flex flex-col justify-between rounded-2xl border border-stone-200 bg-white p-4 shadow-2xs"
                 >
-                  <div className="relative h-28 w-full bg-stone-100 overflow-hidden">
-                    {p.imageUrl ? (
-                      <img
-                        src={p.imageUrl}
-                        alt={p.name}
-                        className={`h-full w-full object-cover transition ${
-                          isOutOfStock ? 'grayscale contrast-75' : 'group-hover:scale-105'
-                        }`}
-                        loading="lazy"
-                      />
-                    ) : (
-                      <div className="flex h-full w-full items-center justify-center text-stone-400 bg-stone-100">
-                        <ImageIcon className="h-6 w-6 text-stone-300" />
-                      </div>
-                    )}
-                    <span className="absolute top-1.5 left-1.5 rounded-md bg-stone-900/80 px-1.5 py-0.5 text-[9px] font-bold text-white">
-                      {p.internalCode}
-                    </span>
-                    {reservedQty > 0 && !isOutOfStock && (
-                      <span className="absolute top-1.5 right-1.5 rounded-md bg-amber-600 px-1.5 py-0.5 text-[10px] font-black text-white shadow-xs">
-                        {reservedQty} no pedido
-                      </span>
-                    )}
-                    {isOutOfStock && (
-                      <div className="absolute inset-0 flex items-center justify-center bg-stone-950/60 backdrop-blur-xs">
-                        <span className="rounded-lg bg-rose-600 px-2.5 py-1 text-[11px] font-black uppercase text-white">
-                          ESGOTADO
+                  <div>
+                    <div className="flex items-start justify-between gap-2">
+                      <div>
+                        <span className="inline-block rounded-md bg-amber-100 px-2 py-0.5 text-[10px] font-bold uppercase text-amber-900">
+                          {table.status === 'closing' ? 'Pagamento Parcial' : 'Em Consumo'}
                         </span>
-                      </div>
-                    )}
-                  </div>
-
-                  <div className="p-3 flex-1 flex flex-col justify-between">
-                    <div>
-                      <h4 className="text-xs font-bold text-stone-900 line-clamp-2 leading-snug">
-                        {p.name}
-                      </h4>
-                      <p className="mt-1 text-sm font-black text-amber-700">
-                        {formatBRL(p.sellingPrice)}
-                      </p>
-
-                      {/* QUANTIDADE DISPONÍVEL NO ESTOQUE VISÍVEL */}
-                      <div className="mt-1.5">
-                        {isOutOfStock ? (
-                          <span className="text-[10px] font-black text-rose-700 bg-rose-100 px-1.5 py-0.5 rounded uppercase">
-                            🔴 DISPONÍVEL: 00 UNIDADES (ESGOTADO)
-                          </span>
-                        ) : (
-                          <span
-                            className={`inline-flex items-center gap-1 text-[10px] font-black rounded px-1.5 py-0.5 ${
-                              remainingStock <= 5
-                                ? 'bg-amber-100 text-amber-950'
-                                : 'bg-emerald-50 text-emerald-900 border border-emerald-200'
-                            }`}
-                          >
-                            <span className="h-1.5 w-1.5 rounded-full bg-emerald-600" />
-                            DISPONÍVEL: {formatStockQuantity(remainingStock, p.unit)}
-                          </span>
+                        <h3 className="mt-1.5 text-base font-black text-stone-900">
+                          {table.label || `Mesa ${table.number}`}
+                        </h3>
+                        {table.customerName && (
+                          <p className="text-xs text-stone-500">Cliente: {table.customerName}</p>
                         )}
                       </div>
+                      <span className="text-lg font-black text-stone-900 tabular-nums">
+                        {formatBRL(rem)}
+                      </span>
                     </div>
 
-                    <div className="mt-2.5 pt-2 border-t border-stone-100 flex items-center justify-between gap-1">
-                      <button
-                        type="button"
-                        disabled={isOutOfStock}
-                        onClick={() =>
-                          setActiveItemForNotes({
-                            product: p,
-                            notes: '',
-                            quantity: 1,
-                          })
-                        }
-                        className="rounded-lg p-1.5 text-stone-500 hover:bg-stone-100 text-xs flex items-center gap-1"
-                        title="Adicionar com observação personalizada"
-                      >
-                        <Edit3 className="h-3 w-3" />
-                        <span className="text-[10px]">Obs</span>
-                      </button>
-
-                      <button
-                        type="button"
-                        disabled={isOutOfStock}
-                        onClick={() => handleAddToCart(p)}
-                        className={`flex h-8 px-3 items-center justify-center gap-1 rounded-xl text-xs font-bold transition ${
-                          isOutOfStock
-                            ? 'bg-stone-200 text-stone-400 cursor-not-allowed'
-                            : 'bg-amber-600 text-white hover:bg-amber-700 active:scale-95'
-                        }`}
-                      >
-                        <Plus className="h-3.5 w-3.5" />
-                        <span>{isOutOfStock ? 'Esgotado' : 'Adicionar'}</span>
-                      </button>
+                    <div className="mt-3 space-y-1 rounded-xl bg-stone-50 p-2.5 text-xs border border-stone-100">
+                      <div className="flex justify-between text-stone-600">
+                        <span>Consumo de Produtos:</span>
+                        <span className="font-bold tabular-nums">{formatBRL(pTotal)}</span>
+                      </div>
+                      {eTotal > 0 && (
+                        <div className="flex justify-between text-purple-700">
+                          <span>Valores Extras:</span>
+                          <span className="font-bold tabular-nums">+{formatBRL(eTotal)}</span>
+                        </div>
+                      )}
+                      {paid > 0 && (
+                        <div className="flex justify-between text-emerald-700">
+                          <span>Já Pago:</span>
+                          <span className="font-bold tabular-nums">-{formatBRL(paid)}</span>
+                        </div>
+                      )}
                     </div>
                   </div>
+
+                  <button
+                    type="button"
+                    disabled={isSellerBlocked}
+                    onClick={() => openTableSettlementModal(table)}
+                    className="mt-3 flex min-h-[44px] w-full items-center justify-center gap-2 rounded-xl bg-stone-900 px-4 text-xs font-bold text-white hover:bg-stone-800 disabled:opacity-40 transition"
+                  >
+                    <Banknote className="h-4 w-4 text-amber-400" />
+                    <span>Receber & Fechar Conta</span>
+                    <ArrowRight className="h-3.5 w-3.5" />
+                  </button>
                 </div>
               );
             })}
           </div>
+        )}
+      </section>
 
-          {/* Barra Fixa Inferior com Resumo & Avanço para Conferência */}
-          {cartItems.length > 0 && (
-            <div className="sticky bottom-2 z-20 pt-2 animate-in slide-in-from-bottom-2">
-              <div className="flex items-center justify-between rounded-2xl bg-stone-900 px-5 py-3 text-white shadow-xl">
-                <div>
-                  <span className="text-[10px] font-bold uppercase text-amber-400">Total do Pedido</span>
-                  <p className="text-xl font-black">
-                    {cartItems.reduce((acc, i) => acc + i.quantity, 0)} itens • {formatBRL(total)}
-                  </p>
-                </div>
-
-                <button
-                  type="button"
-                  onClick={() => setCurrentStep('step4_review')}
-                  className="flex items-center gap-2 rounded-xl bg-amber-600 px-5 py-2.5 text-xs font-black uppercase text-white hover:bg-amber-500 active:scale-95 transition shadow-sm"
-                >
-                  <span>Conferir Pedido ➔</span>
-                </button>
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* ========================================================================= */}
-      {/* ETAPA 4 DA ORDEM OBRIGATÓRIA: CONFERIR O PEDIDO */}
-      {/* ========================================================================= */}
-      {currentStep === 'step4_review' && (
-        <div className="max-w-2xl mx-auto space-y-4 animate-in fade-in duration-200">
-          <div className="flex items-center justify-between border-b border-stone-200 pb-3">
-            <button
-              type="button"
-              onClick={() => setCurrentStep('step3_catalog')}
-              className="flex items-center gap-1 rounded-xl border border-stone-200 bg-white px-3 py-1.5 text-xs font-bold text-stone-700 hover:bg-stone-50"
-            >
-              <ArrowLeft className="h-4 w-4" />
-              <span>+ Adicionar Mais Itens</span>
-            </button>
-            <h2 className="text-base font-black text-stone-900 sm:text-lg">
-              Passo 4: Conferência do Pedido
-            </h2>
+      {/* SEÇÃO 2: HISTÓRICO RECENTE DE VENDAS */}
+      <section className="rounded-2xl border border-stone-200 bg-white shadow-2xs overflow-hidden">
+        <div className="flex flex-col gap-3 border-b border-stone-100 p-4 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h2 className="text-sm font-bold text-stone-900">Vendas Registradas</h2>
+            <p className="text-xs text-stone-500">
+              Consulte vendas de Balcão e Mesas quitadas ou em andamento.
+            </p>
           </div>
 
-          <div className="rounded-2xl border border-stone-200 bg-white p-5 shadow-xs space-y-4">
-            {/* Informações do Atendimento */}
-            <div className="flex items-center justify-between rounded-xl bg-stone-50 p-3 border border-stone-200 text-xs">
-              <div>
-                <span className="text-[10px] font-bold uppercase text-stone-400">Atendimento:</span>
-                <p className="font-black text-stone-900 text-sm">
-                  {saleModality === 'table'
-                    ? `Mesa #${selectedTableNumber}`
-                    : saleModality === 'comanda'
-                    ? `Comanda #${comandaCode}`
-                    : 'Venda Balcão'}
-                </p>
-              </div>
-              <div className="text-right">
-                <span className="text-[10px] font-bold uppercase text-stone-400">Atendente:</span>
-                <p className="font-bold text-stone-800">{currentUser?.name}</p>
-              </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="relative">
+              <Search className="absolute left-3 top-2.5 h-3.5 w-3.5 text-stone-400" />
+              <input
+                type="text"
+                placeholder="Buscar #pedido ou operador..."
+                value={historySearch}
+                onChange={(e) => setHistorySearch(e.target.value)}
+                className="min-h-[38px] rounded-xl border border-stone-200 bg-stone-50 py-1.5 pl-8 pr-3 text-xs text-stone-900 focus:border-amber-500 focus:bg-white focus:outline-none"
+              />
             </div>
 
-            {/* Lista dos Itens Selecionados */}
-            <div className="divide-y divide-stone-100 max-h-72 overflow-y-auto pr-1">
-              {cartItems.map((item, idx) => (
-                <div key={idx} className="py-2.5 flex items-center justify-between gap-3">
-                  <div className="flex-1 min-w-0">
-                    <p className="text-xs font-bold text-stone-900 truncate">{item.productName}</p>
-                    {item.notes && (
-                      <p className="text-[11px] font-semibold text-amber-700">Obs: {item.notes}</p>
-                    )}
-                    <p className="text-[11px] text-stone-400">
-                      {item.quantity}x {formatBRL(item.unitPrice)}
-                    </p>
+            <div className="flex rounded-xl border border-stone-200 bg-stone-100 p-1">
+              {(
+                [
+                  { id: 'today', label: 'Hoje' },
+                  { id: 'all', label: 'Todas' },
+                  { id: 'counter', label: 'Balcão' },
+                  { id: 'table', label: 'Mesas' },
+                  { id: 'cancelled', label: 'Canceladas' },
+                ] as const
+              ).map((tab) => (
+                <button
+                  key={tab.id}
+                  type="button"
+                  onClick={() => setHistoryFilter(tab.id)}
+                  className={`rounded-lg px-2.5 py-1 text-[11px] font-bold transition ${
+                    historyFilter === tab.id
+                      ? 'bg-white text-stone-900 shadow-xs'
+                      : 'text-stone-600 hover:text-stone-900'
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <div className="divide-y divide-stone-100">
+          {filteredOrders.length === 0 ? (
+            <div className="p-10 text-center text-stone-400">
+              <Clock className="mx-auto h-8 w-8 text-stone-300" />
+              <p className="mt-2 text-xs font-semibold text-stone-600">
+                Nenhuma venda encontrada para o filtro selecionado.
+              </p>
+            </div>
+          ) : (
+            filteredOrders.slice(0, 40).map((ord) => {
+              const paymentLabel =
+                ord.payments && ord.payments.length > 0
+                  ? ord.payments.map((p) => p.method.toUpperCase()).join(' + ')
+                  : 'Em aberto';
+
+              return (
+                <div
+                  key={ord.id}
+                  className="flex flex-col gap-2 p-4 sm:flex-row sm:items-center sm:justify-between hover:bg-stone-50/70 transition"
+                >
+                  <div className="flex items-start gap-3">
+                    <span className="flex h-10 w-12 shrink-0 items-center justify-center rounded-xl bg-stone-100 font-mono text-xs font-black text-stone-800">
+                      #{ord.orderNumber}
+                    </span>
+                    <div>
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <span className="text-xs font-bold text-stone-900">
+                          {formatModalityBadge(ord)}
+                        </span>
+                        {ord.status === 'cancelled' ? (
+                          <span className="rounded bg-rose-100 px-1.5 py-0.5 text-[10px] font-bold text-rose-800">
+                            Cancelada
+                          </span>
+                        ) : ord.paid ? (
+                          <span className="rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] font-bold text-emerald-800">
+                            Quitada
+                          </span>
+                        ) : (
+                          <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-bold text-amber-800">
+                            Em Aberto
+                          </span>
+                        )}
+                      </div>
+                      <p className="mt-0.5 text-[11px] text-stone-500">
+                        {formatDateTimeBR(ord.createdAt)} · {ord.waiterName || 'Operador'} ·{' '}
+                        {ord.items.length} item(ns) · {paymentLabel}
+                      </p>
+                    </div>
                   </div>
 
-                  <div className="flex items-center gap-2">
-                    <div className="flex items-center gap-1 rounded-xl border border-stone-200 bg-stone-50 p-1">
-                      <button
-                        type="button"
-                        onClick={() => handleUpdateQuantity(idx, -1)}
-                        className="rounded-lg p-1.5 text-stone-700 hover:bg-stone-200"
-                      >
-                        <Minus className="h-3 w-3" />
-                      </button>
-                      <span className="w-6 text-center text-xs font-black text-stone-900">
-                        {item.quantity}
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => handleUpdateQuantity(idx, 1)}
-                        className="rounded-lg p-1.5 text-stone-700 hover:bg-stone-200"
-                      >
-                        <Plus className="h-3 w-3" />
-                      </button>
-                    </div>
+                  <div className="flex items-center justify-between sm:justify-end gap-2.5">
+                    <span className="text-sm font-black text-stone-900 tabular-nums">
+                      {formatBRL(ord.total)}
+                    </span>
 
                     <button
                       type="button"
-                      onClick={() => handleRemoveFromCart(idx)}
-                      className="rounded-lg p-2 text-stone-400 hover:bg-rose-50 hover:text-rose-600"
+                      onClick={() => setViewingOrder(ord)}
+                      className="inline-flex min-h-[38px] items-center gap-1 rounded-xl border border-stone-200 bg-white px-3 text-xs font-bold text-stone-700 hover:bg-stone-50"
                     >
-                      <Trash2 className="h-4 w-4" />
+                      <Eye className="h-3.5 w-3.5" />
+                      <span>Detalhes</span>
                     </button>
 
-                    <span className="w-16 text-right text-xs font-black text-stone-900">
-                      {formatBRL(item.total)}
-                    </span>
+                    {isAdm && ord.status !== 'cancelled' && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setCancellingOrder(ord);
+                          setCancelReason('');
+                        }}
+                        className="inline-flex min-h-[38px] items-center gap-1 rounded-xl border border-rose-200 bg-rose-50 px-3 text-xs font-bold text-rose-700 hover:bg-rose-100"
+                      >
+                        <Ban className="h-3.5 w-3.5" />
+                        <span>Cancelar</span>
+                      </button>
+                    )}
                   </div>
                 </div>
-              ))}
-            </div>
-
-            {/* Totais & Desconto */}
-            <div className="border-t border-stone-200 pt-3 space-y-2 text-xs">
-              <div className="flex justify-between text-stone-600">
-                <span>Consumo de Produtos:</span>
-                <span className="font-bold">{formatBRL(subtotal)}</span>
-              </div>
-
-              {tableExtraTotal > 0 && (
-                <div className="flex justify-between items-center rounded-xl bg-purple-50 p-2.5 border border-purple-200 text-purple-950">
-                  <div>
-                    <span className="text-xs font-black uppercase tracking-wide">
-                      + Valores Extras da Mesa:
-                    </span>
-                    <p className="text-[10px] text-purple-700 mt-0.5">
-                      {tableActiveExtraCharges.map((c) => `${c.description} (${formatBRL(c.amount)})`).join(' • ')}
-                    </p>
-                  </div>
-                  <span className="text-sm font-black text-purple-900">+{formatBRL(tableExtraTotal)}</span>
-                </div>
-              )}
-
-              {includeServiceFee && (
-                <div className="flex justify-between text-stone-600">
-                  <span>Taxa de Atendimento ({currentTenant.settings?.serviceFeePercentage || 10}%):</span>
-                  <span className="font-bold">{formatBRL(serviceFee)}</span>
-                </div>
-              )}
-
-              <div className="flex justify-between items-center text-stone-600">
-                <span>Desconto (R$):</span>
-                <input
-                  type="number"
-                  min="0"
-                  step="0.5"
-                  value={discount || ''}
-                  onChange={(e) => setDiscount(Math.max(0, parseFloat(e.target.value) || 0))}
-                  placeholder="0,00"
-                  className="w-20 rounded-lg border border-stone-200 px-2 py-1 text-right text-xs font-bold text-stone-900 focus:outline-none"
-                />
-              </div>
-
-              <div className="rounded-2xl bg-stone-900 p-4 text-white flex items-center justify-between mt-2">
-                <div>
-                  <span className="text-[10px] font-bold uppercase text-amber-400">Total a Pagar</span>
-                  <p className="text-2xl font-black">{formatBRL(total)}</p>
-                  {tableExtraTotal > 0 && (
-                    <p className="text-[10px] text-stone-300">
-                      Produtos: {formatBRL(subtotal)} + Extras: {formatBRL(tableExtraTotal)}
-                    </p>
-                  )}
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setCurrentStep('step5_payment')}
-                  className="flex items-center gap-2 rounded-xl bg-amber-600 px-5 py-3 text-xs font-black uppercase text-white hover:bg-amber-500 shadow-md active:scale-95 transition"
-                >
-                  <span>Avançar para Pagamento ➔</span>
-                </button>
-              </div>
-            </div>
-          </div>
+              );
+            })
+          )}
         </div>
-      )}
+      </section>
 
-      {/* ========================================================================= */}
-      {/* ETAPA 5 DA ORDEM OBRIGATÓRIA: SELECIONAR FORMA DE PAGAMENTO & CONFIRMAR */}
-      {/* ========================================================================= */}
-      {currentStep === 'step5_payment' && (
-        <div className="max-w-lg mx-auto space-y-4 animate-in fade-in duration-200">
-          <div className="flex items-center justify-between border-b border-stone-200 pb-3">
-            <button
-              type="button"
-              onClick={() => setCurrentStep('step4_review')}
-              className="flex items-center gap-1 rounded-xl border border-stone-200 bg-white px-3 py-1.5 text-xs font-bold text-stone-700 hover:bg-stone-50"
-            >
-              <ArrowLeft className="h-4 w-4" />
-              <span>Voltar ao Pedido</span>
-            </button>
-            <h2 className="text-base font-black text-stone-900">Passo 5: Forma de Pagamento</h2>
-          </div>
-
-          <div className="rounded-2xl border border-stone-200 bg-white p-5 shadow-xs space-y-4">
-            <div className="rounded-2xl bg-amber-50 p-4 border border-amber-200 text-center">
-              <span className="text-[10px] font-bold uppercase tracking-wider text-amber-800">
-                Valor Total da Venda
-              </span>
-              <p className="text-3xl font-black text-amber-950 mt-0.5">{formatBRL(total)}</p>
-              {tableExtraTotal > 0 && (
-                <div className="mt-2 inline-flex items-center gap-1.5 rounded-lg bg-amber-100/80 px-2.5 py-1 text-[11px] font-bold text-amber-900">
-                  <span>Consumo: {formatBRL(subtotal)}</span>
-                  <span>+</span>
-                  <span>Valores Extras: {formatBRL(tableExtraTotal)}</span>
-                </div>
-              )}
-            </div>
-
-            {/* As 3 Formas Exclusivas: DINHEIRO, PIX, DEVENDO */}
-            <div className="space-y-2">
-              <button
-                type="button"
-                onClick={() => setSelectedMethod('dinheiro')}
-                className={`flex w-full items-center justify-between rounded-2xl border p-3.5 text-xs font-bold transition ${
-                  selectedMethod === 'dinheiro'
-                    ? 'border-amber-600 bg-amber-50/70 text-amber-950 ring-2 ring-amber-500/30'
-                    : 'border-stone-200 bg-white text-stone-700 hover:bg-stone-50'
-                }`}
-              >
-                <div className="flex items-center gap-3">
-                  <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-amber-100 text-amber-800">
-                    <Banknote className="h-5 w-5" />
-                  </div>
-                  <div className="text-left">
-                    <p className="text-sm font-black">1. DINHEIRO</p>
-                    <p className="text-[11px] font-normal text-stone-500">
-                      Recebimento em espécie e cálculo de troco
-                    </p>
-                  </div>
-                </div>
-                {selectedMethod === 'dinheiro' && <CheckCircle2 className="h-5 w-5 text-amber-600" />}
-              </button>
-
-              <button
-                type="button"
-                onClick={() => setSelectedMethod('pix')}
-                className={`flex w-full items-center justify-between rounded-2xl border p-3.5 text-xs font-bold transition ${
-                  selectedMethod === 'pix'
-                    ? 'border-emerald-600 bg-emerald-50 text-emerald-950 ring-2 ring-emerald-500/30'
-                    : 'border-stone-200 bg-white text-stone-700 hover:bg-stone-50'
-                }`}
-              >
-                <div className="flex items-center gap-3">
-                  <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-100 text-emerald-700">
-                    <QrCode className="h-5 w-5" />
-                  </div>
-                  <div className="text-left">
-                    <p className="text-sm font-black">2. PIX</p>
-                    <p className="text-[11px] font-normal text-stone-500">
-                      Chave instantânea e QR Code de recebimento
-                    </p>
-                  </div>
-                </div>
-                {selectedMethod === 'pix' && <CheckCircle2 className="h-5 w-5 text-emerald-600" />}
-              </button>
-
-              <button
-                type="button"
-                onClick={() => setSelectedMethod('pendente')}
-                className={`flex w-full items-center justify-between rounded-2xl border p-3.5 text-xs font-bold transition ${
-                  selectedMethod === 'pendente' || selectedMethod === 'devendo'
-                    ? 'border-blue-600 bg-blue-50 text-blue-950 ring-2 ring-blue-500/30'
-                    : 'border-stone-200 bg-white text-stone-700 hover:bg-stone-50'
-                }`}
-              >
-                <div className="flex items-center gap-3">
-                  <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-blue-100 text-blue-800">
-                    <FileText className="h-5 w-5" />
-                  </div>
-                  <div className="text-left">
-                    <p className="text-sm font-black text-blue-950">3. PENDENTE DE PAGAMENTO</p>
-                    <p className="text-[11px] font-normal text-blue-700">
-                      Registro de pedido em aberto sem acerto imediato
-                    </p>
-                  </div>
-                </div>
-                {(selectedMethod === 'pendente' || selectedMethod === 'devendo') && (
-                  <CheckCircle2 className="h-5 w-5 text-blue-600" />
-                )}
-              </button>
-            </div>
-
-            {/* Detalhes de Dinheiro */}
-            {selectedMethod === 'dinheiro' && (
-              <div className="rounded-2xl bg-stone-50 p-4 border border-stone-200 space-y-2 text-xs">
-                <label className="block font-bold text-stone-700">Valor Recebido do Cliente (R$)</label>
-                <input
-                  type="number"
-                  step="0.5"
-                  value={receivedCash || ''}
-                  onChange={(e) => setReceivedCash(parseFloat(e.target.value) || 0)}
-                  placeholder={`Ex: ${total.toFixed(2)}`}
-                  className="w-full rounded-xl border border-stone-200 bg-white px-3 py-2 text-sm font-bold text-stone-900 focus:outline-none"
-                />
-                {receivedCash > total && (
-                  <p className="text-xs font-black text-emerald-700 pt-1">
-                    Troco a Devolver: {formatBRL(receivedCash - total)}
-                  </p>
-                )}
-              </div>
-            )}
-
-            {/* Detalhes de PENDENTE DE PAGAMENTO */}
-            {(selectedMethod === 'pendente' || selectedMethod === 'devendo') && (
-              <div className="rounded-2xl bg-blue-50/70 p-4 border border-blue-200 space-y-3 text-xs">
-                <span className="font-black uppercase text-blue-900 text-[11px]">
-                  Informações do Pedido em Aberto
-                </span>
-                <div>
-                  <label className="block font-bold text-stone-800">Identificação / Nome do Cliente (Opcional)</label>
-                  <input
-                    type="text"
-                    placeholder="Ex: Beatriz ou Balcão Lateral"
-                    value={debtCustomerName}
-                    onChange={(e) => setDebtCustomerName(e.target.value)}
-                    className="mt-1 w-full rounded-xl border border-blue-200 bg-white px-3 py-2 text-xs text-stone-900 focus:outline-none"
-                  />
-                </div>
-                <div>
-                  <label className="block font-bold text-stone-800">Observações (Opcional)</label>
-                  <input
-                    type="text"
-                    placeholder="Ex: Pagar no final do expediente / Mesa em consumo"
-                    value={debtNotes}
-                    onChange={(e) => setDebtNotes(e.target.value)}
-                    className="mt-1 w-full rounded-xl border border-blue-200 bg-white px-3 py-2 text-xs text-stone-900 focus:outline-none"
-                  />
-                </div>
-                <p className="text-[11px] text-blue-800">
-                  O pedido será salvo como <strong>Pendente de Pagamento</strong> no histórico para posterior quitação.
+      {/* MODAL: FECHAMENTO E QUITAÇÃO DE MESA */}
+      {settlingTable && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-900/60 p-4 backdrop-blur-xs overflow-y-auto">
+          <div className="w-full max-w-lg rounded-3xl border border-stone-200 bg-white p-5 sm:p-6 shadow-2xl max-h-[92vh] overflow-y-auto space-y-4">
+            <div className="flex items-center justify-between border-b border-stone-100 pb-3">
+              <div>
+                <h3 className="text-base font-black text-stone-900">
+                  Fechamento: {settlingTable.label || `Mesa ${settlingTable.number}`}
+                </h3>
+                <p className="text-xs text-stone-500">
+                  Conferência de consumo acumulado e recebimento em Dinheiro ou PIX
                 </p>
               </div>
+              <button
+                type="button"
+                onClick={() => setSettlingTable(null)}
+                className="rounded-lg p-1.5 text-stone-400 hover:bg-stone-100"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            {/* Itens consumidos acumulados */}
+            <div className="rounded-2xl border border-stone-200 bg-stone-50 p-3.5 space-y-2">
+              <span className="text-[11px] font-bold uppercase tracking-wider text-stone-500">
+                Consumo Lançado na Mesa
+              </span>
+              {settlingOpenOrders.length === 0 ? (
+                <p className="text-xs text-stone-500">Nenhum produto lançado.</p>
+              ) : (
+                <div className="max-h-40 overflow-y-auto divide-y divide-stone-200/70 text-xs">
+                  {settlingOpenOrders.flatMap((ord) =>
+                    ord.items.map((item, idx) => (
+                      <div key={`${ord.id}-${idx}`} className="py-1.5 flex justify-between gap-2">
+                        <span className="text-stone-800 font-medium">
+                          <strong className="tabular-nums">{item.quantity}×</strong> {item.productName}
+                          {item.variationName ? ` (${item.variationName})` : ''}
+                        </span>
+                        <span className="font-bold text-stone-900 tabular-nums">
+                          {formatBRL(item.total)}
+                        </span>
+                      </div>
+                    ))
+                  )}
+                </div>
+              )}
+
+              <div className="border-t border-stone-200 pt-2 space-y-1 text-xs">
+                <div className="flex justify-between text-stone-600">
+                  <span>Subtotal Produtos:</span>
+                  <span className="font-bold tabular-nums">{formatBRL(settlingProductsTotal)}</span>
+                </div>
+                {settlingExtraTotal > 0 && (
+                  <div className="flex justify-between text-purple-700">
+                    <span>Valores Extras da Mesa:</span>
+                    <span className="font-bold tabular-nums">+{formatBRL(settlingExtraTotal)}</span>
+                  </div>
+                )}
+                {settlingPaidAlready > 0 && (
+                  <div className="flex justify-between text-emerald-700">
+                    <span>Pagamentos Parciais Anteriores:</span>
+                    <span className="font-bold tabular-nums">-{formatBRL(settlingPaidAlready)}</span>
+                  </div>
+                )}
+                <div className="flex justify-between pt-1 text-sm font-black text-stone-900">
+                  <span>Saldo a Receber:</span>
+                  <span className="tabular-nums">{formatBRL(settlingRemaining)}</span>
+                </div>
+              </div>
+            </div>
+
+            <form onSubmit={handleConfirmTableSettlement} className="space-y-4">
+              {settlingRemaining > 0.009 && (
+                <>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setSettleMethod('dinheiro')}
+                      className={`flex min-h-[48px] items-center justify-center gap-2 rounded-xl border text-xs font-bold transition ${
+                        settleMethod === 'dinheiro'
+                          ? 'border-amber-600 bg-amber-50 text-amber-950 ring-2 ring-amber-500/20'
+                          : 'border-stone-200 bg-white text-stone-700'
+                      }`}
+                    >
+                      <Banknote className="h-4 w-4" />
+                      <span>Dinheiro</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setSettleMethod('pix')}
+                      className={`flex min-h-[48px] items-center justify-center gap-2 rounded-xl border text-xs font-bold transition ${
+                        settleMethod === 'pix'
+                          ? 'border-emerald-600 bg-emerald-50 text-emerald-950 ring-2 ring-emerald-500/20'
+                          : 'border-stone-200 bg-white text-stone-700'
+                      }`}
+                    >
+                      <QrCode className="h-4 w-4" />
+                      <span>PIX</span>
+                    </button>
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                    <div>
+                      <label className="block text-xs font-bold text-stone-700">
+                        Valor a Abater / Quitar (R$)
+                      </label>
+                      <input
+                        type="number"
+                        step="0.01"
+                        min="0.01"
+                        max={settlingRemaining}
+                        required
+                        value={settleAmount || ''}
+                        onChange={(e) => {
+                          const v = parseFloat(e.target.value) || 0;
+                          setSettleAmount(v);
+                          if (settleMethod === 'dinheiro') setSettleReceivedCash(v);
+                        }}
+                        className="mt-1 w-full min-h-[44px] rounded-xl border border-stone-200 px-3 font-mono text-sm font-bold text-stone-900"
+                      />
+                    </div>
+
+                    {settleMethod === 'dinheiro' && (
+                      <div>
+                        <label className="block text-xs font-bold text-stone-700">
+                          Valor Recebido (Espécie)
+                        </label>
+                        <input
+                          type="number"
+                          step="0.50"
+                          min="0"
+                          value={settleReceivedCash || ''}
+                          onChange={(e) => setSettleReceivedCash(parseFloat(e.target.value) || 0)}
+                          className="mt-1 w-full min-h-[44px] rounded-xl border border-stone-200 px-3 font-mono text-sm font-bold text-stone-900"
+                        />
+                      </div>
+                    )}
+                  </div>
+
+                  {settlingChange > 0 && (
+                    <div className="rounded-xl bg-emerald-50 border border-emerald-200 px-3 py-2 text-xs font-black text-emerald-800 flex justify-between">
+                      <span>Troco a Devolver:</span>
+                      <span className="tabular-nums">{formatBRL(settlingChange)}</span>
+                    </div>
+                  )}
+
+                  <div>
+                    <label className="block text-xs font-bold text-stone-700">
+                      Observação do Pagamento (Opcional)
+                    </label>
+                    <input
+                      type="text"
+                      placeholder="Ex: Pagamento parcial / Dividido entre clientes"
+                      value={settleNotes}
+                      onChange={(e) => setSettleNotes(e.target.value)}
+                      className="mt-1 w-full min-h-[42px] rounded-xl border border-stone-200 px-3 text-xs text-stone-900"
+                    />
+                  </div>
+                </>
+              )}
+
+              <div className="flex gap-2 border-t border-stone-100 pt-3">
+                <button
+                  type="button"
+                  onClick={() => setSettlingTable(null)}
+                  className="w-1/3 min-h-[48px] rounded-xl border border-stone-200 text-xs font-bold text-stone-700 hover:bg-stone-50"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSubmittingSettle}
+                  className="w-2/3 min-h-[48px] rounded-xl bg-emerald-600 text-xs font-black uppercase text-white hover:bg-emerald-700 disabled:opacity-40 transition"
+                >
+                  {isSubmittingSettle
+                    ? 'Processando...'
+                    : settlingRemaining <= 0.009
+                    ? 'Liberar Mesa Sem Consumo'
+                    : settleAmount + 0.009 >= settlingRemaining
+                    ? 'Quitar Conta & Liberar Mesa'
+                    : 'Registrar Pagamento Parcial'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: DETALHES DA VENDA */}
+      {viewingOrder && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-900/60 p-4 backdrop-blur-xs">
+          <div className="w-full max-w-md rounded-3xl border border-stone-200 bg-white p-5 shadow-2xl space-y-4 max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between border-b border-stone-100 pb-3">
+              <div>
+                <h3 className="text-base font-black text-stone-900">
+                  Pedido #{viewingOrder.orderNumber}
+                </h3>
+                <p className="text-xs text-stone-500">
+                  {formatModalityBadge(viewingOrder)} · {formatDateTimeBR(viewingOrder.createdAt)}
+                </p>
+              </div>
+              <button
+                onClick={() => setViewingOrder(null)}
+                className="rounded-lg p-1 text-stone-400 hover:bg-stone-100"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+
+            <div className="space-y-1.5 rounded-2xl bg-stone-50 p-3 text-xs border border-stone-200">
+              {viewingOrder.items.map((item, idx) => (
+                <div key={idx} className="flex justify-between gap-2">
+                  <span className="text-stone-800">
+                    <strong className="tabular-nums">{item.quantity}×</strong> {item.productName}
+                  </span>
+                  <span className="font-bold text-stone-900 tabular-nums">
+                    {formatBRL(item.total)}
+                  </span>
+                </div>
+              ))}
+              {getOrderExtraTotal(viewingOrder) > 0 && (
+                <div className="flex justify-between border-t border-stone-200 pt-1.5 text-purple-700 font-semibold">
+                  <span>Valores Extras:</span>
+                  <span className="tabular-nums">{formatBRL(getOrderExtraTotal(viewingOrder))}</span>
+                </div>
+              )}
+              <div className="flex justify-between border-t border-stone-200 pt-1.5 text-sm font-black text-stone-900">
+                <span>Total:</span>
+                <span className="tabular-nums">{formatBRL(viewingOrder.total)}</span>
+              </div>
+            </div>
+
+            {viewingOrder.payments.length > 0 && (
+              <div className="space-y-1 text-xs">
+                <span className="font-bold uppercase text-[10px] text-stone-500">Pagamentos:</span>
+                {viewingOrder.payments.map((pay, idx) => (
+                  <div
+                    key={idx}
+                    className="flex justify-between rounded-xl border border-stone-200 px-3 py-2"
+                  >
+                    <span className="font-bold uppercase text-stone-800">{pay.method}</span>
+                    <span className="font-bold text-emerald-700 tabular-nums">
+                      {formatBRL(pay.amount)}
+                    </span>
+                  </div>
+                ))}
+              </div>
             )}
 
-            {/* Botão de Confirmação Final */}
+            {(viewingOrder.receiptImageUrl || viewingOrder.payments[0]?.receiptImageUrl) && (
+              <div className="overflow-hidden rounded-2xl border border-stone-200 bg-stone-950 flex items-center justify-center max-h-56">
+                <img
+                  src={viewingOrder.receiptImageUrl || viewingOrder.payments[0]?.receiptImageUrl}
+                  alt="Comprovante"
+                  className="max-h-56 w-auto object-contain"
+                />
+              </div>
+            )}
+
             <button
               type="button"
-              onClick={handleFinalizeSale}
-              className="w-full flex items-center justify-center gap-2 rounded-2xl bg-emerald-600 py-3.5 text-xs font-black uppercase text-white shadow-md hover:bg-emerald-700 active:scale-95 transition"
+              onClick={() => setViewingOrder(null)}
+              className="w-full min-h-[44px] rounded-xl bg-stone-900 text-xs font-bold text-white hover:bg-stone-800"
             >
-              <CheckCircle2 className="h-5 w-5" />
-              <span>Confirmar Operação e Baixar Estoque</span>
+              Fechar
             </button>
           </div>
         </div>
       )}
 
-      {/* ========================================================================= */}
-      {/* ETAPA 6: SUCESSO & COMPROVANTE OFICIAL */}
-      {/* ========================================================================= */}
-      {currentStep === 'step6_success' && finishedOrder && (
-        <div className="max-w-md mx-auto space-y-4 animate-in zoom-in-95 duration-200 text-center">
-          <div className="rounded-3xl border border-emerald-200 bg-white p-6 shadow-xl space-y-4">
-            <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-emerald-100 text-emerald-700 shadow-xs">
-              <CheckCircle2 className="h-8 w-8" />
-            </div>
-
-            <div>
-              <span className="text-[10px] font-black uppercase text-emerald-700 tracking-wider">
-                Operação Concluída com Sucesso
-              </span>
-              <h3 className="text-xl font-black text-stone-900 mt-0.5">
-                Venda #{finishedOrder.orderNumber} Confirmada!
-              </h3>
-              <p className="text-xs text-stone-500">
-                Baixa de estoque confirmada pela Matriz Administrativa.
-              </p>
-            </div>
-
-            <div className="rounded-2xl bg-stone-50 p-4 border border-stone-200 text-left text-xs space-y-1.5 font-mono">
-              <div className="flex justify-between">
-                <span className="text-stone-500">Modalidade:</span>
-                <span className="font-bold text-stone-900 uppercase">
-                  {finishedOrder.type === 'table'
-                    ? `Mesa #${finishedOrder.tableNumber}`
-                    : finishedOrder.type === 'comanda'
-                    ? `Comanda #${finishedOrder.comandaNumber}`
-                    : 'Balcão'}
-                </span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-stone-500">Pagamento:</span>
-                <span className="font-bold text-stone-900 uppercase">
-                  {finishedOrder.payments[0]?.method}
-                </span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-stone-500">Total Pago:</span>
-                <span className="font-bold text-emerald-700">{formatBRL(finishedOrder.total)}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-stone-500">Vendedor:</span>
-                <span className="font-bold text-stone-900">{finishedOrder.waiterName}</span>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-2 gap-2">
-              <button
-                type="button"
-                onClick={() => window.print()}
-                className="flex items-center justify-center gap-1.5 rounded-xl border border-stone-200 bg-white py-2.5 text-xs font-bold text-stone-700 hover:bg-stone-50"
-              >
-                <Printer className="h-4 w-4" />
-                <span>Imprimir Recibo</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={handleResetForNewSale}
-                className="flex items-center justify-center gap-1.5 rounded-xl bg-amber-600 py-2.5 text-xs font-black uppercase text-white hover:bg-amber-700"
-              >
-                <span>+ Nova Venda</span>
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Modal para Observação do Item (Ex: "Sem cebola", "Ponto da carne") */}
-      {activeItemForNotes && (
+      {/* MODAL: CANCELAMENTO DE VENDA (EXCLUSIVO ADM) */}
+      {cancellingOrder && isAdm && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-900/60 p-4 backdrop-blur-xs">
-          <div className="w-full max-w-sm rounded-2xl border border-stone-200 bg-white p-5 shadow-2xl animate-in zoom-in-95">
-            <div className="flex items-center justify-between border-b border-stone-100 pb-2.5">
-              <h3 className="text-sm font-black text-stone-900">
-                Observação: {activeItemForNotes.product.name}
-              </h3>
-              <button onClick={() => setActiveItemForNotes(null)} className="text-stone-400">
-                <X className="h-4 w-4" />
-              </button>
+          <div className="w-full max-w-md rounded-3xl border border-rose-200 bg-white p-6 shadow-2xl space-y-4">
+            <div className="flex items-center gap-3">
+              <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-rose-100 text-rose-700">
+                <AlertTriangle className="h-6 w-6" />
+              </div>
+              <div>
+                <h3 className="text-base font-black text-stone-900">
+                  Cancelar Pedido #{cancellingOrder.orderNumber}
+                </h3>
+                <p className="text-xs text-stone-500">
+                  O estoque dos produtos será estornado automaticamente.
+                </p>
+              </div>
             </div>
 
-            <div className="mt-3 space-y-3">
+            <form onSubmit={handleConfirmCancelOrder} className="space-y-3">
               <div>
-                <label className="block text-xs font-bold text-stone-700">Quantidade</label>
-                <div className="mt-1 flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setActiveItemForNotes((prev) =>
-                        prev ? { ...prev, quantity: Math.max(1, prev.quantity - 1) } : null
-                      )
-                    }
-                    className="rounded-lg border border-stone-200 p-2 text-stone-700"
-                  >
-                    <Minus className="h-3.5 w-3.5" />
-                  </button>
-                  <span className="w-8 text-center text-sm font-black">
-                    {activeItemForNotes.quantity}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setActiveItemForNotes((prev) => (prev ? { ...prev, quantity: prev.quantity + 1 } : null))
-                    }
-                    className="rounded-lg border border-stone-200 p-2 text-stone-700"
-                  >
-                    <Plus className="h-3.5 w-3.5" />
-                  </button>
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-xs font-bold text-stone-700">Observação / Instrução</label>
+                <label className="block text-xs font-bold text-stone-700">
+                  Motivo do Cancelamento *
+                </label>
                 <input
                   type="text"
-                  placeholder="Ex: Sem cebola, gelo e limão..."
-                  value={activeItemForNotes.notes}
-                  onChange={(e) =>
-                    setActiveItemForNotes((prev) => (prev ? { ...prev, notes: e.target.value } : null))
-                  }
-                  className="mt-1 w-full rounded-xl border border-stone-200 px-3 py-2 text-xs font-bold text-stone-900 focus:outline-none"
+                  required
+                  placeholder="Ex: Lançamento em duplicidade / desistência do cliente"
+                  value={cancelReason}
+                  onChange={(e) => setCancelReason(e.target.value)}
+                  className="mt-1 w-full min-h-[44px] rounded-xl border border-stone-200 px-3 text-xs text-stone-900"
                 />
               </div>
 
-              <button
-                type="button"
-                onClick={() =>
-                  handleAddToCart(
-                    activeItemForNotes.product,
-                    activeItemForNotes.notes,
-                    activeItemForNotes.quantity
-                  )
-                }
-                className="w-full rounded-xl bg-amber-600 py-2.5 text-xs font-black uppercase text-white hover:bg-amber-700"
-              >
-                Confirmar e Adicionar
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Modal de Histórico de Vendas Recentes */}
-      {isHistoryModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-900/60 p-4 backdrop-blur-xs">
-          <div className="w-full max-w-xl rounded-2xl border border-stone-200 bg-white p-5 shadow-2xl max-h-[85vh] overflow-y-auto">
-            <div className="flex items-center justify-between border-b border-stone-100 pb-3">
-              <h3 className="text-sm font-black text-stone-900">Vendas Recentes no Estabelecimento</h3>
-              <button onClick={() => setIsHistoryModalOpen(false)} className="text-stone-400">
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-
-            <div className="mt-3 divide-y divide-stone-100">
-              {getOrders(currentTenant.id).slice(0, 8).map((ord) => (
-                <div key={ord.id} className="py-2.5 flex items-center justify-between text-xs">
-                  <div>
-                    <span className="font-bold text-stone-900">#{ord.orderNumber}</span> •{' '}
-                    <span className="text-stone-500">
-                      {ord.type === 'table'
-                        ? `Mesa #${ord.tableNumber}`
-                        : ord.type === 'comanda'
-                        ? `Comanda #${ord.comandaNumber}`
-                        : 'Balcão'}
-                    </span>
-                    <p className="text-[10px] text-stone-400">
-                      {formatTimeBR(ord.createdAt)} • {ord.waiterName} • {ord.items.length} itens
-                    </p>
-                  </div>
-                  <span className="font-black text-stone-900">{formatBRL(ord.total)}</span>
-                </div>
-              ))}
-            </div>
+              <div className="flex gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setCancellingOrder(null)}
+                  className="w-1/2 min-h-[44px] rounded-xl border border-stone-200 text-xs font-bold text-stone-700"
+                >
+                  Voltar
+                </button>
+                <button
+                  type="submit"
+                  className="w-1/2 min-h-[44px] rounded-xl bg-rose-600 text-xs font-bold text-white hover:bg-rose-700"
+                >
+                  Confirmar Cancelamento
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

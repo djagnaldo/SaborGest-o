@@ -3,705 +3,932 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from 'react';
-import {
-  Server,
-  Wifi,
-  Smartphone,
-  Monitor,
-  ShieldCheck,
-  QrCode,
-  Download,
-  CheckCircle2,
-  XCircle,
-  Ban,
-  RefreshCw,
-  Copy,
-  KeyRound,
-  HardDrive,
-  Users2,
-  Clock,
-  Radio,
-  FileCode,
-  AlertTriangle,
-  Play,
-  Pause,
-  ExternalLink,
-  ArrowRightLeft,
-  ShieldAlert,
-  Database,
-  Lock,
-} from 'lucide-react';
-import { useTenant } from '../../contexts/TenantContext';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useAuth } from '../../contexts/AuthContext';
+import { useTenant } from '../../contexts/TenantContext';
 import {
-  ConnectedDevice,
-  DeviceStatus,
-  LocalServerConfig,
-  DatabaseBackupMetadata,
-  MatrizInfo,
-  MatrizHost,
-  getLocalServerConfig,
-  updateLocalServerConfig,
-  getConnectedDevices,
-  updateDeviceStatus,
-  removeDevice,
-  generateLocalBackup,
-  getLocalBackups,
-  registerNewDevice,
-  getMatrizInfo,
-  migrateMatriz,
-} from '../../services/local-db';
-import { formatDateTimeBR } from '../../utils/formatters';
+  Wifi,
+  WifiOff,
+  Copy,
+  Check,
+  QrCode,
+  KeyRound,
+  ShieldCheck,
+  UserCheck,
+  RefreshCw,
+  Trash2,
+  Power,
+  MonitorSmartphone,
+  Clock,
+  AlertCircle,
+  ExternalLink,
+  Smartphone,
+  BatteryCharging,
+} from 'lucide-react';
+import {
+  fetchWebAccessStatus,
+  toggleWebAccessServer,
+  generateWebAccessKey,
+  renewWebAccessKey,
+  revokeWebAccessKey,
+  disconnectWebSession,
+  fetchQrDataUrl,
+  startAndroidHostServer,
+  stopAndroidHostServer,
+  refreshNativeServerStatus,
+  getSavedNativeServerPort,
+  saveNativeServerPort,
+} from '../../services/sync-client';
+import {
+  isAndroidNativeHost,
+  requestNativeBatteryExemption,
+  type NativeServerStatus,
+} from '../../services/native-server';
+import { collectSyncableState } from '../../services/storage';
+import type { WebAccessStatusResponse, WebAccessMode } from '../../types';
 
-interface LocalServerManagerProps {
-  onSimulateDeviceSwitch?: (deviceType: 'android_adm' | 'windows_pc' | 'android_seller') => void;
-}
-
-export const LocalServerManager: React.FC<LocalServerManagerProps> = ({ onSimulateDeviceSwitch }) => {
+export const LocalServerManager: React.FC = () => {
   const { currentTenant } = useTenant();
-  const { currentUser } = useAuth();
+  const { currentUser, users, isAdm, wsConnected } = useAuth();
 
-  const [config, setConfig] = useState<LocalServerConfig>(getLocalServerConfig());
-  const [matriz, setMatriz] = useState<MatrizInfo>(getMatrizInfo());
-  const [devices, setDevices] = useState<ConnectedDevice[]>(getConnectedDevices());
-  const [backups, setBackups] = useState<DatabaseBackupMetadata[]>(getLocalBackups());
-  const [copiedToken, setCopiedToken] = useState(false);
-  const [showQrModal, setShowQrModal] = useState(false);
-  const [showMigrationModal, setShowMigrationModal] = useState(false);
-  const [migrationFeedback, setMigrationFeedback] = useState<string | null>(null);
+  const isAndroidHost = isAndroidNativeHost();
+  const [nativeStatus, setNativeStatus] = useState<NativeServerStatus | null>(null);
+  const [configuredPort, setConfiguredPort] = useState<number>(() => getSavedNativeServerPort());
+  const [status, setStatus] = useState<WebAccessStatusResponse | null>(null);
+  const [qrDataUrl, setQrDataUrl] = useState<string>('');
+  const [selectedUrl, setSelectedUrl] = useState<string>('');
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
-  const [newSellerEmail, setNewSellerEmail] = useState('');
-  const [newSellerName, setNewSellerName] = useState('');
-  const [newSellerDeviceName, setNewSellerDeviceName] = useState('');
+  const [newKeyMode, setNewKeyMode] = useState<WebAccessMode>('seller');
+  const [selectedSellerId, setSelectedSellerId] = useState<string>('');
+  const [expiresInHours, setExpiresInHours] = useState<number>(24);
+  const [generatedPlainKey, setGeneratedPlainKey] = useState<{
+    plainKey: string;
+    mode: WebAccessMode;
+    userName: string;
+  } | null>(null);
+  const [busyAction, setBusyAction] = useState<string | null>(null);
 
-  const refreshData = () => {
-    setConfig(getLocalServerConfig());
-    setMatriz(getMatrizInfo());
-    setDevices(getConnectedDevices());
-    setBackups(getLocalBackups());
-  };
+  const sellers = users.filter((u) => u.role !== 'admin');
 
   useEffect(() => {
-    const handleSync = () => refreshData();
-    window.addEventListener('sabor_local_sync', handleSync);
-    return () => window.removeEventListener('sabor_local_sync', handleSync);
-  }, []);
+    if (!selectedSellerId && sellers.length > 0) {
+      const firstAuth = sellers.find((s) => s.canSell !== false && s.status !== 'bloqueado');
+      setSelectedSellerId((firstAuth || sellers[0]).id);
+    }
+  }, [sellers, selectedSellerId]);
 
-  const handleToggleServer = () => {
-    const updated = updateLocalServerConfig({ isServerRunning: !config.isServerRunning });
-    setConfig(updated);
+  const loadStatus = useCallback(async () => {
+    if (!currentTenant?.id || !isAdm) return;
+    try {
+      setError(null);
+      if (isAndroidHost) {
+        const nStatus = await refreshNativeServerStatus();
+        setNativeStatus(nStatus);
+        if (nStatus && !nStatus.running) {
+          // Nunca mostra servidor ativo quando o Foreground Service Android está parado
+          setStatus(null);
+          setQrDataUrl('');
+          setLoading(false);
+          return;
+        }
+        if (nStatus?.port) {
+          setConfiguredPort(nStatus.port);
+        }
+      }
+
+      const data = await fetchWebAccessStatus(currentTenant.id, currentUser?.id);
+      setStatus(data);
+      const defaultUrl =
+        selectedUrl && data.urls.includes(selectedUrl)
+          ? selectedUrl
+          : data.urls[0] || `${window.location.origin}/?portal=web`;
+      setSelectedUrl(defaultUrl);
+
+      const qr = await fetchQrDataUrl(defaultUrl, currentUser?.id);
+      setQrDataUrl(qr);
+    } catch (err: any) {
+      const msg = String(err?.message || '');
+      if (msg.startsWith('NATIVE_SERVER_STOPPED:')) {
+        setStatus(null);
+        setQrDataUrl('');
+      } else {
+        setError(msg || 'Não foi possível consultar o servidor de Acesso Web.');
+      }
+    } finally {
+      setLoading(false);
+    }
+  }, [currentTenant?.id, currentUser?.id, isAdm, isAndroidHost, selectedUrl]);
+
+  useEffect(() => {
+    loadStatus();
+    const timer = setInterval(loadStatus, 5000);
+    const onSync = () => loadStatus();
+    const onNativeChange = (e: Event) => {
+      const detail = (e as CustomEvent<NativeServerStatus | null>).detail;
+      setNativeStatus(detail);
+      loadStatus();
+    };
+    window.addEventListener('sabor_local_sync', onSync);
+    window.addEventListener('sabor_native_server_status', onNativeChange);
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener('sabor_local_sync', onSync);
+      window.removeEventListener('sabor_native_server_status', onNativeChange);
+    };
+  }, [loadStatus]);
+
+  const handleCopy = (text: string, id: string) => {
+    navigator.clipboard.writeText(text).catch(() => {});
+    setCopiedKey(id);
+    setTimeout(() => setCopiedKey(null), 2200);
   };
 
-  const handleAuthorizeDevice = (deviceId: string) => {
-    updateDeviceStatus(deviceId, 'authorized');
-    refreshData();
-  };
-
-  const handleBlockDevice = (deviceId: string) => {
-    updateDeviceStatus(deviceId, 'blocked');
-    refreshData();
-  };
-
-  const handleRevokeDevice = (deviceId: string) => {
-    updateDeviceStatus(deviceId, 'revoked');
-    refreshData();
-  };
-
-  const handleCopyPairingCode = () => {
-    const pairingPayload = `sabor://${config.serverIp}:${config.port}?token=${config.serverToken}`;
-    navigator.clipboard.writeText(pairingPayload);
-    setCopiedToken(true);
-    setTimeout(() => setCopiedToken(false), 2500);
-  };
-
-  const handleDownloadBackup = () => {
-    const { jsonContent, metadata } = generateLocalBackup(currentTenant.id);
-    const blob = new Blob([jsonContent], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = metadata.filename;
-    a.click();
-    URL.revokeObjectURL(url);
-    refreshData();
-  };
-
-  // Executa migração controlada da Matriz (Celular <-> PC Windows)
-  const handleExecuteMigration = (targetHost: MatrizHost) => {
-    const targetName = targetHost === 'windows_pc'
-      ? 'Computador Windows do Administrador (Dell Core i7)'
-      : 'Celular Android do Administrador (Samsung Galaxy S23)';
-    const targetIp = targetHost === 'windows_pc' ? '192.168.43.104' : '192.168.43.1';
-
-    const result = migrateMatriz(
-      targetHost,
-      targetName,
-      targetIp,
-      currentUser?.name || 'Carlos Oliveira (Administrador)'
-    );
-
-    if (result.success) {
-      setMigrationFeedback(
-        `✓ ${result.message} Checksum de Integridade: ${result.checksum}. Total de tabelas migradas: ${result.recordCount}.`
-      );
-      refreshData();
-      setTimeout(() => setShowMigrationModal(false), 3000);
+  const handlePortChange = (rawVal: string) => {
+    const parsed = parseInt(rawVal.replace(/\D/g, ''), 10);
+    if (!Number.isNaN(parsed)) {
+      setConfiguredPort(parsed);
+      if (parsed >= 1024 && parsed <= 65535) {
+        saveNativeServerPort(parsed);
+      }
     } else {
-      alert(result.message);
+      setConfiguredPort(3000);
     }
   };
 
-  const handleDownloadWindowsInstaller = () => {
-    const isPCMatriz = matriz.activeHost === 'windows_pc';
-    const batScript = `@echo off
-echo ========================================================
-echo   SABOR GESTAO - ${isPCMatriz ? 'MATRIZ ADMINISTRATIVA' : 'TERMINAL BALCAO'} WINDOWS
-echo ========================================================
-echo.
-echo Conectando ao Banco Local SQLite do Estabelecimento:
-echo Host da Matriz: ${matriz.activeHostLabel}
-echo IP de Acesso:  ${config.serverIp}
-echo Porta Local:   ${config.port}
-echo Token Mestre:  ${matriz.masterCryptographicToken.substring(0, 16)}...
-echo.
-echo Verificando conectividade na rede local Wi-Fi / Hotspot...
-ping -n 1 ${config.serverIp} >nul
-if %errorlevel% neq 0 (
-  echo AVISO: Nao foi possivel comunicar com o IP ${config.serverIp}.
-  echo Certifique-se de que o PC esta conectado no mesmo Wi-Fi ou Hotspot da Matriz!
-) else (
-  echo SUCESSO: Comunicacao com a Matriz ativa estabelecida!
-)
-echo.
-echo Criando atalho no Desktop do Windows...
-echo [InternetShortcut] > "%USERPROFILE%\\Desktop\\SaborGestao_${isPCMatriz ? 'Matriz' : 'Terminal'}.url"
-echo URL=http://${config.serverIp}:${config.port} >> "%USERPROFILE%\\Desktop\\SaborGestao_${isPCMatriz ? 'Matriz' : 'Terminal'}.url"
-echo.
-echo Instalacao concluida com sucesso!
-echo Abra o atalho na sua Area de Trabalho.
-pause
-`;
-    const blob = new Blob([batScript], { type: 'text/plain' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `Instalar_SaborGestao_${isPCMatriz ? 'Matriz' : 'Terminal'}_Windows.bat`;
-    a.click();
-    URL.revokeObjectURL(url);
+  const handleStartNativeServer = async () => {
+    if (!currentTenant?.id) return;
+    if (configuredPort < 1024 || configuredPort > 65535) {
+      setError('Informe uma porta válida entre 1024 e 65535 (recomendado: 3000 ou 8080).');
+      return;
+    }
+    setBusyAction('native_power');
+    setError(null);
+    try {
+      const nStatus = await startAndroidHostServer({
+        port: configuredPort,
+        tenantId: currentTenant.id,
+        userId: currentUser?.id,
+        seedSnapshot: collectSyncableState(),
+      });
+      setNativeStatus(nStatus);
+      await loadStatus();
+    } catch (err: any) {
+      setError(err?.message || 'Falha ao iniciar o servidor web nativo no Android.');
+    } finally {
+      setBusyAction(null);
+    }
   };
 
-  const handleSimulateNewRequest = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!newSellerEmail || !newSellerName) return;
-
-    registerNewDevice({
-      deviceName: newSellerDeviceName || `Android (${newSellerName})`,
-      deviceType: 'android_seller',
-      ipAddress: `192.168.43.${Math.floor(Math.random() * 100 + 100)}`,
-      userEmail: newSellerEmail,
-      userName: newSellerName,
-      role: 'waiter',
-      status: 'pending',
-      authToken: 'tok-req-' + Math.random().toString(36).substring(2, 8),
-      appVersion: '2.4.0-localfirst',
-      isOnline: true,
-    });
-
-    setNewSellerEmail('');
-    setNewSellerName('');
-    setNewSellerDeviceName('');
-    refreshData();
+  const handleStopNativeServer = async () => {
+    setBusyAction('native_power');
+    setError(null);
+    try {
+      const nStatus = await stopAndroidHostServer();
+      setNativeStatus(nStatus);
+      setStatus(null);
+      setQrDataUrl('');
+    } catch (err: any) {
+      setError(err?.message || 'Falha ao parar o servidor nativo Android.');
+    } finally {
+      setBusyAction(null);
+    }
   };
 
-  const pendingDevices = devices.filter((d) => d.status === 'pending');
-  const authorizedDevices = devices.filter((d) => d.status === 'authorized');
+  const handleBatteryExemption = async () => {
+    try {
+      await requestNativeBatteryExemption();
+      const updated = await refreshNativeServerStatus();
+      setNativeStatus(updated);
+    } catch (err: any) {
+      setError(err?.message || 'Não foi possível abrir configurações de bateria.');
+    }
+  };
+
+  const handleToggleWebAccess = async () => {
+    if (!status || !currentTenant?.id) return;
+    setBusyAction('toggle');
+    try {
+      await toggleWebAccessServer(!status.webAccessEnabled, currentTenant.id, currentUser?.id);
+      await loadStatus();
+    } catch (err: any) {
+      setError(err?.message || 'Erro ao alterar acesso pelo navegador.');
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleCreateKey = async () => {
+    if (!currentTenant?.id) return;
+    setBusyAction('create_key');
+    setError(null);
+    try {
+      const res = await generateWebAccessKey({
+        tenantId: currentTenant.id,
+        mode: newKeyMode,
+        userId: newKeyMode === 'seller' ? selectedSellerId : currentUser?.id,
+        expiresInHours,
+        activeUserId: currentUser?.id,
+      });
+      setGeneratedPlainKey({
+        plainKey: res.plainKey,
+        mode: res.keySummary.mode,
+        userName: res.keySummary.userName,
+      });
+      await loadStatus();
+    } catch (err: any) {
+      setError(err?.message || 'Erro ao gerar chave de acesso.');
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleRenewKey = async (keyId: string) => {
+    setBusyAction(`renew_${keyId}`);
+    setError(null);
+    try {
+      const res = await renewWebAccessKey(keyId, 24, currentUser?.id);
+      setGeneratedPlainKey({
+        plainKey: res.plainKey,
+        mode: res.keySummary.mode,
+        userName: res.keySummary.userName,
+      });
+      await loadStatus();
+    } catch (err: any) {
+      setError(err?.message || 'Erro ao renovar chave.');
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleRevokeKey = async (keyId: string) => {
+    setBusyAction(`revoke_${keyId}`);
+    setError(null);
+    try {
+      await revokeWebAccessKey(keyId, currentUser?.id);
+      await loadStatus();
+    } catch (err: any) {
+      setError(err?.message || 'Erro ao revogar chave.');
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleDisconnectSession = async (sessionId: string) => {
+    setBusyAction(`disc_${sessionId}`);
+    setError(null);
+    try {
+      await disconnectWebSession(sessionId, currentUser?.id);
+      await loadStatus();
+    } catch (err: any) {
+      setError(err?.message || 'Erro ao desconectar dispositivo.');
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleSelectUrl = async (url: string) => {
+    setSelectedUrl(url);
+    try {
+      const qr = await fetchQrDataUrl(url, currentUser?.id);
+      setQrDataUrl(qr);
+    } catch {
+      // noop
+    }
+  };
+
+  if (!isAdm) {
+    return (
+      <div className="bg-white rounded-2xl border border-stone-200 p-8 text-center">
+        <ShieldCheck className="w-10 h-10 text-stone-400 mx-auto mb-3" />
+        <h2 className="text-lg font-bold text-stone-900">Acesso Restrito ao Administrador</h2>
+        <p className="text-sm text-stone-500 mt-1">
+          Apenas o Administrador pode iniciar o servidor local, gerar chaves e desconectar dispositivos.
+        </p>
+      </div>
+    );
+  }
+
+  const nativeRunning = isAndroidHost ? Boolean(nativeStatus?.running) : Boolean(status);
+  const isNetworkActive = nativeRunning && Boolean(status?.webAccessEnabled);
+  const activeKeys = (status?.keys || []).filter((k) => !k.revoked);
+  const browserOriginUrl = `${typeof window !== 'undefined' ? window.location.origin : ''}/?portal=web`;
+  const effectiveQrUrl = selectedUrl || status?.urls?.[0] || browserOriginUrl;
 
   return (
     <div className="space-y-6">
-      {/* CARD PRINCIPAL: MATRIZ ADMINISTRATIVA & AUTORIDADE ÚNICA */}
-      <div className="relative overflow-hidden rounded-3xl bg-gradient-to-br from-stone-900 via-stone-800 to-amber-950 p-6 sm:p-8 text-white shadow-xl">
-        <div className="relative z-10">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="inline-flex items-center gap-2 rounded-full bg-emerald-500/20 px-3 py-1 text-xs font-semibold text-emerald-300 border border-emerald-500/30">
-              <Radio className="h-3.5 w-3.5 animate-pulse text-emerald-400" />
-              <span>MATRIZ ADMINISTRATIVA ATIVA • AUTORIDADE ÚNICA DOS DADOS</span>
-            </div>
-
-            <div className="flex items-center gap-2">
-              <button
-                onClick={handleToggleServer}
-                className={`flex items-center gap-2 rounded-xl px-3.5 py-1.5 text-xs font-bold transition shadow-sm ${
-                  config.isServerRunning
-                    ? 'bg-emerald-600 text-white hover:bg-emerald-500'
-                    : 'bg-rose-600 text-white hover:bg-rose-500'
+      {/* Header + Server Service Control */}
+      <div className="bg-white rounded-2xl border border-stone-200 p-5 sm:p-6 shadow-xs">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+          <div>
+            <div className="flex items-center gap-2.5 flex-wrap">
+              <h1 className="text-xl sm:text-2xl font-extrabold text-stone-900 tracking-tight">
+                {isAndroidHost ? 'Servidor Nativo no Celular (ADM)' : 'Acesso pelo Navegador'}
+              </h1>
+              <span
+                className={`text-xs font-bold px-2.5 py-1 rounded-lg ${
+                  isAndroidHost
+                    ? nativeRunning
+                      ? isNetworkActive
+                        ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                        : 'bg-amber-50 text-amber-800 border border-amber-200'
+                      : 'bg-rose-50 text-rose-700 border border-rose-200'
+                    : isNetworkActive
+                      ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                      : 'bg-stone-100 text-stone-600 border border-stone-200'
                 }`}
               >
-                {config.isServerRunning ? (
+                {isAndroidHost
+                  ? nativeRunning
+                    ? isNetworkActive
+                      ? 'Serviço Ativo na Rede Wi-Fi'
+                      : 'Serviço Ligado (Login Web Pausado)'
+                    : 'Servidor Nativo Parado'
+                  : status
+                    ? status.webAccessEnabled
+                      ? 'Ativo na Rede'
+                      : 'Acesso Web Desativado'
+                    : 'Servidor Indisponível'}
+              </span>
+              {nativeRunning && (
+                <span className="text-xs font-medium text-stone-500 tabular-nums">
+                  WS: {wsConnected ? 'Conectado' : 'Reconectando'} • Rev #{status?.revision ?? nativeStatus?.revision ?? 0}
+                </span>
+              )}
+            </div>
+            <p className="text-sm text-stone-500 mt-1">
+              {isAndroidHost
+                ? 'Este aparelho Android atua como servidor HTTP e WebSocket principal da rede Wi-Fi, sem depender de computador externo.'
+                : 'Conecte notebooks, tablets ou celulares pelo navegador em Modo Administrador ou Modo Vendedor com sincronização em tempo real.'}
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+            <button
+              type="button"
+              onClick={loadStatus}
+              className="min-h-[44px] px-3.5 rounded-xl border border-stone-200 bg-stone-50 hover:bg-stone-100 text-stone-700 text-sm font-semibold flex items-center gap-2 cursor-pointer"
+            >
+              <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
+              Atualizar
+            </button>
+
+            {isAndroidHost ? (
+              <>
+                {nativeRunning ? (
                   <>
-                    <Pause className="h-3.5 w-3.5" /> Matriz Operando
+                    <button
+                      type="button"
+                      onClick={handleToggleWebAccess}
+                      disabled={busyAction === 'toggle'}
+                      className="min-h-[44px] px-4 rounded-xl border border-stone-300 bg-white hover:bg-stone-50 text-stone-800 text-sm font-semibold cursor-pointer"
+                    >
+                      {status?.webAccessEnabled ? 'Pausar Login Web' : 'Liberar Login Web'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleStopNativeServer}
+                      disabled={busyAction === 'native_power'}
+                      className="min-h-[44px] px-5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white text-sm font-bold flex items-center gap-2 transition-colors cursor-pointer"
+                    >
+                      <Power className="w-4 h-4" />
+                      {busyAction === 'native_power' ? 'Parando...' : 'Parar Servidor'}
+                    </button>
                   </>
                 ) : (
-                  <>
-                    <Play className="h-3.5 w-3.5" /> Iniciar Matriz
-                  </>
+                  <button
+                    type="button"
+                    onClick={handleStartNativeServer}
+                    disabled={busyAction === 'native_power'}
+                    className="min-h-[44px] px-5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-bold flex items-center gap-2 transition-colors cursor-pointer"
+                  >
+                    <Power className="w-4 h-4" />
+                    {busyAction === 'native_power' ? 'Iniciando Serviço...' : 'Iniciar Servidor Nativo'}
+                  </button>
                 )}
-              </button>
-            </div>
+              </>
+            ) : (
+              status && (
+                <button
+                  type="button"
+                  onClick={handleToggleWebAccess}
+                  disabled={busyAction === 'toggle'}
+                  className={`min-h-[44px] px-5 rounded-xl text-sm font-bold flex items-center gap-2 transition-colors cursor-pointer ${
+                    status.webAccessEnabled
+                      ? 'bg-rose-600 hover:bg-rose-700 text-white'
+                      : 'bg-emerald-600 hover:bg-emerald-700 text-white'
+                  }`}
+                >
+                  <Power className="w-4 h-4" />
+                  {status.webAccessEnabled ? 'Desativar Acesso Web' : 'Ativar Acesso Web'}
+                </button>
+              )
+            )}
           </div>
+        </div>
 
-          {/* Identificação da Matriz Ativa */}
-          <div className="mt-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
-            <div>
-              <div className="flex items-center gap-2.5">
-                <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-amber-500/20 text-amber-300 border border-amber-500/30">
-                  {matriz.activeHost === 'android_phone' ? (
-                    <Smartphone className="h-6 w-6" />
-                  ) : (
-                    <Monitor className="h-6 w-6" />
-                  )}
-                </div>
-                <div>
-                  <h1 className="text-xl sm:text-2xl font-black text-white">
-                    {matriz.activeHostLabel}
-                  </h1>
-                  <p className="text-xs text-amber-300 font-medium">
-                    {matriz.hostDeviceName} • IP Local: <strong>{matriz.ipAddress}:{matriz.port}</strong>
-                  </p>
-                </div>
+        {/* Android Foreground Service Port & Battery Settings Bar */}
+        {isAndroidHost && (
+          <div className="mt-4 pt-4 border-t border-stone-200 flex flex-col md:flex-row md:items-center justify-between gap-3">
+            <div className="flex items-center gap-3 flex-wrap">
+              <div className="flex items-center gap-2 text-xs font-semibold text-stone-700">
+                <Smartphone className="w-4 h-4 text-amber-600" />
+                <span>Porta do Servidor HTTP/WS:</span>
               </div>
-
-              <p className="mt-3 text-xs sm:text-sm text-stone-300 max-w-2xl leading-relaxed">
-                Regra Fundamental de Integridade: Somente um dispositivo pode ser a matriz ativa de cada estabelecimento.
-                A matriz detém autoridade central sobre produtos, preços, estoque, clientes e cancelamentos.
-                Celulares de vendedores funcionam exclusivamente como terminais autorizados.
-              </p>
+              <input
+                type="number"
+                min={1024}
+                max={65535}
+                value={configuredPort}
+                disabled={nativeRunning}
+                onChange={(e) => handlePortChange(e.target.value)}
+                className="w-28 min-h-[40px] px-3 rounded-xl border border-stone-300 bg-stone-50 disabled:opacity-60 font-mono text-sm font-bold text-stone-900 tabular-nums"
+              />
+              {nativeRunning && (
+                <span className="text-xs text-stone-500">
+                  Para alterar a porta, pare o servidor primeiro.
+                </span>
+              )}
             </div>
 
-            {/* BOTÃO DE MIGRAÇÃO CONTROLADA */}
-            <button
-              onClick={() => setShowMigrationModal(true)}
-              className="flex items-center gap-2 rounded-2xl bg-gradient-to-r from-amber-600 to-amber-700 px-4 py-3 text-xs font-black uppercase text-white shadow-lg hover:from-amber-500 hover:to-amber-600 transition shrink-0 border border-amber-400/30 active:scale-98"
-            >
-              <ArrowRightLeft className="h-4 w-4" />
-              <span>
-                {matriz.activeHost === 'android_phone'
-                  ? 'Migrar Matriz para PC Windows'
-                  : 'Migrar Matriz para Celular Android'}
+            <div className="flex items-center gap-2.5 flex-wrap">
+              <span
+                className={`text-xs font-semibold px-2.5 py-1.5 rounded-lg border ${
+                  nativeStatus?.batteryOptimizationIgnored
+                    ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                    : 'bg-amber-50 text-amber-800 border-amber-200'
+                }`}
+              >
+                {nativeStatus?.batteryOptimizationIgnored
+                  ? 'Bateria: Execução contínua liberada'
+                  : 'Bateria: Otimização Android ativa (pode suspender em tela apagada)'}
               </span>
-            </button>
-          </div>
-
-          {/* Indicadores Técnicos da Matriz */}
-          <div className="mt-5 grid grid-cols-2 gap-3 sm:grid-cols-4">
-            <div className="rounded-xl bg-white/10 p-3 backdrop-blur-md border border-white/10">
-              <span className="text-[10px] text-stone-300 uppercase font-semibold">Autoridade Ativa</span>
-              <p className="mt-0.5 text-xs font-bold text-emerald-400 truncate">
-                {matriz.activeHost === 'android_phone' ? 'Celular Administrador' : 'Computador Windows'}
-              </p>
-            </div>
-
-            <div className="rounded-xl bg-white/10 p-3 backdrop-blur-md border border-white/10">
-              <span className="text-[10px] text-stone-300 uppercase font-semibold">Banco de Dados SQLite</span>
-              <p className="mt-0.5 text-xs font-mono font-bold text-amber-300">
-                v{matriz.databaseVersion} • Criptografado
-              </p>
-            </div>
-
-            <div className="rounded-xl bg-white/10 p-3 backdrop-blur-md border border-white/10">
-              <span className="text-[10px] text-stone-300 uppercase font-semibold">Rede Wi-Fi / Hotspot</span>
-              <p className="mt-0.5 text-xs font-bold text-white truncate">{config.hotspotSsid}</p>
-            </div>
-
-            <div className="rounded-xl bg-white/10 p-3 backdrop-blur-md border border-white/10">
-              <span className="text-[10px] text-stone-300 uppercase font-semibold">Terminais Pareados</span>
-              <p className="mt-0.5 text-xs font-bold text-emerald-400">
-                {authorizedDevices.length} autorizados
-              </p>
-            </div>
-          </div>
-
-          {/* Ações de Pareamento Rápido */}
-          <div className="mt-5 flex flex-wrap items-center gap-2.5">
-            <button
-              onClick={() => setShowQrModal(true)}
-              className="inline-flex items-center gap-2 rounded-xl bg-amber-600 px-4 py-2.5 text-xs font-bold text-white shadow-md hover:bg-amber-500 transition"
-            >
-              <QrCode className="h-4 w-4" />
-              QR Code de Pareamento dos Terminais
-            </button>
-
-            <button
-              onClick={handleCopyPairingCode}
-              className="inline-flex items-center gap-2 rounded-xl bg-white/10 px-4 py-2.5 text-xs font-bold text-white backdrop-blur-md hover:bg-white/20 transition border border-white/10"
-            >
-              <Copy className="h-4 w-4 text-amber-400" />
-              {copiedToken ? 'Código Copiado!' : 'Copiar Token de Conexão'}
-            </button>
-
-            <button
-              onClick={handleDownloadWindowsInstaller}
-              className="inline-flex items-center gap-2 rounded-xl bg-white/10 px-4 py-2.5 text-xs font-bold text-white backdrop-blur-md hover:bg-white/20 transition border border-white/10"
-            >
-              <Download className="h-4 w-4 text-emerald-400" />
-              Baixar Instalador Windows (.bat)
-            </button>
-
-            <button
-              onClick={handleDownloadBackup}
-              className="inline-flex items-center gap-2 rounded-xl bg-white/10 px-4 py-2.5 text-xs font-bold text-white backdrop-blur-md hover:bg-white/20 transition border border-white/10"
-            >
-              <HardDrive className="h-4 w-4 text-amber-400" />
-              Exportar Backup SQLite (Criptografado)
-            </button>
-          </div>
-        </div>
-      </div>
-
-      {/* Dispositivos Aguardando Autorização (Aprovação Obrigatória pelo ADM) */}
-      {pendingDevices.length > 0 && (
-        <div className="rounded-2xl border-2 border-amber-300 bg-amber-50/80 p-5 shadow-sm space-y-3">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2 text-amber-900">
-              <AlertTriangle className="h-5 w-5 text-amber-600" />
-              <h3 className="font-bold text-sm">
-                Solicitações de Acesso de Terminais Pendentes ({pendingDevices.length})
-              </h3>
-            </div>
-            <span className="text-[11px] font-semibold text-amber-800">
-              Autorização exclusiva da Matriz
-            </span>
-          </div>
-
-          <p className="text-xs text-amber-950 leading-relaxed">
-            Novos funcionários que cadastraram seu e-mail pelo aplicativo do vendedor aguardam sua autorização
-            para receber dados e registrar pedidos:
-          </p>
-
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            {pendingDevices.map((dev) => (
-              <div
-                key={dev.id}
-                className="flex items-center justify-between rounded-xl border border-amber-200 bg-white p-3.5 shadow-xs"
-              >
-                <div>
-                  <div className="flex items-center gap-2">
-                    <span className="font-bold text-stone-900 text-xs">{dev.userName || dev.userEmail}</span>
-                    <span className="rounded bg-amber-100 px-1.5 py-0.2 text-[9px] font-bold text-amber-800">
-                      Pendente
-                    </span>
-                  </div>
-                  <p className="text-[11px] text-stone-500">{dev.userEmail} • IP: {dev.ipAddress}</p>
-                  <p className="text-[10px] text-stone-400">Dispositivo: {dev.deviceName}</p>
-                </div>
-
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => handleAuthorizeDevice(dev.id)}
-                    className="flex items-center gap-1 rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-bold text-white hover:bg-emerald-700 transition"
-                  >
-                    <CheckCircle2 className="h-3.5 w-3.5" />
-                    Aprovar
-                  </button>
-                  <button
-                    onClick={() => handleBlockDevice(dev.id)}
-                    className="rounded-lg p-1.5 text-stone-400 hover:bg-rose-50 hover:text-rose-600"
-                    title="Rejeitar Solicitação"
-                  >
-                    <XCircle className="h-4 w-4" />
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Grid: Terminais Autorizados + Histórico de Migrações da Matriz */}
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
-        {/* Lado Esquerdo: Lista de Terminais Autorizados (7 colunas) */}
-        <div className="space-y-4 lg:col-span-7">
-          <div className="rounded-2xl border border-stone-200 bg-white p-5 shadow-2xs">
-            <div className="flex items-center justify-between border-b border-stone-100 pb-3">
-              <div className="flex items-center gap-2">
-                <ShieldCheck className="h-4 w-4 text-emerald-600" />
-                <h3 className="text-xs font-bold uppercase tracking-wider text-stone-700">
-                  Terminais Conectados à Matriz ({authorizedDevices.length})
-                </h3>
-              </div>
-              <button
-                onClick={refreshData}
-                className="flex items-center gap-1 text-xs text-stone-500 hover:text-stone-800"
-              >
-                <RefreshCw className="h-3.5 w-3.5" /> Atualizar
-              </button>
-            </div>
-
-            <div className="mt-3 divide-y divide-stone-100">
-              {authorizedDevices.map((dev) => {
-                const isMasterDevice =
-                  (matriz.activeHost === 'android_phone' && dev.deviceType === 'android_adm') ||
-                  (matriz.activeHost === 'windows_pc' && dev.deviceType === 'windows_pc');
-
-                return (
-                  <div key={dev.id} className="flex items-center justify-between py-3">
-                    <div className="flex items-center gap-3">
-                      <div
-                        className={`flex h-9 w-9 items-center justify-center rounded-xl text-white font-bold text-xs ${
-                          isMasterDevice
-                            ? 'bg-amber-600 shadow-sm'
-                            : dev.deviceType === 'windows_pc'
-                            ? 'bg-blue-600'
-                            : 'bg-emerald-600'
-                        }`}
-                      >
-                        {dev.deviceType === 'windows_pc' ? (
-                          <Monitor className="h-4 w-4" />
-                        ) : (
-                          <Smartphone className="h-4 w-4" />
-                        )}
-                      </div>
-
-                      <div>
-                        <div className="flex items-center gap-2">
-                          <p className="text-xs font-bold text-stone-900">{dev.deviceName}</p>
-                          {isMasterDevice ? (
-                            <span className="rounded-md bg-amber-100 px-1.5 py-0.2 text-[9px] font-black text-amber-900 uppercase">
-                              MATRIZ ATIVA
-                            </span>
-                          ) : (
-                            <span className="rounded-md bg-emerald-50 px-1.5 py-0.2 text-[9px] font-semibold text-emerald-700">
-                              Terminal Autorizado
-                            </span>
-                          )}
-                        </div>
-                        <p className="text-[11px] text-stone-400">
-                          {dev.userEmail} • {dev.ipAddress} • v{dev.appVersion}
-                        </p>
-                      </div>
-                    </div>
-
-                    {!isMasterDevice && (
-                      <div className="flex items-center gap-2">
-                        <button
-                          onClick={() => handleBlockDevice(dev.id)}
-                          className="rounded-lg border border-stone-200 px-2 py-1 text-[11px] font-semibold text-stone-600 hover:bg-stone-100"
-                          title="Bloquear Terminal"
-                        >
-                          Bloquear
-                        </button>
-                        <button
-                          onClick={() => handleRevokeDevice(dev.id)}
-                          className="rounded-lg p-1 text-stone-400 hover:text-rose-600"
-                          title="Remover Permissão"
-                        >
-                          <Ban className="h-3.5 w-3.5" />
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        </div>
-
-        {/* Lado Direito: Histórico de Migrações e Integridade (5 colunas) */}
-        <div className="space-y-4 lg:col-span-5">
-          <div className="rounded-2xl border border-stone-200 bg-white p-5 shadow-2xs">
-            <div className="flex items-center gap-2 border-b border-stone-100 pb-3">
-              <Database className="h-4 w-4 text-amber-600" />
-              <h3 className="text-xs font-bold uppercase tracking-wider text-stone-700">
-                Auditoria de Migração da Matriz
-              </h3>
-            </div>
-
-            <p className="mt-2 text-xs text-stone-500 leading-relaxed">
-              Histórico rastreável de transferências de autoridade entre dispositivos com verificação de integridade SHA256:
-            </p>
-
-            <div className="mt-3 space-y-2">
-              {matriz.migrationHistory.length > 0 ? (
-                matriz.migrationHistory.map((mig) => (
-                  <div
-                    key={mig.id}
-                    className="rounded-xl border border-stone-200 bg-stone-50/70 p-3 text-xs space-y-1"
-                  >
-                    <div className="flex items-center justify-between text-stone-700 font-bold">
-                      <span>{mig.fromHost} ➔ {mig.toHost}</span>
-                      <span className="text-[10px] text-stone-400">{formatDateTimeBR(mig.timestamp)}</span>
-                    </div>
-                    <p className="text-[11px] text-stone-500">
-                      Executado por: <strong>{mig.transferredBy}</strong>
-                    </p>
-                    <p className="text-[10px] font-mono text-emerald-700 font-bold">
-                      Checksum: {mig.checksum} ({mig.totalRecords} tabelas migradas)
-                    </p>
-                  </div>
-                ))
-              ) : (
-                <div className="py-6 text-center text-xs text-stone-400 rounded-xl bg-stone-50 border border-dashed border-stone-200">
-                  <Database className="h-6 w-6 mx-auto text-stone-300 mb-1" />
-                  Nenhuma migração executada até o momento.
-                  <p className="text-[10px] text-stone-400 mt-1">A Matriz original reside no celular Android.</p>
-                </div>
+              {!nativeStatus?.batteryOptimizationIgnored && (
+                <button
+                  type="button"
+                  onClick={handleBatteryExemption}
+                  className="min-h-[38px] px-3 rounded-xl bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold flex items-center gap-1.5 cursor-pointer"
+                >
+                  <BatteryCharging className="w-4 h-4" />
+                  Manter Ativo em 2º Plano
+                </button>
               )}
             </div>
           </div>
-        </div>
+        )}
+
+        {error && (
+          <div className="mt-4 p-3.5 bg-rose-50 border border-rose-200 rounded-xl flex items-start gap-2.5 text-sm text-rose-700">
+            <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+            <span>{error}</span>
+          </div>
+        )}
       </div>
 
-      {/* MODAL DE MIGRAÇÃO CONTROLADA DA MATRIZ */}
-      {showMigrationModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-900/60 p-4 backdrop-blur-xs">
-          <div className="w-full max-w-lg rounded-3xl border border-stone-200 bg-white p-6 shadow-2xl">
-            <div className="flex items-center justify-between border-b border-stone-100 pb-3">
-              <div className="flex items-center gap-2">
-                <ArrowRightLeft className="h-5 w-5 text-amber-600" />
-                <h3 className="font-black text-stone-900 text-base">Migração da Matriz Administrativa</h3>
-              </div>
-              <button
-                onClick={() => setShowMigrationModal(false)}
-                className="rounded-lg p-1.5 text-stone-400 hover:bg-stone-100"
-              >
-                <XCircle className="h-5 w-5" />
-              </button>
+      {/* When Android Native Server is Stopped -> Honest Stopped State */}
+      {isAndroidHost && !nativeRunning ? (
+        <div className="bg-white rounded-2xl border border-stone-200 p-8 text-center space-y-4">
+          <div className="w-14 h-14 rounded-2xl bg-stone-100 border border-stone-200 flex items-center justify-center mx-auto">
+            <WifiOff className="w-7 h-7 text-stone-500" />
+          </div>
+          <div className="max-w-lg mx-auto space-y-2">
+            <h2 className="text-lg font-extrabold text-stone-900">
+              O servidor web no celular está desligado
+            </h2>
+            <p className="text-sm text-stone-600 leading-relaxed">
+              O aplicativo continua funcionando normalmente neste aparelho em modo local. Para permitir que notebooks, tablets ou celulares dos vendedores conectem na rede Wi-Fi pela porta{' '}
+              <strong className="font-mono">{configuredPort}</strong>, clique em{' '}
+              <strong>Iniciar Servidor Nativo</strong>.
+            </p>
+            {nativeStatus?.primaryIp && nativeStatus.primaryIp !== '127.0.0.1' && (
+              <p className="text-xs text-stone-500 font-mono">
+                IP Wi-Fi detectado neste dispositivo: {nativeStatus.primaryIp}
+              </p>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={handleStartNativeServer}
+            disabled={busyAction === 'native_power'}
+            className="min-h-[48px] px-6 bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-bold rounded-xl inline-flex items-center gap-2 cursor-pointer"
+          >
+            <Power className="w-4 h-4" />
+            {busyAction === 'native_power'
+              ? 'Iniciando Servidor...'
+              : `Iniciar Servidor na Porta ${configuredPort}`}
+          </button>
+        </div>
+      ) : (
+        /* Main Grid: Network URL + QR Code | Key Generator */
+        <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
+          {/* Left: URL, IP, QR Code, Instructions */}
+          <div className="xl:col-span-5 bg-white rounded-2xl border border-stone-200 p-5 sm:p-6 shadow-xs space-y-5">
+            <div className="flex items-center justify-between">
+              <h2 className="text-base font-bold text-stone-900 flex items-center gap-2">
+                {isNetworkActive ? (
+                  <Wifi className="w-5 h-5 text-emerald-600" />
+                ) : (
+                  <WifiOff className="w-5 h-5 text-stone-400" />
+                )}
+                Endereço de Conexão (Wi-Fi LAN)
+              </h2>
+              <span className="text-xs font-bold text-stone-600 tabular-nums">
+                Porta {status?.port || configuredPort}
+              </span>
             </div>
 
-            <div className="mt-4 space-y-3 text-xs text-stone-600 leading-relaxed">
-              <p>
-                Você está prestes a transferir a <strong>Autoridade Central dos Dados</strong> para outro dispositivo físico do estabelecimento.
-              </p>
-
-              <div className="rounded-2xl bg-amber-50 p-3.5 border border-amber-200 space-y-1.5 text-amber-950">
-                <div className="flex items-center gap-1.5 font-bold text-amber-900">
-                  <Lock className="h-4 w-4" />
-                  <span>Garantia de Unicidade Absoluta:</span>
-                </div>
-                <p className="text-[11px]">
-                  • O dispositivo anterior deixará de ser a Matriz e passará a operar como terminal.
-                  <br />
-                  • Todo o banco SQLite será empacotado e transferido com checksum criptográfico SHA256.
-                  <br />
-                  • É impossível a existência de duas matrizes ativas simultâneas.
+            <div className="bg-stone-50 border border-stone-200 rounded-xl p-4 space-y-3">
+              <div>
+                <p className="text-xs font-bold uppercase tracking-wider text-stone-500">
+                  IP Detectado na Rede Local
+                </p>
+                <p className="text-lg font-extrabold font-mono text-stone-900 tabular-nums mt-0.5">
+                  {status?.primaryIp || nativeStatus?.primaryIp || '127.0.0.1'}
                 </p>
               </div>
 
-              {migrationFeedback ? (
-                <div className="rounded-xl bg-emerald-50 p-3 text-emerald-900 font-bold border border-emerald-200">
-                  {migrationFeedback}
+              {status?.urls && status.urls.length > 1 && (
+                <div>
+                  <p className="text-xs font-semibold text-stone-500 mb-1.5">
+                    Interfaces de rede disponíveis:
+                  </p>
+                  <div className="flex flex-wrap gap-1.5">
+                    {status.urls.map((u) => (
+                      <button
+                        key={u}
+                        type="button"
+                        onClick={() => handleSelectUrl(u)}
+                        className={`text-xs font-mono px-2.5 py-1.5 rounded-lg border cursor-pointer ${
+                          effectiveQrUrl === u
+                            ? 'bg-stone-900 text-white border-stone-900'
+                            : 'bg-white text-stone-700 border-stone-200'
+                        }`}
+                      >
+                        {u.replace('http://', '').replace('/?portal=web', '')}
+                      </button>
+                    ))}
+                  </div>
                 </div>
-              ) : (
-                <div className="mt-4 space-y-2">
-                  <p className="font-bold text-stone-800">Escolha o destino da nova Matriz:</p>
+              )}
 
-                  {matriz.activeHost === 'android_phone' ? (
-                    <button
-                      onClick={() => handleExecuteMigration('windows_pc')}
-                      className="flex w-full items-center justify-between rounded-2xl border-2 border-stone-200 bg-white p-3.5 hover:border-amber-500 hover:bg-amber-50/40 transition text-left"
+              <div>
+                <p className="text-xs font-bold uppercase tracking-wider text-stone-500 mb-1">
+                  Link Direto do Portal Web
+                </p>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    readOnly
+                    value={effectiveQrUrl}
+                    className="flex-1 min-h-[44px] px-3 bg-white border border-stone-300 rounded-xl font-mono text-xs text-stone-800"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => handleCopy(effectiveQrUrl, 'url')}
+                    className="min-h-[44px] px-4 bg-stone-900 hover:bg-stone-800 text-white text-xs font-bold rounded-xl flex items-center gap-1.5 shrink-0 cursor-pointer"
+                  >
+                    {copiedKey === 'url' ? (
+                      <>
+                        <Check className="w-4 h-4 text-emerald-400" />
+                        Copiado
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-4 h-4" />
+                        Copiar endereço
+                      </>
+                    )}
+                  </button>
+                </div>
+              </div>
+
+              {!isAndroidHost && (
+                <a
+                  href={browserOriginUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="w-full min-h-[44px] border border-stone-300 bg-white hover:bg-stone-100 text-stone-800 text-xs font-bold rounded-xl flex items-center justify-center gap-2 transition-colors"
+                >
+                  <ExternalLink className="w-4 h-4" />
+                  Abrir Portal de Login em Nova Aba (Teste Real)
+                </a>
+              )}
+            </div>
+
+            {/* Real QR Code */}
+            <div className="flex flex-col sm:flex-row items-center gap-4 p-4 rounded-xl border border-stone-200 bg-white">
+              <div className="w-36 h-36 rounded-xl border border-stone-200 bg-white flex items-center justify-center shrink-0 overflow-hidden p-1.5">
+                {qrDataUrl ? (
+                  <img
+                    src={qrDataUrl}
+                    alt="QR Code de Acesso pelo Navegador"
+                    className="w-full h-full object-contain"
+                  />
+                ) : (
+                  <QrCode className="w-16 h-16 text-stone-300" />
+                )}
+              </div>
+              <div className="text-xs text-stone-600 space-y-1.5">
+                <p className="font-bold text-stone-900 text-sm">QR Code de Conexão</p>
+                <p className="leading-relaxed">
+                  Aponte a câmera de outro celular ou tablet na mesma rede Wi-Fi para abrir o portal de login diretamente.
+                </p>
+                <p className="text-stone-500">
+                  Gere ao lado uma chave de <strong>Modo Administrador</strong> ou <strong>Modo Vendedor</strong> para autenticar o dispositivo.
+                </p>
+              </div>
+            </div>
+
+            {/* 5 Step Instructions */}
+            <div className="bg-stone-50 border border-stone-200 rounded-xl p-4 space-y-2 text-xs text-stone-600">
+              <p className="font-bold text-stone-900">Como conectar outro dispositivo (5 passos):</p>
+              <ol className="list-decimal list-inside space-y-1 leading-relaxed">
+                <li>Confirme que o celular do ADM e o outro aparelho estão na mesma rede Wi-Fi.</li>
+                <li>Mantenha o <strong>Servidor Nativo</strong> iniciado (notificação ativa no Android).</li>
+                <li>Gere uma chave para <strong>Modo Administrador</strong> ou <strong>Modo Vendedor</strong>.</li>
+                <li>No outro aparelho, leia o QR Code ou digite o endereço copiado no navegador.</li>
+                <li>Informe a chave de acesso para iniciar a operação sincronizada em tempo real.</li>
+              </ol>
+            </div>
+          </div>
+
+          {/* Right: Generate & Manage Access Keys */}
+          <div className="xl:col-span-7 space-y-6">
+            <div className="bg-white rounded-2xl border border-stone-200 p-5 sm:p-6 shadow-xs space-y-4">
+              <h2 className="text-base font-bold text-stone-900 flex items-center gap-2">
+                <KeyRound className="w-5 h-5 text-amber-600" />
+                Gerar Chave de Acesso
+              </h2>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <button
+                  type="button"
+                  onClick={() => setNewKeyMode('admin')}
+                  className={`min-h-[56px] p-3.5 rounded-xl border text-left transition-all cursor-pointer ${
+                    newKeyMode === 'admin'
+                      ? 'border-amber-600 bg-amber-50/70'
+                      : 'border-stone-200 bg-white hover:border-stone-300'
+                  }`}
+                >
+                  <div className="flex items-center gap-2 font-bold text-sm text-stone-900">
+                    <ShieldCheck className="w-4 h-4 text-amber-600" />
+                    Modo Administrador
+                  </div>
+                  <p className="text-xs text-stone-500 mt-0.5">
+                    Acesso gerencial completo sincronizado.
+                  </p>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setNewKeyMode('seller')}
+                  className={`min-h-[56px] p-3.5 rounded-xl border text-left transition-all cursor-pointer ${
+                    newKeyMode === 'seller'
+                      ? 'border-emerald-600 bg-emerald-50/70'
+                      : 'border-stone-200 bg-white hover:border-stone-300'
+                  }`}
+                >
+                  <div className="flex items-center gap-2 font-bold text-sm text-stone-900">
+                    <UserCheck className="w-4 h-4 text-emerald-600" />
+                    Modo Vendedor
+                  </div>
+                  <p className="text-xs text-stone-500 mt-0.5">
+                    Acesso individual restrito às vendas autorizadas.
+                  </p>
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {newKeyMode === 'seller' && (
+                  <div>
+                    <label className="block text-xs font-bold uppercase tracking-wider text-stone-500 mb-1.5">
+                      Vendedor Vinculado
+                    </label>
+                    <select
+                      value={selectedSellerId}
+                      onChange={(e) => setSelectedSellerId(e.target.value)}
+                      className="w-full min-h-[44px] px-3 bg-stone-50 border border-stone-300 rounded-xl text-sm text-stone-900"
                     >
-                      <div className="flex items-center gap-3">
-                        <Monitor className="h-6 w-6 text-blue-600" />
-                        <div>
-                          <p className="font-bold text-stone-900 text-sm">Computador Windows do Administrador</p>
-                          <p className="text-[11px] text-stone-500">PC Balcão • IP: 192.168.43.104</p>
+                      {sellers.map((s) => (
+                        <option key={s.id} value={s.id}>
+                          {s.name} ({s.canSell === false || s.status === 'bloqueado' ? 'BLOQUEADO' : 'Autorizado'})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+
+                <div className={newKeyMode === 'admin' ? 'sm:col-span-2' : ''}>
+                  <label className="block text-xs font-bold uppercase tracking-wider text-stone-500 mb-1.5">
+                    Validade da Chave
+                  </label>
+                  <select
+                    value={expiresInHours}
+                    onChange={(e) => setExpiresInHours(Number(e.target.value))}
+                    className="w-full min-h-[44px] px-3 bg-stone-50 border border-stone-300 rounded-xl text-sm text-stone-900"
+                  >
+                    <option value={12}>12 horas (Turno)</option>
+                    <option value={24}>24 horas (Diária)</option>
+                    <option value={168}>7 dias</option>
+                    <option value={720}>30 dias</option>
+                  </select>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={handleCreateKey}
+                disabled={busyAction === 'create_key' || (newKeyMode === 'seller' && !selectedSellerId)}
+                className="w-full min-h-[48px] bg-stone-900 hover:bg-stone-800 disabled:bg-stone-300 text-white text-sm font-bold rounded-xl transition-colors cursor-pointer"
+              >
+                {busyAction === 'create_key'
+                  ? 'Gerando chave criptografada...'
+                  : `Gerar Chave para ${newKeyMode === 'admin' ? 'Administrador' : 'Vendedor'}`}
+              </button>
+
+              {generatedPlainKey && (
+                <div className="p-4 rounded-xl bg-amber-50 border border-amber-300 space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-bold uppercase tracking-wider text-amber-900">
+                      Chave Gerada ({generatedPlainKey.mode === 'admin' ? 'ADM' : 'Vendedor'} — {generatedPlainKey.userName})
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => handleCopy(generatedPlainKey.plainKey, 'new_plain_key')}
+                      className="min-h-[36px] px-3 bg-amber-600 hover:bg-amber-700 text-white text-xs font-bold rounded-lg flex items-center gap-1.5 cursor-pointer"
+                    >
+                      {copiedKey === 'new_plain_key' ? (
+                        <>
+                          <Check className="w-3.5 h-3.5" />
+                          Chave Copiada
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="w-3.5 h-3.5" />
+                          Copiar Chave
+                        </>
+                      )}
+                    </button>
+                  </div>
+                  <p className="font-mono text-lg font-extrabold tracking-widest text-stone-900 select-all">
+                    {generatedPlainKey.plainKey}
+                  </p>
+                  <p className="text-xs text-amber-800">
+                    Guarde ou envie esta chave agora. Por segurança, o servidor armazena apenas o hash criptográfico (scrypt + salt).
+                  </p>
+                </div>
+              )}
+
+              {/* Existing Keys Table */}
+              <div className="pt-2 space-y-2">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-stone-500">
+                  Chaves Ativas ({activeKeys.length})
+                </h3>
+                {activeKeys.length === 0 ? (
+                  <p className="text-xs text-stone-500 py-3">
+                    Nenhuma chave ativa emitida no momento.
+                  </p>
+                ) : (
+                  <div className="space-y-2">
+                    {activeKeys.map((k) => (
+                      <div
+                        key={k.id}
+                        className="p-3 rounded-xl border border-stone-200 bg-stone-50 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+                      >
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="font-mono text-xs font-bold text-stone-900">
+                              {k.keyPreview}
+                            </span>
+                            <span
+                              className={`text-[11px] font-bold px-2 py-0.5 rounded ${
+                                k.mode === 'admin'
+                                  ? 'bg-amber-100 text-amber-800'
+                                  : 'bg-emerald-100 text-emerald-800'
+                              }`}
+                            >
+                              {k.mode === 'admin' ? 'ADM' : 'Vendedor'}
+                            </span>
+                            <span className="text-xs font-semibold text-stone-700 truncate">
+                              {k.userName}
+                            </span>
+                          </div>
+                          <p className="text-[11px] text-stone-500 mt-1 tabular-nums">
+                            Expira em {new Date(k.expiresAt).toLocaleString('pt-BR')}
+                          </p>
+                        </div>
+
+                        <div className="flex items-center gap-2 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => handleRenewKey(k.id)}
+                            disabled={busyAction === `renew_${k.id}`}
+                            className="min-h-[38px] px-3 rounded-lg border border-stone-300 bg-white hover:bg-stone-100 text-xs font-semibold text-stone-700 cursor-pointer"
+                          >
+                            Renovar
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleRevokeKey(k.id)}
+                            disabled={busyAction === `revoke_${k.id}`}
+                            className="min-h-[38px] px-3 rounded-lg bg-rose-50 hover:bg-rose-100 border border-rose-200 text-xs font-semibold text-rose-700 flex items-center gap-1 cursor-pointer"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                            Revogar
+                          </button>
                         </div>
                       </div>
-                      <span className="rounded-xl bg-amber-600 px-3 py-1.5 text-xs font-bold text-white shadow-xs">
-                        Tornar Matriz
-                      </span>
-                    </button>
-                  ) : (
-                    <button
-                      onClick={() => handleExecuteMigration('android_phone')}
-                      className="flex w-full items-center justify-between rounded-2xl border-2 border-stone-200 bg-white p-3.5 hover:border-amber-500 hover:bg-amber-50/40 transition text-left"
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Connected Devices + Individual Disconnect */}
+            <div className="bg-white rounded-2xl border border-stone-200 p-5 sm:p-6 shadow-xs space-y-4">
+              <div className="flex items-center justify-between">
+                <h2 className="text-base font-bold text-stone-900 flex items-center gap-2">
+                  <MonitorSmartphone className="w-5 h-5 text-emerald-600" />
+                  Dispositivos Conectados ({status?.activeSessionsCount || 0})
+                </h2>
+              </div>
+
+              {!status?.sessions || status.sessions.length === 0 ? (
+                <p className="text-xs text-stone-500 py-2">
+                  Nenhum navegador externo conectado no momento.
+                </p>
+              ) : (
+                <div className="space-y-2.5">
+                  {status.sessions.map((s) => (
+                    <div
+                      key={s.id}
+                      className="p-3.5 rounded-xl border border-stone-200 bg-stone-50 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
                     >
-                      <div className="flex items-center gap-3">
-                        <Smartphone className="h-6 w-6 text-emerald-600" />
-                        <div>
-                          <p className="font-bold text-stone-900 text-sm">Celular Android do Administrador</p>
-                          <p className="text-[11px] text-stone-500">Samsung Galaxy S23 • IP: 192.168.43.1</p>
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="text-sm font-bold text-stone-900">{s.deviceLabel}</span>
+                          <span
+                            className={`text-[11px] font-bold px-2 py-0.5 rounded ${
+                              s.mode === 'admin'
+                                ? 'bg-amber-100 text-amber-800'
+                                : 'bg-emerald-100 text-emerald-800'
+                            }`}
+                          >
+                            {s.mode === 'admin' ? 'MODO ADM' : 'MODO VENDEDOR'}
+                          </span>
                         </div>
+                        <p className="text-xs text-stone-600 mt-0.5">
+                          Usuário: <strong>{s.userName}</strong> • IP:{' '}
+                          <span className="font-mono">{s.ipAddress}</span>
+                        </p>
+                        <p className="text-[11px] text-stone-500 tabular-nums mt-0.5">
+                          Conectado em {new Date(s.connectedAt).toLocaleTimeString('pt-BR')} •{' '}
+                          {s.wsConnected ? 'Tempo real ativo' : 'HTTP ativo'}
+                        </p>
                       </div>
-                      <span className="rounded-xl bg-amber-600 px-3 py-1.5 text-xs font-bold text-white shadow-xs">
-                        Tornar Matriz
-                      </span>
-                    </button>
-                  )}
+                      <button
+                        type="button"
+                        onClick={() => handleDisconnectSession(s.id)}
+                        disabled={busyAction === `disc_${s.id}`}
+                        className="min-h-[40px] px-3.5 bg-rose-600 hover:bg-rose-700 text-white text-xs font-bold rounded-xl shrink-0 cursor-pointer"
+                      >
+                        Desconectar
+                      </button>
+                    </div>
+                  ))}
                 </div>
               )}
             </div>
 
-            <div className="mt-5 flex justify-end">
-              <button
-                onClick={() => setShowMigrationModal(false)}
-                className="rounded-xl border border-stone-200 px-4 py-2 text-xs font-bold text-stone-700 hover:bg-stone-50"
-              >
-                Fechar
-              </button>
+            {/* Connection Logs */}
+            <div className="bg-white rounded-2xl border border-stone-200 p-5 sm:p-6 shadow-xs space-y-3">
+              <h2 className="text-base font-bold text-stone-900 flex items-center gap-2">
+                <Clock className="w-5 h-5 text-stone-600" />
+                Histórico de Conexões e Auditoria de Chaves
+              </h2>
+              {!status?.logs || status.logs.length === 0 ? (
+                <p className="text-xs text-stone-500">Sem eventos de conexão registrados ainda.</p>
+              ) : (
+                <div className="max-h-60 overflow-y-auto space-y-2 pr-1">
+                  {status.logs.slice(0, 20).map((log) => (
+                    <div
+                      key={log.id}
+                      className="p-2.5 rounded-lg bg-stone-50 border border-stone-200 text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-1"
+                    >
+                      <div>
+                        <span className="font-bold text-stone-900">{log.userName}</span>
+                        <span className="text-stone-500"> — {log.details}</span>
+                      </div>
+                      <span className="text-[11px] text-stone-500 font-mono tabular-nums shrink-0">
+                        {new Date(log.timestamp).toLocaleString('pt-BR')}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
-          </div>
-        </div>
-      )}
-
-      {/* MODAL QR CODE DE PAREAMENTO */}
-      {showQrModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-900/60 p-4 backdrop-blur-xs">
-          <div className="w-full max-w-sm rounded-3xl border border-stone-200 bg-white p-6 shadow-2xl text-center">
-            <h3 className="text-base font-black text-stone-900">Pareamento de Terminal</h3>
-            <p className="mt-1 text-xs text-stone-500">
-              Aponte a câmera do aplicativo do vendedor para sincronizar com a Matriz:
-            </p>
-
-            {/* Simulação Visual do QR Code com SVG de Alta Fidelidade */}
-            <div className="mt-4 mx-auto flex h-48 w-48 items-center justify-center rounded-2xl border-4 border-stone-900 bg-white p-3 shadow-inner">
-              <svg viewBox="0 0 100 100" className="h-full w-full">
-                <rect x="5" y="5" width="25" height="25" fill="#1c1917" rx="3" />
-                <rect x="9" y="9" width="17" height="17" fill="white" rx="2" />
-                <rect x="13" y="13" width="9" height="9" fill="#1c1917" />
-
-                <rect x="70" y="5" width="25" height="25" fill="#1c1917" rx="3" />
-                <rect x="74" y="9" width="17" height="17" fill="white" rx="2" />
-                <rect x="78" y="13" width="9" height="9" fill="#1c1917" />
-
-                <rect x="5" y="70" width="25" height="25" fill="#1c1917" rx="3" />
-                <rect x="9" y="74" width="17" height="17" fill="white" rx="2" />
-                <rect x="13" y="78" width="9" height="9" fill="#1c1917" />
-
-                <rect x="35" y="10" width="8" height="8" fill="#d97706" />
-                <rect x="48" y="10" width="12" height="6" fill="#1c1917" />
-                <rect x="35" y="24" width="25" height="6" fill="#1c1917" />
-                <rect x="10" y="38" width="8" height="12" fill="#1c1917" />
-                <rect x="25" y="38" width="14" height="6" fill="#d97706" />
-                <rect x="45" y="38" width="10" height="10" fill="#1c1917" />
-                <rect x="62" y="38" width="12" height="8" fill="#1c1917" />
-                <rect x="80" y="38" width="10" height="14" fill="#d97706" />
-
-                <rect x="38" y="55" width="24" height="8" fill="#1c1917" />
-                <rect x="42" y="70" width="12" height="16" fill="#d97706" />
-                <rect x="62" y="55" width="8" height="20" fill="#1c1917" />
-                <rect x="75" y="65" width="18" height="8" fill="#1c1917" />
-                <rect x="75" y="80" width="12" height="12" fill="#1c1917" />
-              </svg>
-            </div>
-
-            <div className="mt-4 rounded-xl bg-stone-50 p-3 border border-stone-200 text-left font-mono text-xs">
-              <span className="block text-[10px] text-stone-400 uppercase font-sans font-semibold">
-                Endereço da Matriz Ativa
-              </span>
-              <p className="font-bold text-stone-900">http://{config.serverIp}:{config.port}</p>
-              <span className="block text-[10px] text-stone-400 uppercase font-sans font-semibold mt-2">
-                Token de Autorização
-              </span>
-              <p className="font-bold text-amber-700 truncate">{config.serverToken}</p>
-            </div>
-
-            <button
-              onClick={() => setShowQrModal(false)}
-              className="mt-4 w-full rounded-xl bg-stone-900 py-2.5 text-xs font-bold text-white hover:bg-stone-800"
-            >
-              Fechar
-            </button>
           </div>
         </div>
       )}

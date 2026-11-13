@@ -31,6 +31,8 @@ import {
   toggleSellerSellingPermission,
   addAuditLog,
 } from '../../services/storage';
+import { apiRequest, generateWebAccessKey, fetchWebAccessStatus } from '../../services/sync-client';
+import QRCode from 'qrcode';
 
 export const SellerControlPanel: React.FC = () => {
   const { currentTenant } = useTenant();
@@ -49,9 +51,13 @@ export const SellerControlPanel: React.FC = () => {
   const [formAccessCode, setFormAccessCode] = useState('');
   const [formCommission, setFormCommission] = useState<number>(5);
 
+  const [qrImageUrl, setQrImageUrl] = useState<string>('');
+  const [sellerWebKey, setSellerWebKey] = useState<string>('');
+  const [qrServerNotice, setQrServerNotice] = useState<string | null>(null);
+  const [confirmDeleteSeller, setConfirmDeleteSeller] = useState<UserProfile | null>(null);
+
   const loadSellers = () => {
     const allUsers = getUsers(currentTenant.id);
-    // Filtra para exibir todos os vendedores (garçons, caixas e atendentes)
     const list = allUsers.filter((u) => u.role !== 'admin');
     setSellers(list);
   };
@@ -69,19 +75,59 @@ export const SellerControlPanel: React.FC = () => {
     setTimeout(() => setFeedbackMessage(null), 3500);
   };
 
-  // Alternância do Controle Liga/Desliga da Permissão de Venda
-  const handleTogglePermission = (seller: UserProfile) => {
+  // Alternância do Controle Liga/Desliga da Permissão de Venda (local + servidor WebSocket)
+  const handleTogglePermission = async (seller: UserProfile) => {
     const currentCanSell = seller.canSell !== false && seller.status !== 'bloqueado';
     const nextCanSell = !currentCanSell;
 
     const updated = toggleSellerSellingPermission(seller.id, nextCanSell, currentUser?.name);
+    try {
+      await apiRequest(`/api/users/${encodeURIComponent(seller.id)}/toggle-sell`, {
+        method: 'POST',
+        activeUserId: currentUser?.id,
+        body: { canSell: nextCanSell },
+      });
+    } catch {
+      // Offline fallback já salvo localmente
+    }
     if (updated) {
       loadSellers();
       showFeedback(
         nextCanSell
-          ? `✓ Permissão de venda LIGADA para ${seller.name} (AUTORIZADO)`
-          : `⚠️ Permissão de venda DESLIGADA para ${seller.name} (BLOQUEADO)`
+          ? `Permissão de venda LIGADA para ${seller.name} (AUTORIZADO)`
+          : `Permissão de venda DESLIGADA para ${seller.name} (BLOQUEADO e desconectado)`
       );
+    }
+  };
+
+  const handleOpenSellerQr = async (seller: UserProfile) => {
+    setQrModalSeller(seller);
+    setSellerWebKey('');
+    setQrImageUrl('');
+    setQrServerNotice(null);
+    try {
+      const status = await fetchWebAccessStatus(currentTenant.id, currentUser?.id);
+      const portalUrl = status.urls[0] || `${window.location.origin}/?portal=web`;
+      const dataUrl = await QRCode.toDataURL(portalUrl, { width: 240, margin: 2 });
+      setQrImageUrl(dataUrl);
+      if (seller.canSell !== false && seller.status !== 'bloqueado') {
+        const res = await generateWebAccessKey({
+          tenantId: currentTenant.id,
+          mode: 'seller',
+          userId: seller.id,
+          expiresInHours: 24,
+          activeUserId: currentUser?.id,
+        });
+        setSellerWebKey(res.plainKey);
+      }
+    } catch (err: any) {
+      const msg = String(err?.message || '');
+      if (msg.startsWith('NATIVE_SERVER_STOPPED:')) {
+        setQrServerNotice('Inicie o Servidor Nativo na aba "Acesso Web" para gerar o QR Code da rede Wi-Fi e a chave individual deste vendedor.');
+      } else {
+        const fallbackUrl = `${window.location.origin}/?portal=web`;
+        QRCode.toDataURL(fallbackUrl, { width: 240, margin: 2 }).then(setQrImageUrl).catch(() => {});
+      }
     }
   };
 
@@ -99,7 +145,7 @@ export const SellerControlPanel: React.FC = () => {
   const handleSaveNewSeller = (e: React.FormEvent) => {
     e.preventDefault();
     if (!formName.trim()) {
-      alert('Informe o nome do vendedor.');
+      showFeedback('Informe o nome do vendedor.');
       return;
     }
 
@@ -169,7 +215,7 @@ export const SellerControlPanel: React.FC = () => {
     e.preventDefault();
     if (!editingSeller) return;
     if (!formName.trim()) {
-      alert('Informe o nome do vendedor.');
+      showFeedback('Informe o nome do vendedor.');
       return;
     }
 
@@ -194,27 +240,22 @@ export const SellerControlPanel: React.FC = () => {
 
     loadSellers();
     setIsEditModalOpen(false);
-    showFeedback(`✓ Dados do vendedor "${updated.name}" atualizados com sucesso!`);
+    showFeedback(`Dados do vendedor "${updated.name}" atualizados com sucesso.`);
   };
 
-  // Remover Vendedor
-  const handleDeleteSeller = (seller: UserProfile) => {
-    if (
-      confirm(
-        `Confirma a remoção do vendedor "${seller.name}"?\nSuas vendas anteriores continuarão preservadas nos relatórios históricos.`
-      )
-    ) {
-      removeUserFromStorage(seller.id);
-      addAuditLog({
-        tenantId: currentTenant.id,
-        userId: currentUser?.id || 'adm',
-        userName: currentUser?.name || 'Administrador Matriz',
-        action: 'REMOCAO_VENDEDOR',
-        details: `Removeu o vendedor ${seller.name} do sistema.`,
-      });
-      loadSellers();
-      showFeedback(`✓ Vendedor "${seller.name}" removido.`);
-    }
+  const handleConfirmDeleteSeller = () => {
+    if (!confirmDeleteSeller) return;
+    removeUserFromStorage(confirmDeleteSeller.id);
+    addAuditLog({
+      tenantId: currentTenant.id,
+      userId: currentUser?.id || 'adm',
+      userName: currentUser?.name || 'Administrador Matriz',
+      action: 'REMOCAO_VENDEDOR',
+      details: `Removeu o vendedor ${confirmDeleteSeller.name} do sistema.`,
+    });
+    loadSellers();
+    showFeedback(`Vendedor "${confirmDeleteSeller.name}" removido.`);
+    setConfirmDeleteSeller(null);
   };
 
   return (
@@ -281,7 +322,7 @@ export const SellerControlPanel: React.FC = () => {
                   <div>
                     {isAuthorized ? (
                       <span className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-300 bg-emerald-50 px-3 py-1 text-xs font-black uppercase tracking-wider text-emerald-800">
-                        <span className="h-2 w-2 rounded-full bg-emerald-600 animate-pulse" />
+                        <span className="h-2 w-2 rounded-full bg-emerald-600" />
                         AUTORIZADO
                       </span>
                     ) : (
@@ -331,11 +372,7 @@ export const SellerControlPanel: React.FC = () => {
                     }
                   >
                     {isAuthorized ? (
-                      <>
-                        <span>[ LIGADO</span>
-                        <span className="h-2.5 w-2.5 rounded-full bg-white shadow-xs animate-pulse" />
-                        <span>]</span>
-                      </>
+                      <span>[ LIGADO ]</span>
                     ) : (
                       <span>[ DESLIGADO ]</span>
                     )}
@@ -353,17 +390,17 @@ export const SellerControlPanel: React.FC = () => {
 
                   <div className="flex items-center gap-2">
                     <button
-                      onClick={() => setQrModalSeller(seller)}
-                      className="flex items-center gap-1 rounded-lg px-2.5 py-1 text-[11px] font-semibold text-stone-600 hover:bg-stone-100 transition"
-                      title="Exibir QR Code individual de liberação do vendedor"
+                      onClick={() => handleOpenSellerQr(seller)}
+                      className="flex items-center gap-1 rounded-lg px-2.5 min-h-[38px] text-[11px] font-semibold text-stone-600 hover:bg-stone-100 transition cursor-pointer"
+                      title="Gerar chave web e QR Code individual do vendedor"
                     >
                       <QrCode className="h-3.5 w-3.5 text-amber-600" />
-                      <span>QR Code</span>
+                      <span>Chave Web / QR</span>
                     </button>
 
                     <button
                       onClick={() => handleOpenEdit(seller)}
-                      className="flex items-center gap-1 rounded-lg px-2.5 py-1 text-[11px] font-semibold text-stone-600 hover:bg-stone-100 transition"
+                      className="flex items-center gap-1 rounded-lg px-2.5 min-h-[38px] text-[11px] font-semibold text-stone-600 hover:bg-stone-100 transition cursor-pointer"
                       title="Editar vendedor"
                     >
                       <Edit2 className="h-3.5 w-3.5 text-stone-500" />
@@ -371,8 +408,8 @@ export const SellerControlPanel: React.FC = () => {
                     </button>
 
                     <button
-                      onClick={() => handleDeleteSeller(seller)}
-                      className="flex items-center gap-1 rounded-lg px-2.5 py-1 text-[11px] font-semibold text-rose-600 hover:bg-rose-50 transition"
+                      onClick={() => setConfirmDeleteSeller(seller)}
+                      className="flex items-center gap-1 rounded-lg px-2.5 min-h-[38px] text-[11px] font-semibold text-rose-600 hover:bg-rose-50 transition cursor-pointer"
                       title="Remover vendedor"
                     >
                       <Trash2 className="h-3.5 w-3.5" />
@@ -618,22 +655,35 @@ export const SellerControlPanel: React.FC = () => {
             <div className="mt-4">
               <h3 className="text-lg font-black text-stone-900">{qrModalSeller.name}</h3>
               <p className="text-xs text-stone-500">
-                Aponte o celular do vendedor para este QR Code para vincular o dispositivo à Matriz.
+                Aponte a câmera do navegador para o QR Code e informe a Chave de Acesso Web abaixo.
               </p>
 
-              {/* QR Code Simulado com SVG nítido */}
-              <div className="my-5 mx-auto flex h-48 w-48 items-center justify-center rounded-2xl border-2 border-stone-900 bg-stone-900 p-3 shadow-md">
-                <div className="flex h-full w-full flex-col items-center justify-center rounded-xl bg-white p-2">
-                  <QrCode className="h-28 w-28 text-stone-900" />
-                  <span className="mt-1 font-mono text-[10px] font-bold text-stone-600">
-                    {qrModalSeller.qrToken || 'TOKEN-AUTH-8821'}
-                  </span>
+              {qrServerNotice ? (
+                <div className="my-4 rounded-xl border border-amber-200 bg-amber-50 p-4 text-xs font-medium text-amber-900">
+                  {qrServerNotice}
                 </div>
-              </div>
+              ) : (
+                <div className="my-4 mx-auto flex h-48 w-48 items-center justify-center rounded-2xl border border-stone-200 bg-white p-2 shadow-xs">
+                  {qrImageUrl ? (
+                    <img src={qrImageUrl} alt="QR Code Vendedor" className="w-full h-full object-contain" />
+                  ) : (
+                    <QrCode className="h-24 w-24 text-stone-300" />
+                  )}
+                </div>
+              )}
+
+              {sellerWebKey && (
+                <div className="mb-3 rounded-xl bg-amber-50 border border-amber-200 p-3 text-left">
+                  <p className="text-[11px] font-bold text-amber-900">Chave Individual MODO VENDEDOR (24h):</p>
+                  <p className="font-mono text-base font-extrabold text-stone-900 mt-0.5 select-all">
+                    {sellerWebKey}
+                  </p>
+                </div>
+              )}
 
               <div className="rounded-xl bg-stone-50 p-3 border border-stone-200 text-left text-xs space-y-1">
                 <div className="flex justify-between">
-                  <span className="text-stone-500">PIN de Acesso:</span>
+                  <span className="text-stone-500">PIN Local:</span>
                   <span className="font-mono font-bold text-stone-900">
                     {qrModalSeller.accessCode || '1234'}
                   </span>
@@ -656,13 +706,42 @@ export const SellerControlPanel: React.FC = () => {
 
               <button
                 onClick={() => {
-                  navigator.clipboard?.writeText(qrModalSeller.qrToken || qrModalSeller.id);
-                  alert('Token do vendedor copiado para a área de transferência!');
+                  const textToCopy = sellerWebKey || qrModalSeller.qrToken || qrModalSeller.id;
+                  navigator.clipboard?.writeText(textToCopy);
+                  showFeedback('Chave copiada para a área de transferência.');
                 }}
-                className="mt-4 w-full flex items-center justify-center gap-1.5 rounded-xl border border-stone-200 bg-stone-50 py-2.5 text-xs font-semibold text-stone-700 hover:bg-stone-100 transition"
+                className="mt-4 w-full min-h-[44px] flex items-center justify-center gap-1.5 rounded-xl border border-stone-200 bg-stone-50 text-xs font-semibold text-stone-700 hover:bg-stone-100 transition cursor-pointer"
               >
                 <Copy className="h-3.5 w-3.5" />
-                <span>Copiar Token de Acesso</span>
+                <span>{sellerWebKey ? 'Copiar Chave Web do Vendedor' : 'Copiar Token do Vendedor'}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL DE CONFIRMAÇÃO DE EXCLUSÃO */}
+      {confirmDeleteSeller && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-900/60 p-4 backdrop-blur-xs">
+          <div className="w-full max-w-sm rounded-2xl border border-stone-200 bg-white p-6 shadow-2xl">
+            <h3 className="text-base font-bold text-stone-900">Remover Vendedor?</h3>
+            <p className="text-xs text-stone-600 mt-1.5 leading-relaxed">
+              Confirma a remoção de <strong>{confirmDeleteSeller.name}</strong>? Todas as vendas anteriores permanecerão preservadas nos relatórios históricos.
+            </p>
+            <div className="flex gap-2 mt-5">
+              <button
+                type="button"
+                onClick={() => setConfirmDeleteSeller(null)}
+                className="flex-1 min-h-[44px] rounded-xl border border-stone-200 text-xs font-semibold text-stone-700 hover:bg-stone-50 cursor-pointer"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmDeleteSeller}
+                className="flex-1 min-h-[44px] rounded-xl bg-rose-600 hover:bg-rose-700 text-xs font-bold text-white cursor-pointer"
+              >
+                Remover
               </button>
             </div>
           </div>

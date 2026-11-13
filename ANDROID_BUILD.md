@@ -6,7 +6,7 @@ O projeto já está 100% configurado com **Capacitor** para Android, com o proje
 
 ### Opção 1: Gerar o APK via Linha de Comando (Gradle)
 
-Se você tem o **JDK (Java 17 ou 21)** e o **Android SDK** instalados no seu computador:
+Se você tem o **JDK 21** e o **Android SDK (API 36)** instalados no seu computador:
 
 1. Abra o terminal na pasta do projeto:
 ```bash

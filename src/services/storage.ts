@@ -71,6 +71,12 @@ const STORAGE_KEYS = {
   ACTIVE_USER_ID: 'sabor_active_user_id',
 };
 
+import {
+  isApplyingRemoteState,
+  registerSnapshotApplier,
+  scheduleStatePushToServer,
+} from './sync-client';
+
 function getStorage<T>(key: string, defaultVal: T): T {
   try {
     const raw = localStorage.getItem(key);
@@ -82,9 +88,81 @@ function getStorage<T>(key: string, defaultVal: T): T {
   }
 }
 
+export function collectSyncableState(): Record<string, any> {
+  return {
+    tenants: getStorage<Tenant[]>(STORAGE_KEYS.TENANTS, []),
+    users: getStorage<UserProfile[]>(STORAGE_KEYS.USERS, []),
+    categories: getStorage<Category[]>(STORAGE_KEYS.CATEGORIES, []),
+    products: getStorage<Product[]>(STORAGE_KEYS.PRODUCTS, []),
+    tables: getStorage<RestaurantTable[]>(STORAGE_KEYS.TABLES, []),
+    orders: getStorage<Order[]>(STORAGE_KEYS.ORDERS, []),
+    cashSessions: getStorage<CashRegisterSession[]>(STORAGE_KEYS.CASH, []),
+    financial: getStorage<FinancialTransaction[]>(STORAGE_KEYS.FINANCIAL, []),
+    inventoryTransactions: getStorage<InventoryTransaction[]>(STORAGE_KEYS.INVENTORY, []),
+    auditLogs: getStorage<AuditLog[]>(STORAGE_KEYS.AUDIT, []),
+    savedReports: getStorage<SavedReport[]>(STORAGE_KEYS.SAVED_REPORTS, []),
+    archivedPeriods: getStorage<ArchivedPeriod[]>(STORAGE_KEYS.ARCHIVED_PERIODS, []),
+    backups: getStorage<SystemBackup[]>(STORAGE_KEYS.BACKUPS, []),
+    tableArchives: getStorage<TableAccountArchive[]>(STORAGE_KEYS.TABLE_ARCHIVES, []),
+    themeConfig: getStorage<SystemThemeConfig>(STORAGE_KEYS.THEME_CONFIG, DEFAULT_THEME_CONFIG),
+  };
+}
+
+registerSnapshotApplier((data: Record<string, any>) => {
+  const writeRaw = (k: string, v: any) => {
+    if (v !== undefined) {
+      localStorage.setItem(k, JSON.stringify(v));
+    }
+  };
+  writeRaw(STORAGE_KEYS.TENANTS, data.tenants);
+  writeRaw(STORAGE_KEYS.USERS, data.users);
+  writeRaw(STORAGE_KEYS.CATEGORIES, data.categories);
+  writeRaw(STORAGE_KEYS.PRODUCTS, data.products);
+  writeRaw(STORAGE_KEYS.TABLES, data.tables);
+  writeRaw(STORAGE_KEYS.ORDERS, data.orders);
+  writeRaw(STORAGE_KEYS.CASH, data.cashSessions);
+  writeRaw(STORAGE_KEYS.FINANCIAL, data.financial);
+  writeRaw(STORAGE_KEYS.INVENTORY, data.inventoryTransactions);
+  writeRaw(STORAGE_KEYS.AUDIT, data.auditLogs);
+  writeRaw(STORAGE_KEYS.SAVED_REPORTS, data.savedReports);
+  writeRaw(STORAGE_KEYS.ARCHIVED_PERIODS, data.archivedPeriods);
+  writeRaw(STORAGE_KEYS.BACKUPS, data.backups);
+  writeRaw(STORAGE_KEYS.TABLE_ARCHIVES, data.tableArchives);
+  if (data.themeConfig) {
+    writeRaw(STORAGE_KEYS.THEME_CONFIG, data.themeConfig);
+    window.dispatchEvent(new CustomEvent('sabor_theme_updated', { detail: data.themeConfig }));
+  }
+});
+
+const SYNC_TRIGGER_KEYS = new Set<string>([
+  STORAGE_KEYS.TENANTS,
+  STORAGE_KEYS.USERS,
+  STORAGE_KEYS.CATEGORIES,
+  STORAGE_KEYS.PRODUCTS,
+  STORAGE_KEYS.TABLES,
+  STORAGE_KEYS.ORDERS,
+  STORAGE_KEYS.CASH,
+  STORAGE_KEYS.FINANCIAL,
+  STORAGE_KEYS.INVENTORY,
+  STORAGE_KEYS.SAVED_REPORTS,
+  STORAGE_KEYS.ARCHIVED_PERIODS,
+  STORAGE_KEYS.BACKUPS,
+  STORAGE_KEYS.TABLE_ARCHIVES,
+  STORAGE_KEYS.THEME_CONFIG,
+]);
+
 function setStorage<T>(key: string, val: T): void {
   try {
     localStorage.setItem(key, JSON.stringify(val));
+    if (!isApplyingRemoteState() && SYNC_TRIGGER_KEYS.has(key) && typeof window !== 'undefined') {
+      const tenantId = localStorage.getItem(STORAGE_KEYS.ACTIVE_TENANT_ID)
+        ? JSON.parse(localStorage.getItem(STORAGE_KEYS.ACTIVE_TENANT_ID)!)
+        : INITIAL_DEMO_TENANT.id;
+      const activeUserId = localStorage.getItem(STORAGE_KEYS.ACTIVE_USER_ID)
+        ? JSON.parse(localStorage.getItem(STORAGE_KEYS.ACTIVE_USER_ID)!)
+        : undefined;
+      scheduleStatePushToServer(collectSyncableState, tenantId, activeUserId);
+    }
   } catch (e) {
     console.error(`Error writing ${key} to storage:`, e);
   }
@@ -1236,6 +1314,229 @@ export function saveOrder(order: Order): void {
     all.unshift(order);
   }
   setStorage(STORAGE_KEYS.ORDERS, all);
+}
+
+export function getOpenTableOrders(tenantId: string, table: RestaurantTable): Order[] {
+  const orders = getOrders(tenantId);
+  return orders.filter(
+    (o) =>
+      o.type === 'table' &&
+      (o.tableId === table.id || o.tableNumber === table.number) &&
+      o.status !== 'cancelled' &&
+      (!o.paid || o.status !== 'closed')
+  );
+}
+
+// Acumula itens no pedido aberto da mesa (ou cria um pedido único ativo), baixando apenas o delta do estoque
+export function addOrAccumulateTableItems(
+  tenantId: string,
+  tableId: string,
+  itemsToAdd: Array<{
+    productId: string;
+    quantity: number;
+    variationName?: string;
+    selectedAddons?: { name: string; price: number }[];
+    notes?: string;
+  }>,
+  operatorUser: { id: string; name: string }
+): { success: boolean; table?: RestaurantTable; order?: Order; error?: string } {
+  if (!itemsToAdd || itemsToAdd.length === 0) {
+    return { success: false, error: 'Selecione ao menos um produto para adicionar à mesa.' };
+  }
+
+  const allTables = getStorage<RestaurantTable[]>(STORAGE_KEYS.TABLES, INITIAL_DEMO_TABLES);
+  const tableIdx = allTables.findIndex((t) => t.id === tableId && t.tenantId === tenantId);
+  if (tableIdx < 0) return { success: false, error: 'Mesa não encontrada.' };
+  const table = allTables[tableIdx];
+
+  const allProducts = getStorage<Product[]>(STORAGE_KEYS.PRODUCTS, INITIAL_DEMO_PRODUCTS);
+  const tenants = getTenants();
+  const tenant = tenants.find((t) => t.id === tenantId);
+  const allowNegativeStock = Boolean(tenant?.settings?.allowNegativeStock);
+
+  for (const reqItem of itemsToAdd) {
+    if (!reqItem.quantity || reqItem.quantity <= 0) {
+      return { success: false, error: 'Informe uma quantidade válida maior que zero.' };
+    }
+    const prod = allProducts.find((p) => p.id === reqItem.productId && p.tenantId === tenantId);
+    if (!prod) return { success: false, error: 'Produto não encontrado no cardápio.' };
+    if (!prod.active) return { success: false, error: `Produto "${prod.name}" está inativo.` };
+    if (!allowNegativeStock && (prod.stockQuantity ?? 0) < reqItem.quantity) {
+      return {
+        success: false,
+        error: `Estoque insuficiente para "${prod.name}". Disponível: ${prod.stockQuantity ?? 0} ${prod.unit}, solicitado: ${reqItem.quantity}.`,
+      };
+    }
+  }
+
+  const allOrders = getStorage<Order[]>(STORAGE_KEYS.ORDERS, INITIAL_DEMO_ORDERS);
+  const orderIdx = allOrders.findIndex(
+    (o) =>
+      o.tenantId === tenantId &&
+      o.type === 'table' &&
+      (o.tableId === table.id || o.tableNumber === table.number) &&
+      o.status !== 'cancelled' &&
+      !o.paid &&
+      o.status !== 'closed'
+  );
+
+  const nowIso = new Date().toISOString();
+  let order: Order;
+
+  if (orderIdx >= 0) {
+    order = {
+      ...allOrders[orderIdx],
+      items: allOrders[orderIdx].items.map((i) => ({ ...i })),
+    };
+  } else {
+    const nextNum = allOrders.reduce((max, o) => Math.max(max, o.orderNumber || 0), 100) + 1;
+    order = {
+      id: `ord-tbl-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      tenantId,
+      orderNumber: nextNum,
+      type: 'table',
+      status: 'preparing',
+      tableId: table.id,
+      tableNumber: table.number,
+      tableName: table.label || `Mesa ${table.number}`,
+      customerName: table.customerName,
+      waiterId: operatorUser.id,
+      waiterName: operatorUser.name,
+      items: [],
+      subtotal: 0,
+      discount: 0,
+      serviceFee: 0,
+      extraTotal: table.extraTotal || 0,
+      extraCharges: table.extraCharges || [],
+      total: table.extraTotal || 0,
+      payments: [],
+      paid: false,
+      createdAt: nowIso,
+    };
+  }
+
+  for (const reqItem of itemsToAdd) {
+    const pIdx = allProducts.findIndex((p) => p.id === reqItem.productId && p.tenantId === tenantId);
+    const prod = allProducts[pIdx];
+    const prevStock = prod.stockQuantity ?? 0;
+    const newStock = allowNegativeStock
+      ? Number((prevStock - reqItem.quantity).toFixed(3))
+      : Math.max(0, Number((prevStock - reqItem.quantity).toFixed(3)));
+
+    allProducts[pIdx] = { ...prod, stockQuantity: newStock, updatedAt: nowIso };
+
+    addInventoryTransaction({
+      id: `inv-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      tenantId,
+      productId: prod.id,
+      productName: prod.name,
+      type: 'sale',
+      quantity: reqItem.quantity,
+      previousStock: prevStock,
+      newStock,
+      reason: `Consumo adicionado à ${table.label || `Mesa ${table.number}`}`,
+      userId: operatorUser.id,
+      userName: operatorUser.name,
+      createdAt: nowIso,
+    });
+
+    const variationPrice =
+      reqItem.variationName && prod.variations?.length
+        ? prod.variations.find((v) => v.name === reqItem.variationName)?.price ?? prod.sellingPrice
+        : prod.sellingPrice;
+    const addonsTotal = (reqItem.selectedAddons || []).reduce((acc, a) => acc + a.price, 0);
+    const unitPrice = Number((variationPrice + addonsTotal).toFixed(2));
+    const cleanNotes = (reqItem.notes || '').trim();
+    const addonsKey = JSON.stringify(reqItem.selectedAddons || []);
+
+    const existingItemIdx = order.items.findIndex(
+      (existing) =>
+        existing.productId === prod.id &&
+        (existing.variationName || '') === (reqItem.variationName || '') &&
+        (existing.notes || '').trim() === cleanNotes &&
+        JSON.stringify(existing.selectedAddons || []) === addonsKey
+    );
+
+    if (existingItemIdx >= 0) {
+      const existing = order.items[existingItemIdx];
+      const nextQty = Number((existing.quantity + reqItem.quantity).toFixed(3));
+      order.items[existingItemIdx] = {
+        ...existing,
+        quantity: nextQty,
+        total: Number((nextQty * existing.unitPrice).toFixed(2)),
+      };
+    } else {
+      order.items.push({
+        productId: prod.id,
+        productName: prod.name,
+        quantity: reqItem.quantity,
+        unitPrice,
+        variationName: reqItem.variationName,
+        selectedAddons: reqItem.selectedAddons,
+        notes: cleanNotes || undefined,
+        total: Number((reqItem.quantity * unitPrice).toFixed(2)),
+      });
+    }
+  }
+
+  setStorage(STORAGE_KEYS.PRODUCTS, allProducts);
+
+  const itemsSubtotal = Number(order.items.reduce((sum, i) => sum + i.total, 0).toFixed(2));
+  const activeExtras = (table.extraCharges || []).filter((c) => c.status === 'active');
+  const extraTotal = Number(activeExtras.reduce((sum, c) => sum + c.amount, 0).toFixed(2));
+
+  order.subtotal = itemsSubtotal;
+  order.extraTotal = extraTotal;
+  order.extraCharges = table.extraCharges || [];
+  order.total = Number((itemsSubtotal + extraTotal).toFixed(2));
+
+  if (orderIdx >= 0) {
+    allOrders[orderIdx] = order;
+  } else {
+    allOrders.unshift(order);
+  }
+  setStorage(STORAGE_KEYS.ORDERS, allOrders);
+
+  const openTableOrders = allOrders.filter(
+    (o) =>
+      o.tenantId === tenantId &&
+      o.type === 'table' &&
+      (o.tableId === table.id || o.tableNumber === table.number) &&
+      o.status !== 'cancelled' &&
+      !o.paid &&
+      o.status !== 'closed'
+  );
+  const productsTotal = Number(openTableOrders.reduce((acc, o) => acc + (o.subtotal || 0), 0).toFixed(2));
+  const grandTotal = Number((productsTotal + extraTotal).toFixed(2));
+
+  const updatedTable: RestaurantTable = {
+    ...table,
+    status: table.status === 'closing' ? 'closing' : 'occupied',
+    openedAt: table.openedAt || nowIso,
+    waiterId: table.waiterId || operatorUser.id,
+    waiterName: table.waiterName || operatorUser.name,
+    currentOrderId: order.id,
+    productsTotal,
+    extraTotal,
+    currentTotal: grandTotal,
+    activeOrdersCount: openTableOrders.length,
+  };
+  allTables[tableIdx] = updatedTable;
+  setStorage(STORAGE_KEYS.TABLES, allTables);
+
+  addAuditLog({
+    tenantId,
+    userId: operatorUser.id,
+    userName: operatorUser.name,
+    action: 'ADICIONOU_ITENS_MESA',
+    details: `Adicionou ${itemsToAdd.length} item(ns) na ${table.label || `Mesa ${table.number}`}. Subtotal produtos: R$ ${productsTotal.toFixed(2)}.`,
+  });
+
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('sabor_local_sync', { detail: { action: 'table_items_added', tableId } }));
+  }
+
+  return { success: true, table: updatedTable, order };
 }
 
 // Garante separação estrita entre venda de produtos e valores extras da mesa

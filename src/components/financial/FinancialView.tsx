@@ -42,12 +42,23 @@ export const FinancialView: React.FC = () => {
   const paidOrders = orders.filter((o) => o.paid && o.status !== 'cancelled');
   const totalRevenue = paidOrders.reduce((acc, o) => acc + getOrderProductSalesTotal(o), 0);
   const totalExtraRecovered = paidOrders.reduce((acc, o) => acc + getOrderExtraTotal(o), 0);
-  const totalCashSales = paidOrders
-    .filter((o) => o.payments[0]?.method === 'dinheiro')
-    .reduce((acc, o) => acc + getOrderProductSalesTotal(o), 0);
-  const totalPixSales = paidOrders
-    .filter((o) => o.payments[0]?.method === 'pix')
-    .reduce((acc, o) => acc + getOrderProductSalesTotal(o), 0);
+
+  let totalCashSales = 0;
+  let totalPixSales = 0;
+  paidOrders.forEach((o) => {
+    const productRevenue = getOrderProductSalesTotal(o);
+    const payments = o.payments || [];
+    if (payments.length === 0) return;
+
+    const sumPayments = payments.reduce((sum, p) => sum + (p.amount || 0), 0);
+    const ratio = sumPayments > 0 ? productRevenue / sumPayments : 1;
+
+    payments.forEach((p) => {
+      const share = Number(((p.amount || 0) * ratio).toFixed(2));
+      if (p.method === 'dinheiro') totalCashSales += share;
+      if (p.method === 'pix') totalPixSales += share;
+    });
+  });
 
   // Gastos e Despesas Reais
   const totalExpenses = expenses.reduce((acc, e) => acc + (e.amount || 0), 0);

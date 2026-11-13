@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import { UserProfile, UserRole, UserPermission } from '../types';
 import { useTenant } from './TenantContext';
 import {
@@ -17,6 +17,14 @@ import {
 import { DEFAULT_PERMISSIONS } from '../services/mock-data';
 import { auth, googleProvider } from '../services/firebase';
 import { signInWithPopup, signOut, onAuthStateChanged, User as FirebaseUser } from 'firebase/auth';
+import {
+  initRealtimeSync,
+  isWebPortalUrl,
+  getWebPortalAuth,
+  logoutWebPortal,
+  getWsConnectionStatus,
+  type WebPortalAuthState,
+} from '../services/sync-client';
 
 interface AuthContextType {
   currentUser: UserProfile | null;
@@ -27,6 +35,12 @@ interface AuthContextType {
   isCashier: boolean;
   activeView: 'admin' | 'vendedor';
   setActiveView: (view: 'admin' | 'vendedor') => void;
+  isWebPortal: boolean;
+  webPortalAuth: WebPortalAuthState | null;
+  wsConnected: boolean;
+  wsRevision: number;
+  revokedMessage: string | null;
+  clearRevokedMessage: () => void;
   switchUser: (userId: string) => void;
   createUser: (userData: {
     name: string;
@@ -50,39 +64,108 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [users, setUsers] = useState<UserProfile[]>([]);
   const [currentUser, setCurrentUser] = useState<UserProfile | null>(null);
   const [firebaseUser, setFirebaseUser] = useState<FirebaseUser | null>(null);
-  const [activeView, setActiveView] = useState<'admin' | 'vendedor'>('admin');
+  const [activeView, setActiveViewState] = useState<'admin' | 'vendedor'>('admin');
+  const [webPortalAuth, setWebPortalAuthState] = useState<WebPortalAuthState | null>(() =>
+    getWebPortalAuth()
+  );
+  const [isWebPortal] = useState<boolean>(() => isWebPortalUrl());
+  const [wsConnected, setWsConnected] = useState<boolean>(() => getWsConnectionStatus().connected);
+  const [wsRevision, setWsRevision] = useState<number>(() => getWsConnectionStatus().revision);
+  const [revokedMessage, setRevokedMessage] = useState<string | null>(null);
 
-  // Load users when current tenant changes
-  useEffect(() => {
+  const reloadUsersFromStorage = useCallback(() => {
     if (!currentTenant?.id) return;
     const tenantUsers = getUsers(currentTenant.id);
     setUsers(tenantUsers);
 
+    const portalAuth = getWebPortalAuth();
+    if (portalAuth) {
+      const syncedUser =
+        tenantUsers.find((u) => u.id === portalAuth.user.id) || portalAuth.user;
+      setCurrentUser(syncedUser);
+      setActiveViewState(portalAuth.session.mode === 'admin' ? 'admin' : 'vendedor');
+      return;
+    }
+
     const activeId = getActiveUserId();
     const active = tenantUsers.find((u) => u.id === activeId) || tenantUsers[0] || null;
     setCurrentUser(active);
-
     if (active) {
       if (active.role === 'waiter' || active.role === 'cashier') {
-        setActiveView('vendedor');
+        setActiveViewState('vendedor');
       } else {
-        setActiveView('admin');
+        setActiveViewState('admin');
       }
     }
   }, [currentTenant?.id]);
+
+  // Load users when current tenant changes
+  useEffect(() => {
+    reloadUsersFromStorage();
+  }, [reloadUsersFromStorage]);
+
+  // Initialize Real-Time WebSocket + HTTP Sync
+  useEffect(() => {
+    if (!currentTenant?.id) return;
+    initRealtimeSync({
+      tenantId: currentTenant.id,
+      userId: currentUser?.id,
+    });
+  }, [currentTenant?.id, currentUser?.id, webPortalAuth?.token]);
+
+  // Listen to storage sync, WS connection status, and remote revocations
+  useEffect(() => {
+    const onLocalSync = () => {
+      reloadUsersFromStorage();
+    };
+    const onWebAuthChanged = (e: Event) => {
+      const detail = (e as CustomEvent<WebPortalAuthState | null>).detail;
+      setWebPortalAuthState(detail);
+      if (detail) {
+        setRevokedMessage(null);
+        setCurrentUser(detail.user);
+        setActiveViewState(detail.session.mode === 'admin' ? 'admin' : 'vendedor');
+      }
+      reloadUsersFromStorage();
+    };
+    const onWebRevoked = (e: Event) => {
+      const detail = (e as CustomEvent<{ reason?: string }>).detail;
+      setWebPortalAuthState(null);
+      setRevokedMessage(
+        detail?.reason || 'Acesso desconectado ou bloqueado pelo Administrador.'
+      );
+    };
+    const onWsStatus = (e: Event) => {
+      const detail = (e as CustomEvent<{ connected: boolean; revision: number }>).detail;
+      if (detail) {
+        setWsConnected(detail.connected);
+        setWsRevision(detail.revision);
+      }
+    };
+
+    window.addEventListener('sabor_local_sync', onLocalSync);
+    window.addEventListener('sabor_web_auth_changed', onWebAuthChanged);
+    window.addEventListener('sabor_web_revoked', onWebRevoked);
+    window.addEventListener('sabor_ws_status', onWsStatus);
+
+    return () => {
+      window.removeEventListener('sabor_local_sync', onLocalSync);
+      window.removeEventListener('sabor_web_auth_changed', onWebAuthChanged);
+      window.removeEventListener('sabor_web_revoked', onWebRevoked);
+      window.removeEventListener('sabor_ws_status', onWsStatus);
+    };
+  }, [reloadUsersFromStorage]);
 
   // Monitor Firebase Auth
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (user) => {
       setFirebaseUser(user);
-      if (user && currentTenant?.id) {
-        // If this firebase user matches or needs linking
+      if (user && currentTenant?.id && !getWebPortalAuth()) {
         const existing = users.find((u) => u.email.toLowerCase() === user.email?.toLowerCase());
         if (existing) {
           setCurrentUser(existing);
           setActiveUserId(existing.id);
         } else if (user.email === 'agnaldomix@gmail.com') {
-          // Auto-attach bootstrap admin
           const adminUser: UserProfile = {
             id: user.uid,
             tenantId: currentTenant.id,
@@ -106,23 +189,32 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return () => unsubscribe();
   }, [currentTenant?.id, users]);
 
+  const setActiveView = (view: 'admin' | 'vendedor') => {
+    if (webPortalAuth && webPortalAuth.session.mode === 'seller') {
+      // Vendedor autenticado pelo navegador nunca alterna para MODO ADMINISTRADOR
+      setActiveViewState('vendedor');
+      return;
+    }
+    setActiveViewState(view);
+  };
+
   const switchUser = (userId: string) => {
+    if (webPortalAuth) return; // Troca direta desabilitada quando conectado via chave web
     const target = users.find((u) => u.id === userId);
     if (target) {
       setCurrentUser(target);
       setActiveUserId(userId);
-      // Auto-route view depending on permissions
       if (target.role === 'waiter' || target.role === 'cashier') {
-        setActiveView('vendedor');
+        setActiveViewState('vendedor');
       } else {
-        setActiveView('admin');
+        setActiveViewState('admin');
       }
       addAuditLog({
         tenantId: currentTenant.id,
         userId: target.id,
         userName: target.name,
-        action: 'LOGIN_SIMULADO',
-        details: `Usuário ativo alterado para ${target.name} (${target.role})`,
+        action: 'ALTERACAO_PERFIL_MATRIZ',
+        details: `Operador ativo alterado para ${target.name} (${target.role})`,
       });
     }
   };
@@ -145,6 +237,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       phone: userData.phone,
       role: userData.role,
       active: true,
+      canSell: true,
+      status: 'autorizado',
       commissionRate: userData.commissionRate ?? (userData.role === 'waiter' ? 5 : 0),
       salesTargetMonthly: userData.salesTargetMonthly ?? 15000,
       permissions: {
@@ -218,15 +312,20 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   const logout = () => {
+    if (webPortalAuth) {
+      logoutWebPortal();
+      return;
+    }
     signOut(auth).catch(() => {});
     if (users.length > 0) {
-      // Return to first user
       setCurrentUser(users[0]);
       setActiveUserId(users[0].id);
     }
   };
 
-  const isAdm = currentUser?.role === 'admin' || currentUser?.role === 'manager';
+  const isAdm = webPortalAuth
+    ? webPortalAuth.session.mode === 'admin'
+    : currentUser?.role === 'admin' || currentUser?.role === 'manager';
   const isWaiter = currentUser?.role === 'waiter';
   const isCashier = currentUser?.role === 'cashier';
 
@@ -241,6 +340,12 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         isCashier,
         activeView,
         setActiveView,
+        isWebPortal,
+        webPortalAuth,
+        wsConnected,
+        wsRevision,
+        revokedMessage,
+        clearRevokedMessage: () => setRevokedMessage(null),
         switchUser,
         createUser,
         updateUser,
