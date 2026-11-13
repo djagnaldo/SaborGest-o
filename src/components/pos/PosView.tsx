@@ -21,7 +21,6 @@ import {
   Camera,
   Upload,
   Grid2X2,
-  Scale,
   Clock,
   ArrowRight,
   Ban,
@@ -631,6 +630,17 @@ export const PosView: React.FC<PosViewProps> = ({
     const todayStr = new Date().toDateString();
     const q = historySearch.trim().toLowerCase();
     return orders.filter((o) => {
+      if (!isAdm && currentUser) {
+        const isContributor =
+          Array.isArray(o.contributors) &&
+          o.contributors.some((c: any) => (typeof c === 'string' ? c === currentUser.id : c?.id === currentUser.id));
+        const isOwner =
+          o.waiterId === currentUser.id ||
+          o.createdById === currentUser.id ||
+          isContributor ||
+          (!o.waiterId && o.waiterName === currentUser.name);
+        if (!isOwner) return false;
+      }
       if (historyFilter === 'today' && new Date(o.createdAt).toDateString() !== todayStr) return false;
       if (historyFilter === 'counter' && o.type !== 'counter') return false;
       if (historyFilter === 'table' && o.type !== 'table') return false;
@@ -644,7 +654,7 @@ export const PosView: React.FC<PosViewProps> = ({
       }
       return true;
     });
-  }, [orders, historyFilter, historySearch]);
+  }, [orders, historyFilter, historySearch, isAdm, currentUser]);
 
   // =========================================================================
   // RENDER: MODO BALCÃO INDEPENDENTE
@@ -821,7 +831,6 @@ export const PosView: React.FC<PosViewProps> = ({
               {/* Grid de Produtos */}
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
                 {filteredCatalog.map((prod) => {
-                  const isWeight = prod.allowWeight || prod.unit === 'kg' || prod.unit === 'g';
                   const outOfStock = !currentTenant.settings?.allowNegativeStock && (prod.stockQuantity ?? 0) <= 0;
 
                   return (
@@ -852,11 +861,6 @@ export const PosView: React.FC<PosViewProps> = ({
                         <span className="absolute top-2 left-2 rounded-md bg-stone-900/80 px-1.5 py-0.5 font-mono text-[10px] font-bold text-white">
                           {prod.internalCode}
                         </span>
-                        {isWeight && (
-                          <span className="absolute bottom-2 left-2 inline-flex items-center gap-1 rounded-md bg-amber-600/95 px-1.5 py-0.5 text-[10px] font-bold text-white">
-                            <Scale className="h-3 w-3" /> Balança
-                          </span>
-                        )}
                       </div>
 
                       <div className="flex flex-1 flex-col justify-between p-3">
@@ -1298,6 +1302,11 @@ export const PosView: React.FC<PosViewProps> = ({
                         {table.customerName && (
                           <p className="text-xs text-stone-500">Cliente: {table.customerName}</p>
                         )}
+                        {(table.openedByName || table.waiterName) && (
+                          <p className="text-[11px] text-stone-500">
+                            Aberta por: <strong>{table.openedByName || table.waiterName}</strong>
+                          </p>
+                        )}
                       </div>
                       <span className="text-lg font-black text-stone-900 tabular-nums">
                         {formatBRL(rem)}
@@ -1345,9 +1354,13 @@ export const PosView: React.FC<PosViewProps> = ({
       <section className="rounded-2xl border border-stone-200 bg-white shadow-2xs overflow-hidden">
         <div className="flex flex-col gap-3 border-b border-stone-100 p-4 sm:flex-row sm:items-center sm:justify-between">
           <div>
-            <h2 className="text-sm font-bold text-stone-900">Vendas Registradas</h2>
+            <h2 className="text-sm font-bold text-stone-900">
+              {isAdm ? 'Vendas Registradas' : 'Minhas Vendas Registradas'}
+            </h2>
             <p className="text-xs text-stone-500">
-              Consulte vendas de Balcão e Mesas quitadas ou em andamento.
+              {isAdm
+                ? 'Consulte vendas de Balcão e Mesas quitadas ou em andamento.'
+                : 'Exibindo exclusivamente suas vendas e atendimentos realizados neste estabelecimento.'}
             </p>
           </div>
 
@@ -1509,11 +1522,18 @@ export const PosView: React.FC<PosViewProps> = ({
                   {settlingOpenOrders.flatMap((ord) =>
                     ord.items.map((item, idx) => (
                       <div key={`${ord.id}-${idx}`} className="py-1.5 flex justify-between gap-2">
-                        <span className="text-stone-800 font-medium">
-                          <strong className="tabular-nums">{item.quantity}×</strong> {item.productName}
-                          {item.variationName ? ` (${item.variationName})` : ''}
-                        </span>
-                        <span className="font-bold text-stone-900 tabular-nums">
+                        <div className="min-w-0">
+                          <span className="text-stone-800 font-medium block">
+                            <strong className="tabular-nums">{item.quantity}×</strong> {item.productName}
+                            {item.variationName ? ` (${item.variationName})` : ''}
+                          </span>
+                          {item.addedByName && (
+                            <span className="text-[10px] text-stone-500">
+                              Lançado por: {item.addedByName}
+                            </span>
+                          )}
+                        </div>
+                        <span className="font-bold text-stone-900 tabular-nums shrink-0">
                           {formatBRL(item.total)}
                         </span>
                       </div>

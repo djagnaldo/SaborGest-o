@@ -51,6 +51,8 @@ class SaborServerStore(
     private val lock = Any()
     private val random = SecureRandom()
     private val dbFile = File(context.filesDir, "saborgestao-db.json")
+    private val mediaDir = File(context.filesDir, "media")
+    private val archivesDir = File(context.filesDir, "archives")
     private var db: JSONObject = loadFromDisk()
 
     private fun nowIso(): String = formatIso(System.currentTimeMillis())
@@ -108,8 +110,11 @@ class SaborServerStore(
             put("auditLogs", JSONArray())
             put("savedReports", JSONArray())
             put("archivedPeriods", JSONArray())
+            put("archivedPdfs", JSONArray())
             put("backups", JSONArray())
             put("tableArchives", JSONArray())
+            put("customers", JSONArray())
+            put("suppliers", JSONArray())
             put("themeConfig", JSONObject().apply {
                 put("posColor", "#d97706")
                 put("inventoryColor", "#059669")
@@ -191,6 +196,8 @@ class SaborServerStore(
 
     private fun loadFromDisk(): JSONObject {
         try {
+            if (!mediaDir.exists()) mediaDir.mkdirs()
+            if (!archivesDir.exists()) archivesDir.mkdirs()
             if (dbFile.exists()) {
                 val raw = dbFile.readText(Charsets.UTF_8)
                 val parsed = JSONObject(raw)
@@ -210,6 +217,7 @@ class SaborServerStore(
                     base.put("sessions", parsed.optJSONArray("sessions") ?: JSONArray())
                     base.put("connectionLogs", parsed.optJSONArray("connectionLogs") ?: JSONArray())
                     base.put("processedMutationIds", parsed.optJSONArray("processedMutationIds") ?: JSONArray())
+                    writeAtomic(base)
                     return base
                 }
             }
@@ -225,6 +233,8 @@ class SaborServerStore(
             if (parent != null && !parent.exists()) {
                 parent.mkdirs()
             }
+            if (!mediaDir.exists()) mediaDir.mkdirs()
+            if (!archivesDir.exists()) archivesDir.mkdirs()
             val tmp = File(context.filesDir, "saborgestao-db.tmp-${System.currentTimeMillis()}")
             tmp.writeText(snapshot.toString(), Charsets.UTF_8)
             if (!tmp.renameTo(dbFile)) {
@@ -491,41 +501,110 @@ class SaborServerStore(
             ?: "tenant-demo-01"
 
         if (roleMode == "seller") {
+            val filteredTenants = JSONArray()
+            for (i in 0 until tenants.length()) {
+                val t = tenants.optJSONObject(i) ?: continue
+                if (t.optString("id") == activeTenantId) filteredTenants.put(JSONObject(t.toString()))
+            }
+
             val usersArr = data.optJSONArray("users") ?: JSONArray()
             val filteredUsers = JSONArray()
             for (i in 0 until usersArr.length()) {
                 val u = usersArr.optJSONObject(i) ?: continue
+                if (u.optString("tenantId") != activeTenantId) continue
                 val copy = JSONObject(u.toString())
                 if (copy.optString("id") != userId) {
                     copy.remove("accessCode")
                 }
+                copy.put("commissionRate", 0)
+                copy.remove("salesTargetMonthly")
                 filteredUsers.put(copy)
             }
 
+            val categoriesArr = JSONArray()
+            val allCats = data.optJSONArray("categories") ?: JSONArray()
+            for (i in 0 until allCats.length()) {
+                val c = allCats.optJSONObject(i) ?: continue
+                if (c.optString("tenantId") == activeTenantId) categoriesArr.put(JSONObject(c.toString()))
+            }
+
+            val productsArr = JSONArray()
+            val allProds = data.optJSONArray("products") ?: JSONArray()
+            for (i in 0 until allProds.length()) {
+                val p = allProds.optJSONObject(i) ?: continue
+                if (p.optString("tenantId") == activeTenantId) productsArr.put(JSONObject(p.toString()))
+            }
+
+            val tablesArr = JSONArray()
+            val allTables = data.optJSONArray("tables") ?: JSONArray()
+            for (i in 0 until allTables.length()) {
+                val t = allTables.optJSONObject(i) ?: continue
+                if (t.optString("tenantId") == activeTenantId) tablesArr.put(JSONObject(t.toString()))
+            }
+
+            val ordersArr = JSONArray()
+            val allOrders = data.optJSONArray("orders") ?: JSONArray()
+            for (i in 0 until allOrders.length()) {
+                val o = allOrders.optJSONObject(i) ?: continue
+                if (o.optString("tenantId") != activeTenantId) continue
+                var isContributor = false
+                val contribs = o.optJSONArray("contributors")
+                if (contribs != null) {
+                    for (cIdx in 0 until contribs.length()) {
+                        if (contribs.optJSONObject(cIdx)?.optString("id") == userId) {
+                            isContributor = true
+                            break
+                        }
+                    }
+                }
+                val isOwner = o.optString("waiterId") == userId || o.optString("createdById") == userId || isContributor
+                val isOpenTable = o.optString("type") == "table" && o.optString("status") != "closed" && o.optString("status") != "cancelled" && !o.optBoolean("paid", false)
+                if (isOwner || isOpenTable) {
+                    ordersArr.put(JSONObject(o.toString()))
+                }
+            }
+
             val cashArr = data.optJSONArray("cashSessions") ?: JSONArray()
-            val openCash = JSONArray()
+            val maskedCash = JSONArray()
             for (i in 0 until cashArr.length()) {
                 val c = cashArr.optJSONObject(i) ?: continue
-                if (c.optString("status") == "open") {
-                    openCash.put(JSONObject(c.toString()))
+                if (c.optString("tenantId") == activeTenantId && c.optString("status") == "open") {
+                    maskedCash.put(JSONObject().apply {
+                        put("id", c.optString("id"))
+                        put("tenantId", c.optString("tenantId"))
+                        put("openedBy", c.optString("openedBy"))
+                        put("openedByName", c.optString("openedByName"))
+                        put("openedAt", c.optString("openedAt"))
+                        put("status", "open")
+                        put("initialAmount", 0.0)
+                        put("totalCash", 0.0)
+                        put("totalPix", 0.0)
+                        put("totalDevendo", 0.0)
+                        put("totalWithdrawals", 0.0)
+                        put("totalDeposits", 0.0)
+                        put("expectedAmount", 0.0)
+                    })
                 }
             }
 
             val sellerData = JSONObject().apply {
-                put("tenants", JSONArray(tenants.toString()))
+                put("tenants", filteredTenants)
                 put("users", filteredUsers)
-                put("categories", JSONArray((data.optJSONArray("categories") ?: JSONArray()).toString()))
-                put("products", JSONArray((data.optJSONArray("products") ?: JSONArray()).toString()))
-                put("tables", JSONArray((data.optJSONArray("tables") ?: JSONArray()).toString()))
-                put("orders", JSONArray((data.optJSONArray("orders") ?: JSONArray()).toString()))
-                put("cashSessions", openCash)
+                put("categories", categoriesArr)
+                put("products", productsArr)
+                put("tables", tablesArr)
+                put("orders", ordersArr)
+                put("cashSessions", maskedCash)
                 put("financial", JSONArray())
                 put("inventoryTransactions", JSONArray())
                 put("auditLogs", JSONArray())
                 put("savedReports", JSONArray())
                 put("archivedPeriods", JSONArray())
+                put("archivedPdfs", JSONArray())
                 put("backups", JSONArray())
                 put("tableArchives", JSONArray())
+                put("customers", JSONArray())
+                put("suppliers", JSONArray())
                 put("themeConfig", JSONObject((data.optJSONObject("themeConfig") ?: JSONObject()).toString()))
             }
             return@synchronized JSONObject().apply {
@@ -1335,12 +1414,27 @@ class SaborServerStore(
 
         val now = nowIso()
         val tableLabel = table.optString("label").takeIf { it.isNotBlank() } ?: "Mesa $tableNumber"
+        val isOpeningTable = table.optString("openedById").isBlank() || table.optString("status") == "available"
+        val tableOpLogs = JSONArray((table.optJSONArray("operationLogs") ?: JSONArray()).toString())
+        if (isOpeningTable) {
+            tableOpLogs.put(JSONObject().apply {
+                put("id", "tlog-${System.currentTimeMillis()}-${randomHex(2)}")
+                put("type", "table_opened")
+                put("notes", "Mesa aberta por $operatorName")
+                put("operatorId", operatorId)
+                put("operatorName", operatorName)
+                put("timestamp", now)
+            })
+        }
+
         if (order == null) {
             var maxOrderNum = 100
             for (i in 0 until orders.length()) {
                 val num = orders.optJSONObject(i)?.optInt("orderNumber", 0) ?: 0
                 if (num > maxOrderNum) maxOrderNum = num
             }
+            val openerId = table.optString("openedById").takeIf { it.isNotBlank() } ?: operatorId
+            val openerName = table.optString("openedByName").takeIf { it.isNotBlank() } ?: operatorName
             order = JSONObject().apply {
                 put("id", "ord-tbl-${System.currentTimeMillis()}-${randomHex(2)}")
                 put("tenantId", tenantId)
@@ -1352,8 +1446,14 @@ class SaborServerStore(
                 put("tableName", tableLabel)
                 val cName = table.optString("customerName")
                 if (cName.isNotBlank()) put("customerName", cName)
-                put("waiterId", operatorId)
-                put("waiterName", operatorName)
+                put("waiterId", openerId)
+                put("waiterName", openerName)
+                put("createdById", openerId)
+                put("createdByName", openerName)
+                put("contributors", JSONArray().put(JSONObject().apply {
+                    put("id", operatorId)
+                    put("name", operatorName)
+                }))
                 put("items", JSONArray())
                 put("subtotal", 0.0)
                 put("discount", 0.0)
@@ -1365,12 +1465,34 @@ class SaborServerStore(
                 put("paid", false)
                 put("createdAt", now)
             }
+        } else {
+            val contribs = JSONArray((order.optJSONArray("contributors") ?: JSONArray()).toString())
+            var hasOp = false
+            for (c in 0 until contribs.length()) {
+                if (contribs.optJSONObject(c)?.optString("id") == operatorId) {
+                    hasOp = true
+                    break
+                }
+            }
+            if (!hasOp) {
+                contribs.put(JSONObject().apply {
+                    put("id", operatorId)
+                    put("name", operatorName)
+                })
+            }
+            order.put("contributors", contribs)
+            if (order.optString("createdById").isBlank()) {
+                order.put("createdById", order.optString("waiterId").takeIf { it.isNotBlank() } ?: operatorId)
+            }
+            if (order.optString("createdByName").isBlank()) {
+                order.put("createdByName", order.optString("waiterName").takeIf { it.isNotBlank() } ?: operatorName)
+            }
         }
 
         val orderItems = order.optJSONArray("items") ?: JSONArray()
         var invTxs = data.optJSONArray("inventoryTransactions") ?: JSONArray()
 
-        // 3. Baixa estoque delta e acumula itens equivalentes
+        // 3. Baixa estoque delta e acumula itens equivalentes com rastreio de autoria
         for (i in 0 until items.length()) {
             val reqItem = items.getJSONObject(i)
             val prodId = reqItem.optString("productId")
@@ -1446,6 +1568,11 @@ class SaborServerStore(
                 val accQty = round3(existing.optDouble("quantity", 0.0) + qty)
                 val lockedUnitPrice = existing.optDouble("unitPrice", unitPrice)
                 existing.put("quantity", accQty)
+                val prevAuthors = existing.optString("addedByName", "").split(",").map { it.trim() }.filter { it.isNotEmpty() }.toMutableList()
+                if (!prevAuthors.contains(operatorName)) prevAuthors.add(operatorName)
+                if (existing.optString("addedById").isBlank()) existing.put("addedById", operatorId)
+                existing.put("addedByName", prevAuthors.joinToString(", "))
+                if (existing.optString("addedAt").isBlank()) existing.put("addedAt", now)
                 existing.put("total", round2(accQty * lockedUnitPrice))
             } else {
                 val newOrderItem = JSONObject().apply {
@@ -1456,10 +1583,25 @@ class SaborServerStore(
                     if (varName.isNotEmpty()) put("variationName", varName)
                     if (selectedAddons.length() > 0) put("selectedAddons", selectedAddons)
                     if (cleanNotes.isNotEmpty()) put("notes", cleanNotes)
+                    put("addedById", operatorId)
+                    put("addedByName", operatorName)
+                    put("addedAt", now)
                     put("total", round2(qty * unitPrice))
                 }
                 orderItems.put(newOrderItem)
             }
+
+            tableOpLogs.put(JSONObject().apply {
+                put("id", "tlog-${System.currentTimeMillis()}-${randomHex(2)}")
+                put("type", "item_added")
+                put("productId", prodId)
+                put("productName", prod.optString("name"))
+                put("quantity", qty)
+                if (varName.isNotEmpty()) put("notes", "Variação: $varName")
+                put("operatorId", operatorId)
+                put("operatorName", operatorName)
+                put("timestamp", now)
+            })
         }
 
         data.put("inventoryTransactions", invTxs)
@@ -1515,6 +1657,8 @@ class SaborServerStore(
             table.put("status", "occupied")
         }
         if (table.optString("openedAt").isBlank()) table.put("openedAt", now)
+        if (table.optString("openedById").isBlank()) table.put("openedById", operatorId)
+        if (table.optString("openedByName").isBlank()) table.put("openedByName", operatorName)
         if (table.optString("waiterId").isBlank()) table.put("waiterId", operatorId)
         if (table.optString("waiterName").isBlank()) table.put("waiterName", operatorName)
         table.put("currentOrderId", order.optString("id"))
@@ -1522,6 +1666,7 @@ class SaborServerStore(
         table.put("extraTotal", extraTotal)
         table.put("currentTotal", grandTotal)
         table.put("activeOrdersCount", activeCount)
+        table.put("operationLogs", tableOpLogs)
         tables.put(tableIdx, table)
 
         addAuditLog(
@@ -1753,6 +1898,8 @@ class SaborServerStore(
 
         table.put("status", "available")
         table.remove("openedAt")
+        table.remove("openedById")
+        table.remove("openedByName")
         table.remove("waiterId")
         table.remove("waiterName")
         table.remove("currentOrderId")
@@ -1763,6 +1910,7 @@ class SaborServerStore(
         table.put("payments", JSONArray())
         table.put("extraCharges", JSONArray())
         table.put("activeOrdersCount", 0)
+        table.put("operationLogs", JSONArray())
         table.remove("timer")
         tables.put(tableIdx, table)
 
@@ -2167,7 +2315,8 @@ class SaborServerStore(
             listOf(
                 "tenants", "users", "categories", "products", "tables", "orders",
                 "cashSessions", "financial", "inventoryTransactions", "auditLogs",
-                "savedReports", "archivedPeriods", "backups", "tableArchives", "themeConfig"
+                "savedReports", "archivedPeriods", "archivedPdfs", "backups",
+                "tableArchives", "customers", "suppliers", "themeConfig"
             )
         }
 
@@ -2239,5 +2388,691 @@ class SaborServerStore(
         bitmap.compress(Bitmap.CompressFormat.PNG, 100, baos)
         val base64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
         return "data:image/png;base64,$base64"
+    }
+
+    // ==================== MÍDIA, MESAS STATUS, CATÁLOGO, CONTATOS E PDF ====================
+
+    fun saveMediaFile(dataUrl: String, prefix: String = "prod"): JSONObject {
+        if (!mediaDir.exists()) mediaDir.mkdirs()
+        val regex = Regex("^data:(image/(?:png|jpeg|jpg|webp|gif));base64,(.+)$", RegexOption.IGNORE_CASE)
+        val match = regex.find(dataUrl.trim()) ?: throw IllegalArgumentException("Imagem inválida.")
+        val mime = match.groupValues[1].lowercase(Locale.US)
+        val ext = when (mime) {
+            "image/png" -> "png"
+            "image/webp" -> "webp"
+            "image/gif" -> "gif"
+            else -> "jpg"
+        }
+        val bytes = Base64.decode(match.groupValues[2], Base64.DEFAULT)
+        if (bytes.isEmpty() || bytes.size > 6 * 1024 * 1024) {
+            throw IllegalArgumentException("Tamanho da imagem excede o limite de 6 MB.")
+        }
+        val safePrefix = prefix.replace(Regex("[^a-zA-Z0-9_-]"), "").take(20).ifBlank { "media" }
+        val fileName = "$safePrefix-${System.currentTimeMillis()}-${randomHex(3)}.$ext"
+        File(mediaDir, fileName).writeBytes(bytes)
+        return JSONObject().apply {
+            put("ok", true)
+            put("url", "/api/media/$fileName")
+            put("fileName", fileName)
+            put("sizeBytes", bytes.size)
+        }
+    }
+
+    fun readMediaFile(fileName: String): Pair<ByteArray, String>? {
+        if (!Regex("^[a-zA-Z0-9._-]+$").matches(fileName)) return null
+        val file = File(mediaDir, fileName)
+        if (!file.exists()) return null
+        val lower = fileName.lowercase(Locale.US)
+        val mime = when {
+            lower.endsWith(".png") -> "image/png"
+            lower.endsWith(".webp") -> "image/webp"
+            lower.endsWith(".gif") -> "image/gif"
+            else -> "image/jpeg"
+        }
+        return Pair(file.readBytes(), mime)
+    }
+
+    fun setTableStatus(tenantId: String, tableId: String, status: String, operatorId: String, operatorName: String): JSONObject = synchronized(lock) {
+        val tables = db.getJSONObject("data").optJSONArray("tables") ?: JSONArray()
+        for (i in 0 until tables.length()) {
+            val t = tables.optJSONObject(i) ?: continue
+            if (t.optString("id") == tableId && t.optString("tenantId") == tenantId) {
+                val oldStatus = t.optString("status")
+                t.put("status", status)
+                val logs = JSONArray((t.optJSONArray("operationLogs") ?: JSONArray()).toString())
+                logs.put(JSONObject().apply {
+                    put("id", "tlog-${System.currentTimeMillis()}-${randomHex(2)}")
+                    put("type", "status_changed")
+                    put("notes", "Status alterado de \"$oldStatus\" para \"$status\"")
+                    put("operatorId", operatorId)
+                    put("operatorName", operatorName)
+                    put("timestamp", nowIso())
+                })
+                t.put("operationLogs", logs)
+                tables.put(i, t)
+                addAuditLog(tenantId, operatorId, operatorName, "ALTEROU_STATUS_MESA", "Status da Mesa ${t.optInt("number")} alterado para $status.")
+                commit("table_status_changed", tenantId = tenantId)
+                return@synchronized JSONObject().apply {
+                    put("ok", true)
+                    put("table", JSONObject(t.toString()))
+                    put("revision", db.optInt("revision", 1))
+                }
+            }
+        }
+        throw IllegalArgumentException("Mesa não encontrada.")
+    }
+
+    fun upsertCategory(tenantId: String, payload: JSONObject, actorId: String, actorName: String): JSONObject = synchronized(lock) {
+        val name = payload.optString("name", "").trim()
+        if (name.isEmpty()) throw IllegalArgumentException("Informe o nome da categoria.")
+        val data = db.getJSONObject("data")
+        val cats = data.optJSONArray("categories") ?: JSONArray().also { data.put("categories", it) }
+        val reqId = payload.optString("id").takeIf { it.isNotBlank() }
+        var foundIdx = -1
+        for (i in 0 until cats.length()) {
+            val c = cats.optJSONObject(i) ?: continue
+            if (reqId != null && c.optString("id") == reqId && c.optString("tenantId") == tenantId) {
+                foundIdx = i
+                break
+            }
+        }
+        val saved = if (foundIdx >= 0) {
+            val prev = cats.getJSONObject(foundIdx)
+            prev.put("name", name)
+            if (payload.has("color")) prev.put("color", payload.optString("color"))
+            if (payload.has("active")) prev.put("active", payload.optBoolean("active", true))
+            cats.put(foundIdx, prev)
+            prev
+        } else {
+            val created = JSONObject().apply {
+                put("id", reqId ?: "cat-${System.currentTimeMillis()}-${randomHex(2)}")
+                put("tenantId", tenantId)
+                put("name", name)
+                put("color", payload.optString("color").ifBlank { "#d97706" })
+                put("order", cats.length() + 1)
+                put("active", payload.optBoolean("active", true))
+                put("createdAt", nowIso())
+            }
+            cats.put(created)
+            created
+        }
+        addAuditLog(tenantId, actorId, actorName, if (foundIdx >= 0) "EDITOU_CATEGORIA" else "CRIOU_CATEGORIA", "Categoria \"$name\" salva.")
+        commit("category_upserted", tenantId = tenantId)
+        JSONObject().put("ok", true).put("category", saved).put("revision", db.optInt("revision", 1))
+    }
+
+    fun deleteCategory(tenantId: String, categoryId: String, strategy: String?, targetCategoryId: String?, actorId: String, actorName: String): JSONObject = synchronized(lock) {
+        val data = db.getJSONObject("data")
+        val cats = data.optJSONArray("categories") ?: JSONArray()
+        val products = data.optJSONArray("products") ?: JSONArray()
+        var targetCat: JSONObject? = null
+        val nextCats = JSONArray()
+        for (i in 0 until cats.length()) {
+            val c = cats.optJSONObject(i) ?: continue
+            if (c.optString("id") == categoryId && c.optString("tenantId") == tenantId) {
+                targetCat = c
+            } else {
+                nextCats.put(c)
+            }
+        }
+        if (targetCat == null) throw IllegalArgumentException("Categoria não encontrada.")
+
+        var linkedCount = 0
+        for (i in 0 until products.length()) {
+            val p = products.optJSONObject(i) ?: continue
+            if (p.optString("tenantId") == tenantId && p.optString("categoryId") == categoryId) linkedCount++
+        }
+        if (linkedCount > 0) {
+            if (strategy != "transfer" && strategy != "uncategorized") {
+                throw IllegalArgumentException("Categoria possui $linkedCount produto(s). Escolha transferir ou deixar sem categoria.")
+            }
+            val nextCid = if (strategy == "transfer") (targetCategoryId ?: "") else ""
+            for (i in 0 until products.length()) {
+                val p = products.optJSONObject(i) ?: continue
+                if (p.optString("tenantId") == tenantId && p.optString("categoryId") == categoryId) {
+                    p.put("categoryId", nextCid)
+                    p.put("updatedAt", nowIso())
+                }
+            }
+        }
+        data.put("categories", nextCats)
+        addAuditLog(tenantId, actorId, actorName, "EXCLUIU_CATEGORIA", "Excluiu categoria \"${targetCat.optString("name")}\".")
+        commit("category_deleted", tenantId = tenantId)
+        JSONObject().put("ok", true).put("deletedId", categoryId).put("affectedProductsCount", linkedCount).put("revision", db.optInt("revision", 1))
+    }
+
+    fun upsertProduct(tenantId: String, payload: JSONObject, actorId: String, actorName: String): JSONObject = synchronized(lock) {
+        val name = payload.optString("name", "").trim()
+        if (name.isEmpty()) throw IllegalArgumentException("Informe o nome do produto.")
+        val data = db.getJSONObject("data")
+        val products = data.optJSONArray("products") ?: JSONArray().also { data.put("products", it) }
+
+        var imgUrl = payload.optString("imageUrl", "")
+        if (imgUrl.startsWith("data:image/")) {
+            imgUrl = saveMediaFile(imgUrl, "prod").optString("url")
+        }
+
+        val selling = payload.optDouble("sellingPrice", 0.0)
+        val cost = payload.optDouble("costPrice", 0.0)
+        val margin = if (selling > 0.0) round2(((selling - cost) / selling) * 100.0) else 0.0
+        val reqId = payload.optString("id").takeIf { it.isNotBlank() }
+        var foundIdx = -1
+        for (i in 0 until products.length()) {
+            val p = products.optJSONObject(i) ?: continue
+            if (reqId != null && p.optString("id") == reqId && p.optString("tenantId") == tenantId) {
+                foundIdx = i
+                break
+            }
+        }
+
+        val saved = if (foundIdx >= 0) products.getJSONObject(foundIdx) else JSONObject().apply {
+            put("id", reqId ?: "prod-${System.currentTimeMillis()}-${randomHex(2)}")
+            put("tenantId", tenantId)
+            put("createdAt", nowIso())
+        }
+        val keys = payload.keys()
+        while (keys.hasNext()) {
+            val k = keys.next()
+            if (k != "id" && k != "tenantId") saved.put(k, payload.get(k))
+        }
+        saved.put("name", name)
+        if (imgUrl.isNotEmpty()) saved.put("imageUrl", imgUrl)
+        saved.put("costPrice", cost)
+        saved.put("sellingPrice", selling)
+        saved.put("profitMargin", margin)
+        saved.put("allowWeight", false)
+        saved.put("updatedAt", nowIso())
+
+        if (foundIdx >= 0) products.put(foundIdx, saved) else products.put(saved)
+        addAuditLog(tenantId, actorId, actorName, if (foundIdx >= 0) "EDITOU_PRODUTO" else "CRIOU_PRODUTO", "Produto \"$name\" salvo.")
+        commit("product_upserted", tenantId = tenantId)
+        JSONObject().put("ok", true).put("product", saved).put("revision", db.optInt("revision", 1))
+    }
+
+    fun deleteProductSafely(tenantId: String, productId: String, actorId: String, actorName: String): JSONObject = synchronized(lock) {
+        val data = db.getJSONObject("data")
+        val products = data.optJSONArray("products") ?: JSONArray()
+        val orders = data.optJSONArray("orders") ?: JSONArray()
+
+        for (i in 0 until orders.length()) {
+            val o = orders.optJSONObject(i) ?: continue
+            if (o.optString("tenantId") == tenantId && o.optString("status") != "cancelled" && o.optString("status") != "closed" && !o.optBoolean("paid", false)) {
+                val items = o.optJSONArray("items") ?: continue
+                for (j in 0 until items.length()) {
+                    if (items.optJSONObject(j)?.optString("productId") == productId) {
+                        throw IllegalArgumentException("Produto está lançado em mesa aberta.")
+                    }
+                }
+            }
+        }
+
+        val next = JSONArray()
+        var deletedName = ""
+        for (i in 0 until products.length()) {
+            val p = products.optJSONObject(i) ?: continue
+            if (p.optString("id") == productId && p.optString("tenantId") == tenantId) {
+                deletedName = p.optString("name")
+            } else {
+                next.put(p)
+            }
+        }
+        if (deletedName.isEmpty()) throw IllegalArgumentException("Produto não encontrado.")
+        data.put("products", next)
+        addAuditLog(tenantId, actorId, actorName, "EXCLUIU_PRODUTO", "Excluiu produto \"$deletedName\".")
+        commit("product_deleted", tenantId = tenantId)
+        JSONObject().put("ok", true).put("deletedId", productId).put("revision", db.optInt("revision", 1))
+    }
+
+    fun upsertContact(collectionKey: String, idPrefix: String, tenantId: String, payload: JSONObject, actorId: String, actorName: String): JSONObject = synchronized(lock) {
+        val name = payload.optString("name", "").trim()
+        if (name.isEmpty()) throw IllegalArgumentException("Informe o nome do cadastro.")
+        val data = db.getJSONObject("data")
+        val list = data.optJSONArray(collectionKey) ?: JSONArray().also { data.put(collectionKey, it) }
+        val reqId = payload.optString("id").takeIf { it.isNotBlank() }
+        var foundIdx = -1
+        for (i in 0 until list.length()) {
+            val item = list.optJSONObject(i) ?: continue
+            if (reqId != null && item.optString("id") == reqId && item.optString("tenantId") == tenantId) {
+                foundIdx = i
+                break
+            }
+        }
+        val saved = if (foundIdx >= 0) list.getJSONObject(foundIdx) else JSONObject().apply {
+            put("id", reqId ?: "$idPrefix-${System.currentTimeMillis()}-${randomHex(2)}")
+            put("tenantId", tenantId)
+            put("createdAt", nowIso())
+        }
+        val keys = payload.keys()
+        while (keys.hasNext()) {
+            val k = keys.next()
+            if (k != "id" && k != "tenantId") saved.put(k, payload.get(k))
+        }
+        saved.put("name", name)
+        saved.put("pendingCredit", 0)
+        saved.put("pendingBalance", 0)
+        if (foundIdx >= 0) {
+            list.put(foundIdx, saved)
+        } else {
+            data.put(collectionKey, prependJsonArray(list, saved, 2000))
+        }
+        addAuditLog(tenantId, actorId, actorName, "CADASTRO_CONTATO", "Salvou $collectionKey \"$name\".")
+        commit("${collectionKey}_upserted", tenantId = tenantId)
+        val singleKey = if (collectionKey == "customers") "customer" else "supplier"
+        JSONObject().put("ok", true).put(singleKey, saved).put("revision", db.optInt("revision", 1))
+    }
+
+    fun deleteContact(collectionKey: String, tenantId: String, id: String, actorId: String, actorName: String): JSONObject = synchronized(lock) {
+        val data = db.getJSONObject("data")
+        val list = data.optJSONArray(collectionKey) ?: JSONArray()
+        val next = JSONArray()
+        var foundName = ""
+        for (i in 0 until list.length()) {
+            val item = list.optJSONObject(i) ?: continue
+            if (item.optString("id") == id && item.optString("tenantId") == tenantId) {
+                foundName = item.optString("name")
+            } else {
+                next.put(item)
+            }
+        }
+        if (foundName.isEmpty()) throw IllegalArgumentException("Registro não encontrado.")
+        data.put(collectionKey, next)
+        addAuditLog(tenantId, actorId, actorName, "EXCLUIU_CONTATO", "Excluiu $collectionKey \"$foundName\".")
+        commit("${collectionKey}_deleted", tenantId = tenantId)
+        JSONObject().put("ok", true).put("deletedId", id).put("revision", db.optInt("revision", 1))
+    }
+
+    fun getArchivedPdfs(tenantId: String): JSONArray = synchronized(lock) {
+        val arr = db.getJSONObject("data").optJSONArray("archivedPdfs") ?: JSONArray()
+        val out = JSONArray()
+        for (i in 0 until arr.length()) {
+            val item = arr.optJSONObject(i) ?: continue
+            if (item.optString("tenantId") == tenantId) out.put(item)
+        }
+        out
+    }
+
+    fun getArchivedPdfById(id: String): JSONObject? = synchronized(lock) {
+        val arr = db.getJSONObject("data").optJSONArray("archivedPdfs") ?: JSONArray()
+        for (i in 0 until arr.length()) {
+            val item = arr.optJSONObject(i) ?: continue
+            if (item.optString("id") == id) return@synchronized JSONObject(item.toString())
+        }
+        null
+    }
+
+    fun saveArchivedPdf(pdf: JSONObject, actorId: String, actorName: String): JSONObject = synchronized(lock) {
+        if (!archivesDir.exists()) archivesDir.mkdirs()
+        val b64 = pdf.optString("pdfBase64", "")
+        if (b64.length < 30) throw IllegalArgumentException("Conteúdo binário do PDF ausente.")
+        val bytes = Base64.decode(b64, Base64.DEFAULT)
+        if (bytes.size < 4 || String(bytes.copyOfRange(0, 4), Charsets.US_ASCII) != "%PDF") {
+            throw IllegalArgumentException("Arquivo gerado não possui cabeçalho PDF válido.")
+        }
+        val safeFile = pdf.optString("fileName", "${pdf.optString("id")}.pdf").replace(Regex("[^a-zA-Z0-9._-]"), "_")
+        File(archivesDir, safeFile).writeBytes(bytes)
+        pdf.put("fileName", safeFile)
+        pdf.put("restorable", false)
+        pdf.put("sizeBytes", bytes.size)
+
+        val data = db.getJSONObject("data")
+        val existing = data.optJSONArray("archivedPdfs") ?: JSONArray()
+        data.put("archivedPdfs", prependJsonArray(existing, pdf, 500))
+        val tenantId = pdf.optString("tenantId", getDefaultTenantId())
+        addAuditLog(tenantId, actorId, actorName, "ARQUIVOU_PERIODO_PDF", "Gerou arquivo PDF ($safeFile).")
+        commit("pdf_archived", tenantId = tenantId)
+        JSONObject().put("ok", true).put("archivePdf", pdf).put("revision", db.optInt("revision", 1))
+    }
+
+    private fun filterOutTenant(arr: JSONArray?, tenantId: String): JSONArray {
+        val next = JSONArray()
+        if (arr == null) return next
+        for (i in 0 until arr.length()) {
+            val item = arr.optJSONObject(i) ?: continue
+            if (item.optString("tenantId") != tenantId) {
+                next.put(item)
+            }
+        }
+        return next
+    }
+
+    fun executeCleanPeriodReset(
+        tenantId: String,
+        body: JSONObject,
+        actorId: String,
+        actorName: String,
+        ipAddress: String = "127.0.0.1"
+    ): JSONObject = synchronized(lock) {
+        if (body.optString("confirmationText").trim() != "CONFIRMAR LIMPEZA") {
+            throw IllegalArgumentException("Digite exatamente \"CONFIRMAR LIMPEZA\" para executar a limpeza do sistema.")
+        }
+        val archivePdfId = body.optString("archivePdfId").trim()
+        val data = db.getJSONObject("data")
+        val pdfs = data.optJSONArray("archivedPdfs") ?: JSONArray()
+        var foundPdf: JSONObject? = null
+        for (i in 0 until pdfs.length()) {
+            val p = pdfs.optJSONObject(i) ?: continue
+            if (p.optString("id") == archivePdfId && p.optString("tenantId") == tenantId) {
+                foundPdf = p
+                break
+            }
+        }
+        if (foundPdf == null) {
+            throw IllegalArgumentException("É obrigatório gerar e salvar o arquivo histórico em PDF antes de limpar o sistema.")
+        }
+
+        val keepProducts = body.optBoolean("keepProducts", true)
+        val keepProductPhotos = body.optBoolean("keepProductPhotos", true)
+        val keepProductDescriptions = body.optBoolean("keepProductDescriptions", true)
+        val keepCategories = body.optBoolean("keepCategories", true)
+        val zeroProductPrices = body.optBoolean("zeroProductPrices", false)
+        val zeroProductStock = body.optBoolean("zeroProductStock", false)
+
+        val keepCustomers = body.optBoolean("keepCustomers", true)
+        val keepSuppliers = body.optBoolean("keepSuppliers", true)
+        val keepSellers = body.optBoolean("keepSellers", true)
+        val rotateSellerKeys = body.optBoolean("rotateSellerKeys", false)
+
+        val clearOrders = body.optBoolean("clearOrders", true)
+        val clearTables = body.optBoolean("clearTables", true)
+        val clearCashRegisters = body.optBoolean("clearCashRegisters", true)
+        val clearExpenses = body.optBoolean("clearExpenses", true)
+        val clearReceipts = body.optBoolean("clearReceipts", true)
+        val clearStockMovements = body.optBoolean("clearStockMovements", true)
+        val clearSavedReports = body.optBoolean("clearSavedReports", false)
+        val clearOperationalLogs = body.optBoolean("clearOperationalLogs", false)
+
+        val clearedSummary = mutableListOf<String>()
+        val preservedSummary = mutableListOf<String>()
+        val revokedUserIds = mutableListOf<String>()
+        val revokedSessionIds = mutableListOf<String>()
+        val regeneratedSellerKeys = JSONArray()
+
+        // 1. NUNCA deixar mesas ou comandas abertas após limpeza de período
+        val tables = data.optJSONArray("tables") ?: JSONArray()
+        for (i in 0 until tables.length()) {
+            val t = tables.optJSONObject(i) ?: continue
+            if (t.optString("tenantId") == tenantId) {
+                t.put("status", "available")
+                t.remove("openedAt"); t.remove("openedById"); t.remove("openedByName")
+                t.remove("waiterId"); t.remove("waiterName"); t.remove("currentOrderId")
+                t.remove("customerName")
+                t.put("currentTotal", 0.0); t.put("productsTotal", 0.0); t.put("extraTotal", 0.0)
+                t.put("paidAmount", 0.0); t.put("payments", JSONArray()); t.put("extraCharges", JSONArray())
+                t.put("activeOrdersCount", 0); t.put("operationLogs", JSONArray()); t.remove("timer")
+            }
+        }
+        clearedSummary.add("Mesas e comandas abertas encerradas automaticamente")
+
+        if (clearTables) {
+            data.put("tableArchives", filterOutTenant(data.optJSONArray("tableArchives"), tenantId))
+            clearedSummary.add("Históricos operacionais de mesas")
+        } else {
+            preservedSummary.add("Histórico arquivado de mesas")
+        }
+
+        // 2. Categorias
+        if (!keepCategories) {
+            data.put("categories", filterOutTenant(data.optJSONArray("categories"), tenantId))
+            clearedSummary.add("Categorias do cardápio")
+        } else {
+            preservedSummary.add("Categorias do cardápio")
+        }
+
+        // 3. Produtos (preservação granular)
+        if (!keepProducts) {
+            data.put("products", filterOutTenant(data.optJSONArray("products"), tenantId))
+            clearedSummary.add("Catálogo completo de produtos")
+        } else {
+            val now = nowIso()
+            val products = data.optJSONArray("products") ?: JSONArray()
+            for (i in 0 until products.length()) {
+                val p = products.optJSONObject(i) ?: continue
+                if (p.optString("tenantId") != tenantId) continue
+                if (!keepCategories) p.put("categoryId", "")
+                if (!keepProductPhotos) p.remove("imageUrl")
+                if (!keepProductDescriptions) p.put("description", "")
+                if (zeroProductPrices) {
+                    p.put("sellingPrice", 0.0)
+                    p.put("costPrice", 0.0)
+                    p.put("profitMargin", 0.0)
+                }
+                if (zeroProductStock) p.put("stockQuantity", 0.0)
+                p.put("updatedAt", now)
+            }
+            val keptParts = mutableListOf("Produtos e códigos")
+            if (keepProductPhotos) keptParts.add("fotos") else clearedSummary.add("Fotografias dos produtos")
+            if (keepProductDescriptions) keptParts.add("descrições") else clearedSummary.add("Descrições dos produtos")
+            if (!zeroProductPrices) keptParts.add("preços") else clearedSummary.add("Preços de venda zerados")
+            if (!zeroProductStock) keptParts.add("estoque") else clearedSummary.add("Saldos de estoque zerados")
+            preservedSummary.add(keptParts.joinToString(", "))
+        }
+
+        // 4. Clientes & Fornecedores
+        if (!keepCustomers) {
+            data.put("customers", filterOutTenant(data.optJSONArray("customers"), tenantId))
+            clearedSummary.add("Cadastro de clientes")
+        } else {
+            preservedSummary.add("Clientes cadastrados")
+        }
+
+        if (!keepSuppliers) {
+            data.put("suppliers", filterOutTenant(data.optJSONArray("suppliers"), tenantId))
+            clearedSummary.add("Cadastro de fornecedores")
+        } else {
+            preservedSummary.add("Fornecedores cadastrados")
+        }
+
+        // 5. Vendedores e Chaves Individuais
+        val users = data.optJSONArray("users") ?: JSONArray()
+        val now = nowIso()
+        if (!keepSellers) {
+            val nextUsers = JSONArray()
+            for (i in 0 until users.length()) {
+                val u = users.optJSONObject(i) ?: continue
+                if (u.optString("tenantId") == tenantId && u.optString("role") != "admin") {
+                    val uid = u.optString("id")
+                    if (uid.isNotBlank()) revokedUserIds.add(uid)
+                } else {
+                    nextUsers.put(u)
+                }
+            }
+            data.put("users", nextUsers)
+
+            val keys = db.optJSONArray("accessKeys") ?: JSONArray()
+            for (i in 0 until keys.length()) {
+                val k = keys.optJSONObject(i) ?: continue
+                if (k.optString("tenantId") == tenantId && k.optString("mode") == "seller" && !k.optBoolean("revoked", false)) {
+                    k.put("revoked", true)
+                    k.put("revokedAt", now)
+                }
+            }
+
+            val sessions = db.optJSONArray("sessions") ?: JSONArray()
+            val remainingSessions = JSONArray()
+            for (i in 0 until sessions.length()) {
+                val s = sessions.optJSONObject(i) ?: continue
+                if (s.optString("tenantId") == tenantId && s.optString("mode") == "seller") {
+                    val sid = s.optString("id")
+                    if (sid.isNotBlank()) revokedSessionIds.add(sid)
+                } else {
+                    remainingSessions.put(s)
+                }
+            }
+            db.put("sessions", remainingSessions)
+            clearedSummary.add("Vendedores cadastrados e suas chaves de acesso")
+        } else if (rotateSellerKeys) {
+            val keys = db.optJSONArray("accessKeys") ?: JSONArray()
+            for (i in 0 until keys.length()) {
+                val k = keys.optJSONObject(i) ?: continue
+                if (k.optString("tenantId") == tenantId && k.optString("mode") == "seller" && !k.optBoolean("revoked", false)) {
+                    k.put("revoked", true)
+                    k.put("revokedAt", now)
+                }
+            }
+
+            val sessions = db.optJSONArray("sessions") ?: JSONArray()
+            val remainingSessions = JSONArray()
+            for (i in 0 until sessions.length()) {
+                val s = sessions.optJSONObject(i) ?: continue
+                if (s.optString("tenantId") == tenantId && s.optString("mode") == "seller") {
+                    val sid = s.optString("id")
+                    if (sid.isNotBlank()) revokedSessionIds.add(sid)
+                } else {
+                    remainingSessions.put(s)
+                }
+            }
+            db.put("sessions", remainingSessions)
+
+            val expiresMs = System.currentTimeMillis() + 24L * 3600L * 1000L
+            val expiresAt = formatIso(expiresMs)
+            var currentKeys = db.optJSONArray("accessKeys") ?: JSONArray()
+            for (i in 0 until users.length()) {
+                val u = users.optJSONObject(i) ?: continue
+                if (u.optString("tenantId") == tenantId &&
+                    u.optString("role") != "admin" &&
+                    u.optBoolean("canSell", true) &&
+                    u.optString("status") != "bloqueado"
+                ) {
+                    val plainKey = generateReadableKey("seller")
+                    val (salt, keyHash) = hashSecret(plainKey)
+                    val keyPreview = maskKey(plainKey)
+                    val sellerId = u.optString("id")
+                    val sellerName = u.optString("name", "Vendedor")
+                    val rec = JSONObject().apply {
+                        put("id", "wkey-${System.currentTimeMillis()}-${randomHex(2)}")
+                        put("tenantId", tenantId)
+                        put("mode", "seller")
+                        put("userId", sellerId)
+                        put("userName", sellerName)
+                        put("keyPreview", keyPreview)
+                        put("salt", salt)
+                        put("keyHash", keyHash)
+                        put("createdAt", now)
+                        put("expiresAt", expiresAt)
+                        put("revoked", false)
+                    }
+                    currentKeys = prependJsonArray(currentKeys, rec, 500)
+                    regeneratedSellerKeys.put(JSONObject().apply {
+                        put("userId", sellerId)
+                        put("userName", sellerName)
+                        put("plainKey", plainKey)
+                        put("keyPreview", keyPreview)
+                        put("expiresAt", expiresAt)
+                    })
+                }
+            }
+            db.put("accessKeys", currentKeys)
+            addConnectionLog(
+                tenantId = tenantId,
+                event = "key_renewed",
+                mode = "seller",
+                userName = actorName,
+                deviceLabel = "Limpeza e Novo Período",
+                ipAddress = ipAddress,
+                details = "${regeneratedSellerKeys.length()} chave(s) de vendedor(es) redefinida(s) na virada de período."
+            )
+            preservedSummary.add("Vendedores cadastrados (${regeneratedSellerKeys.length()} nova(s) chave(s) gerada(s))")
+        } else {
+            preservedSummary.add("Vendedores cadastrados e chaves atuais")
+        }
+
+        // 6. Vendas e Pedidos
+        if (clearOrders) {
+            data.put("orders", filterOutTenant(data.optJSONArray("orders"), tenantId))
+            clearedSummary.add("Vendas e históricos de pedidos")
+        } else {
+            val orders = data.optJSONArray("orders") ?: JSONArray()
+            for (i in 0 until orders.length()) {
+                val o = orders.optJSONObject(i) ?: continue
+                val status = o.optString("status")
+                if (o.optString("tenantId") == tenantId && status != "closed" && status != "cancelled") {
+                    o.put("status", "cancelled")
+                    if (o.optString("closedAt").isBlank()) o.put("closedAt", now)
+                }
+            }
+            preservedSummary.add("Histórico de vendas concluídas")
+        }
+
+        // 7. Caixa e Movimentações
+        if (clearCashRegisters) {
+            data.put("cashSessions", filterOutTenant(data.optJSONArray("cashSessions"), tenantId))
+            clearedSummary.add("Caixa e movimentações de caixa")
+        } else {
+            preservedSummary.add("Sessões de caixa")
+        }
+
+        // 8. Gastos e Recebimentos
+        if (clearExpenses || clearReceipts) {
+            val fin = data.optJSONArray("financial") ?: JSONArray()
+            val nextFin = JSONArray()
+            for (i in 0 until fin.length()) {
+                val f = fin.optJSONObject(i) ?: continue
+                if (f.optString("tenantId") != tenantId) {
+                    nextFin.put(f)
+                    continue
+                }
+                val fType = f.optString("type")
+                val isReceipt = fType == "revenue" || fType == "deposit"
+                if (isReceipt && clearReceipts) continue
+                if (!isReceipt && clearExpenses) continue
+                nextFin.put(f)
+            }
+            data.put("financial", nextFin)
+            if (clearExpenses) clearedSummary.add("Gastos e despesas") else preservedSummary.add("Gastos e despesas")
+            if (clearReceipts) clearedSummary.add("Recebimentos financeiros") else preservedSummary.add("Recebimentos financeiros")
+        } else {
+            preservedSummary.add("Gastos e recebimentos")
+        }
+
+        // 9. Movimentações de Estoque
+        if (clearStockMovements) {
+            data.put("inventoryTransactions", filterOutTenant(data.optJSONArray("inventoryTransactions"), tenantId))
+            clearedSummary.add("Movimentações de estoque")
+        } else {
+            preservedSummary.add("Movimentações de estoque")
+        }
+
+        // 10. Relatórios Operacionais Salvos
+        if (clearSavedReports) {
+            data.put("savedReports", filterOutTenant(data.optJSONArray("savedReports"), tenantId))
+            clearedSummary.add("Relatórios operacionais salvos")
+        } else {
+            preservedSummary.add("Relatórios operacionais salvos")
+        }
+
+        // 11. Outros Registros Operacionais (PDFs históricos são SEMPRE mantidos)
+        if (clearOperationalLogs) {
+            data.put("archivedPeriods", filterOutTenant(data.optJSONArray("archivedPeriods"), tenantId))
+            data.put("auditLogs", filterOutTenant(data.optJSONArray("auditLogs"), tenantId))
+            clearedSummary.add("Logs e arquivos operacionais auxiliares")
+        }
+
+        preservedSummary.add("PDFs históricos arquivados e configurações do estabelecimento")
+
+        val reasonText = body.optString("reason").trim()
+        addAuditLog(
+            tenantId,
+            actorId,
+            actorName,
+            "LIMPEZA_NOVO_PERIODO",
+            "Limpeza seletiva pós-PDF (${foundPdf.optString("fileName")}). Zerados: ${clearedSummary.joinToString("; ")}. Preservados: ${preservedSummary.joinToString("; ")}.${if (reasonText.isNotEmpty()) " Motivo: $reasonText" else ""}"
+        )
+        commit(
+            "period_cleaned",
+            tenantId = tenantId,
+            revokedUserIds = revokedUserIds,
+            revokedSessionIds = revokedSessionIds
+        )
+
+        JSONObject().apply {
+            put("ok", true)
+            put("archivePdfId", archivePdfId)
+            put("clearedSummary", JSONArray(clearedSummary))
+            put("preservedSummary", JSONArray(preservedSummary))
+            if (regeneratedSellerKeys.length() > 0) {
+                put("regeneratedSellerKeys", regeneratedSellerKeys)
+            }
+            put("revision", db.optInt("revision", 1))
+        }
     }
 }

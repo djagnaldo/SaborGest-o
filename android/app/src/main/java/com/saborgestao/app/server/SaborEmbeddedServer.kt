@@ -62,6 +62,7 @@ class SaborEmbeddedServer(
                 allowMethod(HttpMethod.Options)
                 allowMethod(HttpMethod.Get)
                 allowMethod(HttpMethod.Post)
+                allowMethod(HttpMethod.Put)
                 allowMethod(HttpMethod.Delete)
             }
 
@@ -148,8 +149,7 @@ class SaborEmbeddedServer(
 
                 get("/api/state/snapshot") {
                     val auth = call.authenticate(listOf("admin", "seller")) ?: return@get
-                    val tenantId = call.request.queryParameters["tenantId"]?.takeIf { it.isNotBlank() }
-                        ?: auth.user.optString("tenantId", store.getDefaultTenantId())
+                    val tenantId = call.resolveAuthorizedTenantId(auth, call.request.queryParameters["tenantId"]) ?: return@get
                     val snap = store.getSnapshot(tenantId, auth.mode, auth.user.optString("id"))
                     snap.put("mode", auth.mode)
                     snap.put("user", auth.user)
@@ -255,14 +255,57 @@ class SaborEmbeddedServer(
                     }
                 }
 
+                // Mídia persistida na Matriz
+                get("/api/media/{filename}") {
+                    val filename = call.parameters["filename"] ?: ""
+                    val media = store.readMediaFile(filename)
+                    if (media == null) {
+                        call.respondError(HttpStatusCode.NotFound, "Imagem não encontrada.")
+                        return@get
+                    }
+                    call.respondBytes(media.first, ContentType.parse(media.second))
+                }
+
+                post("/api/media/upload") {
+                    call.authenticate(listOf("admin")) ?: return@post
+                    try {
+                        val body = call.receiveJsonObject()
+                        val res = store.saveMediaFile(
+                            dataUrl = body.optString("dataUrl", ""),
+                            prefix = body.optString("prefix", "prod")
+                        )
+                        call.respondJson(HttpStatusCode.Created, res)
+                    } catch (err: Exception) {
+                        call.respondError(HttpStatusCode.BadRequest, err.message ?: "Falha ao salvar imagem.")
+                    }
+                }
+
+                post("/api/tables/{tableId}/status") {
+                    val auth = call.authenticate(listOf("admin", "seller")) ?: return@post
+                    try {
+                        val tableId = call.parameters["tableId"] ?: ""
+                        val body = call.receiveJsonObject()
+                        val tenantId = call.resolveAuthorizedTenantId(auth, body.optString("tenantId")) ?: return@post
+                        val res = store.setTableStatus(
+                            tenantId = tenantId,
+                            tableId = tableId,
+                            status = body.optString("status", "occupied"),
+                            operatorId = auth.user.optString("id"),
+                            operatorName = auth.user.optString("name", "Operador")
+                        )
+                        call.respondJson(HttpStatusCode.OK, res)
+                    } catch (err: Exception) {
+                        call.respondError(HttpStatusCode.BadRequest, err.message ?: "Falha ao atualizar status da mesa.")
+                    }
+                }
+
                 // Lançamento de itens na Mesa com acúmulo automático
                 post("/api/tables/{tableId}/items") {
                     val auth = call.authenticate(listOf("admin", "seller")) ?: return@post
                     try {
                         val tableId = call.parameters["tableId"] ?: ""
                         val body = call.receiveJsonObject()
-                        val tenantId = body.optString("tenantId").takeIf { it.isNotBlank() }
-                            ?: auth.user.optString("tenantId", store.getDefaultTenantId())
+                        val tenantId = call.resolveAuthorizedTenantId(auth, body.optString("tenantId")) ?: return@post
                         val res = store.addOrAccumulateTableItems(
                             tenantId = tenantId,
                             tableId = tableId,
@@ -283,8 +326,7 @@ class SaborEmbeddedServer(
                     try {
                         val tableId = call.parameters["tableId"] ?: ""
                         val body = call.receiveJsonObject()
-                        val tenantId = body.optString("tenantId").takeIf { it.isNotBlank() }
-                            ?: auth.user.optString("tenantId", store.getDefaultTenantId())
+                        val tenantId = call.resolveAuthorizedTenantId(auth, body.optString("tenantId")) ?: return@post
                         val method = if (body.optString("method") == "pix") "pix" else "dinheiro"
                         val amount = body.optDouble("amount", 0.0)
                         val receivedAmount = if (body.has("receivedAmount") && !body.isNull("receivedAmount")) {
@@ -317,8 +359,7 @@ class SaborEmbeddedServer(
                     val auth = call.authenticate(listOf("admin", "seller")) ?: return@post
                     try {
                         val body = call.receiveJsonObject()
-                        val tenantId = body.optString("tenantId").takeIf { it.isNotBlank() }
-                            ?: auth.user.optString("tenantId", store.getDefaultTenantId())
+                        val tenantId = call.resolveAuthorizedTenantId(auth, body.optString("tenantId")) ?: return@post
                         val paymentMethod = if (body.optString("paymentMethod") == "pix") "pix" else "dinheiro"
                         val receivedAmount = if (body.has("receivedAmount") && !body.isNull("receivedAmount")) {
                             body.optDouble("receivedAmount")
@@ -359,6 +400,190 @@ class SaborEmbeddedServer(
                     }
                 }
 
+                // Catálogo e Categorias (SOMENTE ADM)
+                post("/api/catalog/categories") {
+                    val auth = call.authenticate(listOf("admin")) ?: return@post
+                    try {
+                        val body = call.receiveJsonObject()
+                        val tenantId = call.resolveAuthorizedTenantId(auth, body.optString("tenantId")) ?: return@post
+                        call.respondJson(HttpStatusCode.Created, store.upsertCategory(tenantId, body, auth.user.optString("id"), auth.user.optString("name", "ADM")))
+                    } catch (err: Exception) {
+                        call.respondError(HttpStatusCode.BadRequest, err.message ?: "Erro ao salvar categoria.")
+                    }
+                }
+
+                put("/api/catalog/categories/{id}") {
+                    val auth = call.authenticate(listOf("admin")) ?: return@put
+                    try {
+                        val body = call.receiveJsonObject().apply { put("id", call.parameters["id"] ?: "") }
+                        val tenantId = call.resolveAuthorizedTenantId(auth, body.optString("tenantId")) ?: return@put
+                        call.respondJson(HttpStatusCode.OK, store.upsertCategory(tenantId, body, auth.user.optString("id"), auth.user.optString("name", "ADM")))
+                    } catch (err: Exception) {
+                        call.respondError(HttpStatusCode.BadRequest, err.message ?: "Erro ao atualizar categoria.")
+                    }
+                }
+
+                delete("/api/catalog/categories/{id}") {
+                    val auth = call.authenticate(listOf("admin")) ?: return@delete
+                    try {
+                        val tenantId = call.resolveAuthorizedTenantId(auth, call.request.queryParameters["tenantId"]) ?: return@delete
+                        val res = store.deleteCategory(
+                            tenantId = tenantId,
+                            categoryId = call.parameters["id"] ?: "",
+                            strategy = call.request.queryParameters["strategy"],
+                            targetCategoryId = call.request.queryParameters["targetCategoryId"],
+                            actorId = auth.user.optString("id"),
+                            actorName = auth.user.optString("name", "ADM")
+                        )
+                        call.respondJson(HttpStatusCode.OK, res)
+                    } catch (err: Exception) {
+                        call.respondError(HttpStatusCode.BadRequest, err.message ?: "Erro ao excluir categoria.")
+                    }
+                }
+
+                post("/api/catalog/products") {
+                    val auth = call.authenticate(listOf("admin")) ?: return@post
+                    try {
+                        val body = call.receiveJsonObject()
+                        val tenantId = call.resolveAuthorizedTenantId(auth, body.optString("tenantId")) ?: return@post
+                        call.respondJson(HttpStatusCode.Created, store.upsertProduct(tenantId, body, auth.user.optString("id"), auth.user.optString("name", "ADM")))
+                    } catch (err: Exception) {
+                        call.respondError(HttpStatusCode.BadRequest, err.message ?: "Erro ao salvar produto.")
+                    }
+                }
+
+                put("/api/catalog/products/{id}") {
+                    val auth = call.authenticate(listOf("admin")) ?: return@put
+                    try {
+                        val body = call.receiveJsonObject().apply { put("id", call.parameters["id"] ?: "") }
+                        val tenantId = call.resolveAuthorizedTenantId(auth, body.optString("tenantId")) ?: return@put
+                        call.respondJson(HttpStatusCode.OK, store.upsertProduct(tenantId, body, auth.user.optString("id"), auth.user.optString("name", "ADM")))
+                    } catch (err: Exception) {
+                        call.respondError(HttpStatusCode.BadRequest, err.message ?: "Erro ao atualizar produto.")
+                    }
+                }
+
+                delete("/api/catalog/products/{id}") {
+                    val auth = call.authenticate(listOf("admin")) ?: return@delete
+                    try {
+                        val tenantId = call.resolveAuthorizedTenantId(auth, call.request.queryParameters["tenantId"]) ?: return@delete
+                        call.respondJson(HttpStatusCode.OK, store.deleteProductSafely(tenantId, call.parameters["id"] ?: "", auth.user.optString("id"), auth.user.optString("name", "ADM")))
+                    } catch (err: Exception) {
+                        call.respondError(HttpStatusCode.BadRequest, err.message ?: "Erro ao excluir produto.")
+                    }
+                }
+
+                // Clientes e Fornecedores (SOMENTE ADM)
+                post("/api/contacts/customers") {
+                    val auth = call.authenticate(listOf("admin")) ?: return@post
+                    try {
+                        val body = call.receiveJsonObject()
+                        val tenantId = call.resolveAuthorizedTenantId(auth, body.optString("tenantId")) ?: return@post
+                        call.respondJson(HttpStatusCode.Created, store.upsertContact("customers", "cust", tenantId, body, auth.user.optString("id"), auth.user.optString("name", "ADM")))
+                    } catch (err: Exception) {
+                        call.respondError(HttpStatusCode.BadRequest, err.message ?: "Erro ao salvar cliente.")
+                    }
+                }
+
+                put("/api/contacts/customers/{id}") {
+                    val auth = call.authenticate(listOf("admin")) ?: return@put
+                    try {
+                        val body = call.receiveJsonObject().apply { put("id", call.parameters["id"] ?: "") }
+                        val tenantId = call.resolveAuthorizedTenantId(auth, body.optString("tenantId")) ?: return@put
+                        call.respondJson(HttpStatusCode.OK, store.upsertContact("customers", "cust", tenantId, body, auth.user.optString("id"), auth.user.optString("name", "ADM")))
+                    } catch (err: Exception) {
+                        call.respondError(HttpStatusCode.BadRequest, err.message ?: "Erro ao atualizar cliente.")
+                    }
+                }
+
+                delete("/api/contacts/customers/{id}") {
+                    val auth = call.authenticate(listOf("admin")) ?: return@delete
+                    try {
+                        val tenantId = call.resolveAuthorizedTenantId(auth, call.request.queryParameters["tenantId"]) ?: return@delete
+                        call.respondJson(HttpStatusCode.OK, store.deleteContact("customers", tenantId, call.parameters["id"] ?: "", auth.user.optString("id"), auth.user.optString("name", "ADM")))
+                    } catch (err: Exception) {
+                        call.respondError(HttpStatusCode.BadRequest, err.message ?: "Erro ao excluir cliente.")
+                    }
+                }
+
+                post("/api/contacts/suppliers") {
+                    val auth = call.authenticate(listOf("admin")) ?: return@post
+                    try {
+                        val body = call.receiveJsonObject()
+                        val tenantId = call.resolveAuthorizedTenantId(auth, body.optString("tenantId")) ?: return@post
+                        call.respondJson(HttpStatusCode.Created, store.upsertContact("suppliers", "sup", tenantId, body, auth.user.optString("id"), auth.user.optString("name", "ADM")))
+                    } catch (err: Exception) {
+                        call.respondError(HttpStatusCode.BadRequest, err.message ?: "Erro ao salvar fornecedor.")
+                    }
+                }
+
+                put("/api/contacts/suppliers/{id}") {
+                    val auth = call.authenticate(listOf("admin")) ?: return@put
+                    try {
+                        val body = call.receiveJsonObject().apply { put("id", call.parameters["id"] ?: "") }
+                        val tenantId = call.resolveAuthorizedTenantId(auth, body.optString("tenantId")) ?: return@put
+                        call.respondJson(HttpStatusCode.OK, store.upsertContact("suppliers", "sup", tenantId, body, auth.user.optString("id"), auth.user.optString("name", "ADM")))
+                    } catch (err: Exception) {
+                        call.respondError(HttpStatusCode.BadRequest, err.message ?: "Erro ao atualizar fornecedor.")
+                    }
+                }
+
+                delete("/api/contacts/suppliers/{id}") {
+                    val auth = call.authenticate(listOf("admin")) ?: return@delete
+                    try {
+                        val tenantId = call.resolveAuthorizedTenantId(auth, call.request.queryParameters["tenantId"]) ?: return@delete
+                        call.respondJson(HttpStatusCode.OK, store.deleteContact("suppliers", tenantId, call.parameters["id"] ?: "", auth.user.optString("id"), auth.user.optString("name", "ADM")))
+                    } catch (err: Exception) {
+                        call.respondError(HttpStatusCode.BadRequest, err.message ?: "Erro ao excluir fornecedor.")
+                    }
+                }
+
+                // Arquivos Históricos em PDF e Limpeza de Período
+                get("/api/admin/archive-pdfs") {
+                    val auth = call.authenticate(listOf("admin")) ?: return@get
+                    val tenantId = call.resolveAuthorizedTenantId(auth, call.request.queryParameters["tenantId"]) ?: return@get
+                    call.respondJson(HttpStatusCode.OK, JSONObject().put("ok", true).put("archivePdfs", store.getArchivedPdfs(tenantId)))
+                }
+
+                post("/api/admin/archive-pdfs") {
+                    val auth = call.authenticate(listOf("admin")) ?: return@post
+                    try {
+                        val body = call.receiveJsonObject()
+                        val tenantId = call.resolveAuthorizedTenantId(auth, body.optString("tenantId")) ?: return@post
+                        body.put("tenantId", tenantId)
+                        call.respondJson(HttpStatusCode.Created, store.saveArchivedPdf(body, auth.user.optString("id"), auth.user.optString("name", "ADM")))
+                    } catch (err: Exception) {
+                        call.respondError(HttpStatusCode.BadRequest, err.message ?: "Erro ao salvar PDF.")
+                    }
+                }
+
+                get("/api/admin/archive-pdfs/{id}/download") {
+                    val auth = call.authenticate(listOf("admin")) ?: return@get
+                    val pdf = store.getArchivedPdfById(call.parameters["id"] ?: "")
+                    if (pdf == null) {
+                        call.respondError(HttpStatusCode.NotFound, "Arquivo PDF não encontrado.")
+                        return@get
+                    }
+                    if (auth.source == "web" && pdf.optString("tenantId") != auth.user.optString("tenantId")) {
+                        call.respondError(HttpStatusCode.Forbidden, "Acesso negado.")
+                        return@get
+                    }
+                    val bytes = android.util.Base64.decode(pdf.optString("pdfBase64", ""), android.util.Base64.DEFAULT)
+                    call.response.header(HttpHeaders.ContentDisposition, "attachment; filename=\"${pdf.optString("fileName", "arquivo.pdf")}\"")
+                    call.respondBytes(bytes, ContentType.Application.Pdf)
+                }
+
+                post("/api/admin/reset-period") {
+                    val auth = call.authenticate(listOf("admin")) ?: return@post
+                    try {
+                        val body = call.receiveJsonObject()
+                        val tenantId = call.resolveAuthorizedTenantId(auth, body.optString("tenantId")) ?: return@post
+                        call.respondJson(HttpStatusCode.OK, store.executeCleanPeriodReset(tenantId, body, auth.user.optString("id"), auth.user.optString("name", "ADM"), auth.ip))
+                    } catch (err: Exception) {
+                        call.respondError(HttpStatusCode.BadRequest, err.message ?: "Falha na limpeza do sistema.")
+                    }
+                }
+
                 // Bloqueio/Autorização de vendedor (SOMENTE ADM)
                 post("/api/users/{userId}/toggle-sell") {
                     val auth = call.authenticate(listOf("admin")) ?: return@post
@@ -381,8 +606,7 @@ class SaborEmbeddedServer(
                 post("/api/admin/sync-state") {
                     val auth = call.authenticate(listOf("admin")) ?: return@post
                     val body = call.receiveJsonObject()
-                    val tenantId = body.optString("tenantId").takeIf { it.isNotBlank() }
-                        ?: auth.user.optString("tenantId", store.getDefaultTenantId())
+                    val tenantId = call.resolveAuthorizedTenantId(auth, body.optString("tenantId")) ?: return@post
                     val partial = body.optJSONObject("data") ?: JSONObject()
                     val res = store.syncStateFromClient(partial, tenantId, auth.user.optString("name", "ADM"), sellerOnly = false)
                     call.respondJson(HttpStatusCode.OK, res)
@@ -390,15 +614,18 @@ class SaborEmbeddedServer(
 
                 post("/api/state/sync") {
                     val auth = call.authenticate(listOf("admin", "seller")) ?: return@post
+                    if (auth.mode == "seller") {
+                        call.respondError(HttpStatusCode.Forbidden, "Acesso negado: vendedores não podem sobrescrever o estado global.")
+                        return@post
+                    }
                     val body = call.receiveJsonObject()
-                    val tenantId = body.optString("tenantId").takeIf { it.isNotBlank() }
-                        ?: auth.user.optString("tenantId", store.getDefaultTenantId())
+                    val tenantId = call.resolveAuthorizedTenantId(auth, body.optString("tenantId")) ?: return@post
                     val partial = body.optJSONObject("data") ?: JSONObject()
                     val res = store.syncStateFromClient(
                         partial = partial,
                         tenantId = tenantId,
-                        actorName = auth.user.optString("name", "Operador"),
-                        sellerOnly = auth.mode == "seller"
+                        actorName = auth.user.optString("name", "ADM"),
+                        sellerOnly = false
                     )
                     call.respondJson(HttpStatusCode.OK, res)
                 }
@@ -669,6 +896,19 @@ class SaborEmbeddedServer(
 
     private suspend fun ApplicationCall.respondError(status: HttpStatusCode, message: String) {
         respondJson(status, JSONObject().put("error", message))
+    }
+
+    private suspend fun ApplicationCall.resolveAuthorizedTenantId(auth: AuthContext, requestedTenantId: String?): String? {
+        val userTenant = auth.user.optString("tenantId").ifBlank { store.getDefaultTenantId() }
+        val reqTid = requestedTenantId?.trim().orEmpty()
+        if (auth.source == "web") {
+            if (reqTid.isNotEmpty() && reqTid != userTenant) {
+                respondError(HttpStatusCode.Forbidden, "Acesso negado para estabelecimento diferente da sessão.")
+                return null
+            }
+            return userTenant
+        }
+        return reqTid.ifEmpty { userTenant }
     }
 
     private suspend fun ApplicationCall.authenticate(allowedModes: List<String>): AuthContext? {

@@ -16,7 +16,7 @@ import {
   User,
   X,
   Search,
-  Filter,
+  AlertTriangle,
 } from 'lucide-react';
 import { useTenant } from '../../contexts/TenantContext';
 import { useAuth } from '../../contexts/AuthContext';
@@ -46,6 +46,9 @@ export const ExpensesView: React.FC = () => {
   const [selectedCategory, setSelectedCategory] = useState<string>('all');
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
 
+  const [confirmDeleteExpense, setConfirmDeleteExpense] = useState<FinancialTransaction | null>(null);
+  const [formError, setFormError] = useState<string | null>(null);
+
   // Form State
   const [description, setDescription] = useState('');
   const [amount, setAmount] = useState<number>(0);
@@ -68,6 +71,7 @@ export const ExpensesView: React.FC = () => {
   }, [currentTenant.id]);
 
   const handleOpenAdd = () => {
+    setFormError(null);
     setDescription('');
     setAmount(0);
     setCategory(EXPENSE_CATEGORIES[0]);
@@ -80,7 +84,7 @@ export const ExpensesView: React.FC = () => {
   const handleSaveExpense = (e: React.FormEvent) => {
     e.preventDefault();
     if (!description.trim() || amount <= 0) {
-      alert('Informe a descrição e um valor positivo para o gasto.');
+      setFormError('Informe a descrição e um valor positivo para o gasto.');
       return;
     }
 
@@ -105,11 +109,11 @@ export const ExpensesView: React.FC = () => {
     setIsAddModalOpen(false);
   };
 
-  const handleDelete = (id: string, desc: string) => {
-    if (confirm(`Confirma a exclusão do gasto "${desc}"?`)) {
-      deleteExpense(id);
-      loadExpenses();
-    }
+  const handleConfirmDelete = () => {
+    if (!confirmDeleteExpense) return;
+    deleteExpense(confirmDeleteExpense.id);
+    setConfirmDeleteExpense(null);
+    loadExpenses();
   };
 
   // Cálculos de Totais
@@ -274,7 +278,7 @@ export const ExpensesView: React.FC = () => {
                   {isAdm && (
                     <button
                       type="button"
-                      onClick={() => handleDelete(expense.id, expense.description)}
+                      onClick={() => setConfirmDeleteExpense(expense)}
                       className="rounded-lg p-1.5 text-stone-400 hover:text-rose-600 hover:bg-rose-50 transition"
                       title="Excluir lançamento de despesa"
                     >
@@ -314,6 +318,11 @@ export const ExpensesView: React.FC = () => {
             </div>
 
             <form onSubmit={handleSaveExpense} className="mt-4 space-y-3.5">
+              {formError && (
+                <div className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-semibold text-rose-800">
+                  {formError}
+                </div>
+              )}
               <div>
                 <label className="block text-xs font-bold text-stone-700">
                   Descrição da Despesa <span className="text-rose-500">*</span>
@@ -427,6 +436,41 @@ export const ExpensesView: React.FC = () => {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL REACT: CONFIRMAR EXCLUSÃO DE GASTO */}
+      {confirmDeleteExpense && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-900/60 p-4 backdrop-blur-xs">
+          <div className="w-full max-w-md rounded-2xl border border-rose-200 bg-white p-6 shadow-2xl space-y-4">
+            <div className="flex items-center gap-3">
+              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-rose-100 text-rose-700">
+                <AlertTriangle className="h-5 w-5" />
+              </div>
+              <div>
+                <h3 className="text-sm font-bold text-stone-900">Excluir Lançamento de Gasto</h3>
+                <p className="text-xs text-stone-500">
+                  Confirma a exclusão do gasto "{confirmDeleteExpense.description}"?
+                </p>
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 pt-2 border-t border-stone-100">
+              <button
+                type="button"
+                onClick={() => setConfirmDeleteExpense(null)}
+                className="rounded-xl border border-stone-200 px-4 py-2 text-xs font-semibold text-stone-600 hover:bg-stone-50"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmDelete}
+                className="rounded-xl bg-rose-600 px-4 py-2 text-xs font-bold text-white hover:bg-rose-700"
+              >
+                Confirmar Exclusão
+              </button>
+            </div>
           </div>
         </div>
       )}

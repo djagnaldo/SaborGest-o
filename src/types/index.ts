@@ -194,6 +194,9 @@ export interface OrderItem {
   variationName?: string;
   selectedAddons?: { name: string; price: number }[];
   notes?: string;
+  addedById?: string;
+  addedByName?: string;
+  addedAt?: string;
   total: number;
 }
 
@@ -285,6 +288,19 @@ export interface TableTimer {
   setByName: string;
 }
 
+export interface TableOperationLog {
+  id: string;
+  type: 'table_opened' | 'item_added' | 'status_changed' | 'payment_partial' | 'extra_charge';
+  productId?: string;
+  productName?: string;
+  quantity?: number;
+  amount?: number;
+  notes?: string;
+  operatorId: string;
+  operatorName: string;
+  timestamp: string;
+}
+
 export interface Order {
   id: string;
   tenantId: string;
@@ -300,6 +316,9 @@ export interface Order {
   customerPhone?: string;
   waiterId?: string;
   waiterName?: string;
+  createdById?: string;
+  createdByName?: string;
+  contributors?: { id: string; name: string }[];
   items: OrderItem[];
   subtotal: number;
   discount: number;
@@ -370,8 +389,11 @@ export interface RestaurantTable {
   activeOrdersCount?: number;
   timer?: TableTimer;
   openedAt?: string;
+  openedById?: string;
+  openedByName?: string;
   waiterId?: string;
   waiterName?: string;
+  operationLogs?: TableOperationLog[];
   isDemo?: boolean;
 }
 
@@ -575,12 +597,44 @@ export interface SystemBackup {
     users: UserProfile[];
     savedReports: SavedReport[];
     archivedPeriods: ArchivedPeriod[];
+    archivedPdfs?: ArchivedPeriodPdf[];
+    customers?: Customer[];
+    suppliers?: Supplier[];
     tableArchives?: TableAccountArchive[];
     themeConfig?: SystemThemeConfig;
   };
   checksum: string;
   cloudSynced?: boolean;
   isDemo?: boolean;
+}
+
+export interface ArchivedPeriodPdf {
+  id: string;
+  tenantId: string;
+  fileName: string;
+  periodStart: string;
+  periodEnd: string;
+  generatedAt: string;
+  generatedById: string;
+  generatedByName: string;
+  establishmentName: string;
+  establishmentDocument?: string;
+  restorable: false;
+  disclaimer: string;
+  pdfBase64: string;
+  sizeBytes: number;
+  summary: {
+    ordersCount: number;
+    itemsSoldCount: number;
+    totalRevenue: number;
+    cashTotal: number;
+    pixTotal: number;
+    otherReceiptsTotal?: number;
+    expensesTotal: number;
+    netResult: number;
+    stockMovementsCount: number;
+    cashSessionsCount?: number;
+  };
 }
 
 export interface SystemThemeConfig {
@@ -597,16 +651,52 @@ export interface SystemThemeConfig {
   updatedById: string;
 }
 
-export interface ResetOperationOptions {
-  resetTables: boolean;
-  resetProducts: boolean;
-  resetStock: boolean;
-  resetSales: boolean;
-  resetExpenses: boolean;
-  resetMovements: boolean;
-  createBackupFirst: boolean;
+export interface SelectiveResetOptions {
   confirmationText: string;
+  archivePdfId: string;
   reason?: string;
+
+  // Cardápio e Catálogo
+  keepProducts: boolean;
+  keepProductPhotos: boolean;
+  keepProductDescriptions: boolean;
+  keepCategories: boolean;
+  zeroProductPrices: boolean;
+  zeroProductStock: boolean;
+
+  // Cadastros Gerais
+  keepCustomers: boolean;
+  keepSuppliers: boolean;
+
+  // Vendedores
+  keepSellers: boolean;
+  rotateSellerKeys: boolean;
+
+  // Módulos Operacionais (true = limpar/zerar; mesas abertas são sempre encerradas)
+  clearOrders: boolean;
+  clearTables: boolean;
+  clearCashRegisters: boolean;
+  clearExpenses: boolean;
+  clearReceipts: boolean;
+  clearStockMovements: boolean;
+  clearSavedReports: boolean;
+  clearOperationalLogs: boolean;
+}
+
+export interface RegeneratedSellerKeyInfo {
+  userId: string;
+  userName: string;
+  plainKey: string;
+  keyPreview: string;
+  expiresAt: string;
+}
+
+export interface SelectiveResetResult {
+  archivePdfId: string;
+  clearedSummary: string[];
+  preservedSummary: string[];
+  regeneratedSellerKeys?: RegeneratedSellerKeyInfo[];
+  revision?: number;
 }
 
 export type WebAccessMode = 'admin' | 'seller';

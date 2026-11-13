@@ -19,8 +19,7 @@ import {
   ShieldAlert,
   FolderArchive,
   RefreshCw,
-  Sparkles,
-  Cloud,
+  HardDrive,
 } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import { useTenant } from '../../contexts/TenantContext';
@@ -49,6 +48,7 @@ export const BackupManagerView: React.FC<BackupManagerViewProps> = () => {
   const [backupNameInput, setBackupNameInput] = useState('');
   const [feedbackMessage, setFeedbackMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [isConfirmingRestore, setIsConfirmingRestore] = useState<SystemBackup | null>(null);
+  const [confirmingDeleteBackup, setConfirmingDeleteBackup] = useState<SystemBackup | null>(null);
   const [backupBeforeRestore, setBackupBeforeRestore] = useState(true);
 
   const loadBackups = () => {
@@ -193,15 +193,15 @@ export const BackupManagerView: React.FC<BackupManagerViewProps> = () => {
     }
   };
 
-  const handleDelete = (id: string, name: string) => {
-    if (window.confirm(`Tem certeza de que deseja excluir o backup "${name}"? Esta ação removerá a cópia local.`)) {
-      deleteSystemBackup(id);
-      loadBackups();
-      setFeedbackMessage({
-        type: 'success',
-        text: `Backup removido com sucesso.`,
-      });
-    }
+  const handleConfirmDelete = () => {
+    if (!confirmingDeleteBackup) return;
+    deleteSystemBackup(confirmingDeleteBackup.id);
+    setConfirmingDeleteBackup(null);
+    loadBackups();
+    setFeedbackMessage({
+      type: 'success',
+      text: `Backup removido com sucesso.`,
+    });
   };
 
   return (
@@ -223,13 +223,14 @@ export const BackupManagerView: React.FC<BackupManagerViewProps> = () => {
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          {/* Botão de Reiniciar Operação com Segurança */}
+          {/* Botão de Arquivar PDF e Limpeza e Novo Período */}
           <button
+            type="button"
             onClick={() => setIsResetModalOpen(true)}
             className="inline-flex items-center gap-2 rounded-xl border border-rose-200 bg-rose-50 px-4 py-2.5 text-xs font-bold text-rose-700 hover:bg-rose-100 transition shadow-xs"
           >
             <RotateCcw className="h-4 w-4" />
-            <span>Reiniciar Operação</span>
+            <span>Limpeza e Novo Período</span>
           </button>
 
           {/* Botão de Importar Arquivo JSON */}
@@ -302,8 +303,8 @@ export const BackupManagerView: React.FC<BackupManagerViewProps> = () => {
 
         <div className="mt-3 flex flex-wrap items-center gap-4 text-[11px] text-stone-500">
           <span className="flex items-center gap-1.5">
-            <Cloud className="h-3.5 w-3.5 text-emerald-600" />
-            Sincronização Híbrida (Armazenamento Local + Nuvem Firestore)
+            <HardDrive className="h-3.5 w-3.5 text-emerald-600" />
+            Armazenamento Local na Matriz ADM + Exportação JSON
           </span>
           <span className="flex items-center gap-1.5">
             <ShieldAlert className="h-3.5 w-3.5 text-amber-600" />
@@ -353,8 +354,8 @@ export const BackupManagerView: React.FC<BackupManagerViewProps> = () => {
                     </span>
                     {bkp.cloudSynced && (
                       <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold text-emerald-700 border border-emerald-200">
-                        <Cloud className="h-3 w-3" />
-                        Nuvem
+                        <HardDrive className="h-3 w-3" />
+                        Matriz Local
                       </span>
                     )}
                   </div>
@@ -426,7 +427,8 @@ export const BackupManagerView: React.FC<BackupManagerViewProps> = () => {
 
                   {/* Excluir */}
                   <button
-                    onClick={() => handleDelete(bkp.id, bkp.name)}
+                    type="button"
+                    onClick={() => setConfirmingDeleteBackup(bkp)}
                     className="rounded-lg p-1.5 text-stone-400 hover:bg-rose-50 hover:text-rose-600 transition"
                     title="Excluir cópia"
                   >
@@ -581,7 +583,42 @@ export const BackupManagerView: React.FC<BackupManagerViewProps> = () => {
         </div>
       )}
 
-      {/* Modal de Reiniciar Operação */}
+      {/* Modal de Confirmação de Exclusão de Backup */}
+      {confirmingDeleteBackup && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-900/60 p-4 backdrop-blur-xs">
+          <div className="w-full max-w-md rounded-2xl border border-rose-200 bg-white p-6 shadow-2xl space-y-4">
+            <div className="flex items-center gap-3">
+              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-rose-100 text-rose-700">
+                <AlertTriangle className="h-5 w-5" />
+              </div>
+              <div>
+                <h3 className="text-sm font-bold text-stone-900">Excluir Cópia de Segurança</h3>
+                <p className="text-xs text-stone-500">
+                  Deseja remover o backup "{confirmingDeleteBackup.name}" da lista local?
+                </p>
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 pt-2 border-t border-stone-100">
+              <button
+                type="button"
+                onClick={() => setConfirmingDeleteBackup(null)}
+                className="rounded-xl border border-stone-200 px-4 py-2 text-xs font-semibold text-stone-600 hover:bg-stone-50"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmDelete}
+                className="rounded-xl bg-rose-600 px-4 py-2 text-xs font-bold text-white hover:bg-rose-700"
+              >
+                Confirmar Exclusão
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal de Limpeza Seletiva e Novo Período */}
       <ResetOperationModal
         isOpen={isResetModalOpen}
         onClose={() => setIsResetModalOpen(false)}
@@ -590,7 +627,7 @@ export const BackupManagerView: React.FC<BackupManagerViewProps> = () => {
           loadBackups();
           setFeedbackMessage({
             type: 'success',
-            text: 'Operação reiniciada com sucesso! Um novo ciclo foi iniciado mantendo os balanços históricos.',
+            text: 'Limpeza seletiva e virada de período concluídas com sucesso! PDF histórico e itens selecionados foram preservados.',
           });
         }}
       />

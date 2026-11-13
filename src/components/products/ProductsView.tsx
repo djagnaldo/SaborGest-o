@@ -5,14 +5,11 @@
 
 import React, { useState, useRef } from 'react';
 import {
-  UtensilsCrossed,
   Plus,
   Search,
   AlertTriangle,
   Edit2,
   Trash2,
-  Tag,
-  Layers,
   ChefHat,
   X,
   Save,
@@ -20,10 +17,10 @@ import {
   Image as ImageIcon,
   Upload,
   Sparkles,
-  ShieldAlert,
   CheckCircle2,
   RotateCw,
-  Scale,
+  FolderKanban,
+  ArrowRightLeft,
 } from 'lucide-react';
 import { useTenant } from '../../contexts/TenantContext';
 import { useAuth } from '../../contexts/AuthContext';
@@ -33,8 +30,17 @@ import {
   getCategories,
   saveProduct,
   deleteProductSafely,
+  saveCategory,
+  deleteCategoryWithStrategy,
   addAuditLog,
 } from '../../services/storage';
+import {
+  uploadMediaFile,
+  upsertCategoryApi,
+  deleteCategoryApi,
+  upsertProductApi,
+  deleteProductApi,
+} from '../../services/sync-client';
 import {
   validateMasterAuthority,
   getMatrizInfo,
@@ -62,6 +68,15 @@ export const ProductsView: React.FC = () => {
   const [isCompressing, setIsCompressing] = useState(false);
   const [compressionBadge, setCompressionBadge] = useState<string | null>(null);
   const [isPresetModalOpen, setIsPresetModalOpen] = useState(false);
+
+  // Gerenciamento de Categorias
+  const [isCategoryModalOpen, setIsCategoryModalOpen] = useState(false);
+  const [newCategoryName, setNewCategoryName] = useState('');
+  const [editingCategoryId, setEditingCategoryId] = useState<string | null>(null);
+  const [editingCategoryName, setEditingCategoryName] = useState('');
+  const [categoryToDelete, setCategoryToDelete] = useState<Category | null>(null);
+  const [deleteStrategy, setDeleteStrategy] = useState<'transfer' | 'uncategorized'>('uncategorized');
+  const [transferTargetCatId, setTransferTargetCatId] = useState('');
 
   // Form State
   const [formData, setFormData] = useState<{
@@ -174,15 +189,21 @@ export const ProductsView: React.FC = () => {
     setConfirmDeleteProd(prod);
   };
 
-  const handleConfirmDelete = () => {
+  const handleConfirmDelete = async () => {
     if (!confirmDeleteProd) return;
-    const result = deleteProductSafely(confirmDeleteProd.id);
+    const prodId = confirmDeleteProd.id;
+    const result = deleteProductSafely(prodId);
+    try {
+      await deleteProductApi(currentTenant.id, prodId, currentUser?.id);
+    } catch {
+      // fallback offline preservado
+    }
     setConfirmDeleteProd(null);
     showFeedback(result.message, result.success ? 'success' : 'error');
     refreshList();
   };
 
-  // Processamento e compressão local de foto (Câmera ou Galeria)
+  // Processamento e compressão local de foto (Câmera ou Galeria) + upload para pasta de mídia da Matriz
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -191,13 +212,29 @@ export const ProductsView: React.FC = () => {
       setIsCompressing(true);
       const result = await processProductImage(file, 600, 600, 0.82);
 
-      setFormData((prev) => ({ ...prev, imageUrl: result.dataUrl }));
+      let finalImageUrl = result.dataUrl;
+      let persistedOnDisk = false;
+      try {
+        const uploaded = await uploadMediaFile(result.dataUrl, 'prod', currentUser?.id);
+        if (uploaded?.url) {
+          finalImageUrl = uploaded.url;
+          persistedOnDisk = true;
+        }
+      } catch {
+        // Offline ou servidor parado: mantém dataUrl comprimido localmente
+      }
+
+      setFormData((prev) => ({ ...prev, imageUrl: finalImageUrl }));
 
       const origKb = Math.round(result.originalSizeBytes / 1024);
       const compKb = Math.round(result.compressedSizeBytes / 1024);
-      const savedPercent = Math.max(0, Math.round(((origKb - compKb) / origKb) * 100));
+      const savedPercent = Math.max(0, Math.round(((origKb - compKb) / Math.max(1, origKb)) * 100));
 
-      setCompressionBadge(`Foto comprimida: ${origKb}KB ➔ ${compKb}KB (${savedPercent}% economizado)`);
+      setCompressionBadge(
+        `Foto comprimida: ${origKb}KB ➔ ${compKb}KB (${savedPercent}% economizado)${
+          persistedOnDisk ? ' · Salva no servidor Matriz' : ''
+        }`
+      );
     } catch (err: any) {
       showFeedback(`Erro ao processar imagem: ${err.message}`, 'error');
     } finally {
@@ -206,52 +243,151 @@ export const ProductsView: React.FC = () => {
     }
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!formData.name || !formData.sellingPrice) return;
 
     if (!checkMasterAuthority(editingProduct ? 'update_product' : 'create_product')) return;
 
     const margin = calcProfitMargin(formData.costPrice, formData.sellingPrice);
+    const savedProd: Product = editingProduct
+      ? {
+          ...editingProduct,
+          ...formData,
+          profitMargin: margin,
+        }
+      : {
+          id: `prod-${Date.now()}`,
+          tenantId: currentTenant.id,
+          ...formData,
+          profitMargin: margin,
+          active: true,
+          createdAt: new Date().toISOString(),
+        };
 
-    if (editingProduct) {
-      saveProduct({
-        ...editingProduct,
-        ...formData,
-        profitMargin: margin,
-      });
-      addAuditLog({
-        tenantId: currentTenant.id,
-        userId: currentUser?.id || 'admin',
-        userName: currentUser?.name || 'Administrador',
-        action: 'ATUALIZOU_PRODUTO',
-        details: `Atualizou o produto ${formData.name} na Matriz (${formatBRL(formData.sellingPrice)})`,
-      });
-    } else {
-      const newProd: Product = {
-        id: `prod-${Date.now()}`,
-        tenantId: currentTenant.id,
-        ...formData,
-        profitMargin: margin,
-        active: true,
-        createdAt: new Date().toISOString(),
-      };
-      saveProduct(newProd);
-      addAuditLog({
-        tenantId: currentTenant.id,
-        userId: currentUser?.id || 'admin',
-        userName: currentUser?.name || 'Administrador',
-        action: 'CRIOU_PRODUTO',
-        details: `Cadastrou o produto ${formData.name} com fotografia na Matriz por ${formatBRL(formData.sellingPrice)}`,
-      });
+    saveProduct(savedProd);
+    addAuditLog({
+      tenantId: currentTenant.id,
+      userId: currentUser?.id || 'admin',
+      userName: currentUser?.name || 'Administrador',
+      action: editingProduct ? 'ATUALIZOU_PRODUTO' : 'CRIOU_PRODUTO',
+      details: `${editingProduct ? 'Atualizou' : 'Cadastrou'} o produto ${formData.name} na Matriz (${formatBRL(formData.sellingPrice)})`,
+    });
+
+    try {
+      await upsertProductApi(currentTenant.id, savedProd, currentUser?.id);
+    } catch {
+      // fallback offline preservado
     }
 
     setIsModalOpen(false);
     refreshList();
   };
 
+  const handleCreateCategory = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newCategoryName.trim()) return;
+    const newCat: Category = {
+      id: `cat-${Date.now()}`,
+      tenantId: currentTenant.id,
+      name: newCategoryName.trim(),
+      order: categories.length + 1,
+      active: true,
+      createdAt: new Date().toISOString(),
+    };
+    saveCategory(newCat);
+    addAuditLog({
+      tenantId: currentTenant.id,
+      userId: currentUser?.id || 'admin',
+      userName: currentUser?.name || 'Administrador',
+      action: 'CRIOU_CATEGORIA',
+      details: `Criou a categoria "${newCat.name}".`,
+    });
+    try {
+      await upsertCategoryApi(currentTenant.id, newCat, currentUser?.id);
+    } catch {
+      // fallback offline
+    }
+    setNewCategoryName('');
+    refreshList();
+    showFeedback(`Categoria "${newCat.name}" criada com sucesso!`);
+  };
+
+  const handleSaveCategoryEdit = async () => {
+    if (!editingCategoryId || !editingCategoryName.trim()) return;
+    const target = categories.find((c) => c.id === editingCategoryId);
+    if (!target) return;
+    const updated: Category = { ...target, name: editingCategoryName.trim() };
+    saveCategory(updated);
+    addAuditLog({
+      tenantId: currentTenant.id,
+      userId: currentUser?.id || 'admin',
+      userName: currentUser?.name || 'Administrador',
+      action: 'EDITOU_CATEGORIA',
+      details: `Renomeou a categoria "${target.name}" para "${updated.name}".`,
+    });
+    try {
+      await upsertCategoryApi(currentTenant.id, updated, currentUser?.id);
+    } catch {
+      // fallback offline
+    }
+    setEditingCategoryId(null);
+    setEditingCategoryName('');
+    refreshList();
+    showFeedback(`Categoria atualizada para "${updated.name}".`);
+  };
+
+  const handleOpenDeleteCategory = (cat: Category) => {
+    const others = categories.filter((c) => c.id !== cat.id);
+    setCategoryToDelete(cat);
+    setDeleteStrategy(others.length > 0 ? 'transfer' : 'uncategorized');
+    setTransferTargetCatId(others[0]?.id || '');
+  };
+
+  const handleConfirmDeleteCategory = async () => {
+    if (!categoryToDelete) return;
+    const res = deleteCategoryWithStrategy(
+      currentTenant.id,
+      categoryToDelete.id,
+      deleteStrategy,
+      deleteStrategy === 'transfer' ? transferTargetCatId : undefined,
+      currentUser ? { id: currentUser.id, name: currentUser.name } : undefined
+    );
+    if (!res.success) {
+      showFeedback(res.error || 'Falha ao excluir categoria.', 'error');
+      return;
+    }
+    try {
+      await deleteCategoryApi(
+        currentTenant.id,
+        categoryToDelete.id,
+        deleteStrategy,
+        deleteStrategy === 'transfer' ? transferTargetCatId : undefined,
+        currentUser?.id
+      );
+    } catch {
+      // fallback offline
+    }
+    if (selectedCategory === categoryToDelete.id) {
+      setSelectedCategory('all');
+    }
+    setCategoryToDelete(null);
+    refreshList();
+    showFeedback(
+      `Categoria removida. ${res.movedProductsCount} produto(s) ${
+        deleteStrategy === 'transfer' ? 'transferido(s)' : 'mantido(s) sem categoria'
+      }.`
+    );
+  };
+
+  const uncategorizedCount = products.filter((p) => !p.categoryId).length;
   const filteredProducts = products.filter((p) => {
-    const matchesCategory = selectedCategory === 'all' || p.categoryId === selectedCategory;
+    const matchesCategory =
+      selectedCategory === 'all'
+        ? true
+        : selectedCategory === 'uncategorized'
+        ? !p.categoryId
+        : p.categoryId === selectedCategory;
     const matchesSearch =
       p.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
       p.internalCode.toLowerCase().includes(searchTerm.toLowerCase());
@@ -294,25 +430,25 @@ export const ProductsView: React.FC = () => {
         </div>
 
         {isAdm && (
-          <button
-            onClick={handleOpenCreateModal}
-            className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-xl bg-amber-600 px-4 py-2.5 text-xs font-bold text-white shadow-sm hover:bg-amber-700 transition"
-          >
-            <Plus className="h-4 w-4" />
-            <span>Cadastrar Produto</span>
-          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setIsCategoryModalOpen(true)}
+              className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-xl border border-stone-300 bg-white px-4 py-2.5 text-xs font-bold text-stone-800 shadow-2xs hover:bg-stone-50 transition"
+            >
+              <FolderKanban className="h-4 w-4 text-amber-600" />
+              <span>Gerenciar Categorias</span>
+            </button>
+            <button
+              type="button"
+              onClick={handleOpenCreateModal}
+              className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-xl bg-amber-600 px-4 py-2.5 text-xs font-bold text-white shadow-sm hover:bg-amber-700 transition"
+            >
+              <Plus className="h-4 w-4" />
+              <span>Cadastrar Produto</span>
+            </button>
+          </div>
         )}
-      </div>
-
-      {/* Informativo sobre Balança e Venda por Peso */}
-      <div className="flex items-start gap-3 rounded-2xl border border-amber-200 bg-amber-50/70 p-3.5 text-xs text-amber-950">
-        <Scale className="h-5 w-5 text-amber-700 shrink-0 mt-0.5" />
-        <div>
-          <p className="font-bold">Suporte a Produtos por Peso (Balança — kg / g)</p>
-          <p className="mt-0.5 text-[11px] text-amber-900/90 leading-relaxed">
-            Produtos configurados com unidade <strong>kg</strong>, <strong>g</strong> ou marcados como <strong>Venda na Balança</strong> permitem digitar o peso exato com cálculo automático de preço e baixa proporcional de estoque no Balcão e nas Mesas. A leitura automática direta de balanças físicas USB/Bluetooth depende de driver Web Serial (PC) ou plugin nativo Android correspondente.
-          </p>
-        </div>
       </div>
 
       {/* Categorias Tabs */}
@@ -343,6 +479,18 @@ export const ProductsView: React.FC = () => {
             </button>
           );
         })}
+        {uncategorizedCount > 0 && (
+          <button
+            onClick={() => setSelectedCategory('uncategorized')}
+            className={`shrink-0 rounded-xl px-3.5 py-2 text-xs font-bold transition ${
+              selectedCategory === 'uncategorized'
+                ? 'bg-stone-700 text-white shadow-xs'
+                : 'border border-stone-200 bg-white text-stone-600 hover:bg-stone-50'
+            }`}
+          >
+            Sem categoria ({uncategorizedCount})
+          </button>
+        )}
       </div>
 
       {/* Busca */}
@@ -361,7 +509,7 @@ export const ProductsView: React.FC = () => {
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
         {filteredProducts.map((prod) => {
           const isLowStock = prod.stockQuantity <= prod.minStock;
-          const categoryName = categories.find((c) => c.id === prod.categoryId)?.name || 'Geral';
+          const categoryName = categories.find((c) => c.id === prod.categoryId)?.name || 'Sem categoria';
 
           return (
             <div
@@ -396,11 +544,6 @@ export const ProductsView: React.FC = () => {
                 {prod.isComposite && (
                   <span className="absolute bottom-2.5 left-2.5 rounded-lg bg-purple-900/80 px-2 py-0.5 text-[10px] font-bold text-purple-200 backdrop-blur-xs flex items-center gap-1">
                     <ChefHat className="h-3 w-3" /> Ficha Técnica
-                  </span>
-                )}
-                {(prod.allowWeight || prod.unit === 'kg' || prod.unit === 'g') && (
-                  <span className="absolute bottom-2.5 right-2.5 rounded-lg bg-amber-600/95 px-2 py-0.5 text-[10px] font-bold text-white flex items-center gap-1">
-                    <Scale className="h-3 w-3" /> Balança ({prod.unit})
                   </span>
                 )}
               </div>
@@ -496,7 +639,7 @@ export const ProductsView: React.FC = () => {
                   {editingProduct ? 'Editar Produto na Matriz' : 'Cadastrar Produto com Fotografia'}
                 </h3>
                 <p className="text-xs text-stone-500">
-                  Armazenamento local SQLite com compressão e sincronização aos terminais
+                  Armazenamento local na Matriz com compressão e sincronização aos terminais
                 </p>
               </div>
               <button
@@ -644,12 +787,13 @@ export const ProductsView: React.FC = () => {
                 </div>
 
                 <div>
-                  <label className="block text-xs font-semibold text-stone-700">Categoria *</label>
+                  <label className="block text-xs font-semibold text-stone-700">Categoria</label>
                   <select
                     value={formData.categoryId}
                     onChange={(e) => setFormData({ ...formData, categoryId: e.target.value })}
                     className="mt-1 w-full rounded-xl border border-stone-200 bg-white px-3 py-2 text-xs font-bold text-stone-900 focus:border-amber-500 focus:outline-none"
                   >
+                    <option value="">Sem categoria</option>
                     {categories.map((c) => (
                       <option key={c.id} value={c.id}>
                         {c.name}
@@ -683,7 +827,7 @@ export const ProductsView: React.FC = () => {
                   />
                 </div>
 
-                <div>
+                <div className="col-span-2">
                   <label className="block text-xs font-semibold text-stone-700">Unidade de Venda *</label>
                   <select
                     value={formData.unit}
@@ -692,34 +836,19 @@ export const ProductsView: React.FC = () => {
                       setFormData({
                         ...formData,
                         unit: nextUnit,
-                        allowWeight: nextUnit === 'kg' || nextUnit === 'g' ? true : formData.allowWeight,
+                        allowWeight: nextUnit === 'kg' || nextUnit === 'g',
                       });
                     }}
                     className="mt-1 w-full rounded-xl border border-stone-200 bg-white px-3 py-2 text-xs font-bold text-stone-900 focus:border-amber-500 focus:outline-none"
                   >
                     <option value="un">Unidade (un)</option>
-                    <option value="kg">Quilograma (kg — Balança)</option>
-                    <option value="g">Grama (g — Balança)</option>
+                    <option value="kg">Quilograma (kg)</option>
+                    <option value="g">Grama (g)</option>
                     <option value="l">Litro (l)</option>
                     <option value="ml">Mililitro (ml)</option>
                     <option value="porcao">Porção</option>
                     <option value="fatia">Fatia</option>
                   </select>
-                </div>
-
-                <div className="flex items-end pb-1">
-                  <label className="flex w-full cursor-pointer items-center gap-2 rounded-xl border border-amber-200 bg-amber-50/70 px-3 py-2 text-xs font-semibold text-amber-950">
-                    <input
-                      type="checkbox"
-                      checked={formData.allowWeight}
-                      onChange={(e) => setFormData({ ...formData, allowWeight: e.target.checked })}
-                      className="rounded border-amber-400 text-amber-600 focus:ring-amber-500"
-                    />
-                    <span className="flex items-center gap-1">
-                      <Scale className="h-3.5 w-3.5 text-amber-700" />
-                      Venda na Balança (por peso)
-                    </span>
-                  </label>
                 </div>
 
                 <div>
@@ -820,6 +949,198 @@ export const ProductsView: React.FC = () => {
                 </button>
               ))}
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: GERENCIAR CATEGORIAS (CRIAR, RENOMEAR, EXCLUIR COM REATRIBUIÇÃO) */}
+      {isCategoryModalOpen && isAdm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-900/60 p-4 backdrop-blur-xs">
+          <div className="w-full max-w-lg rounded-3xl border border-stone-200 bg-white p-6 shadow-2xl max-h-[88vh] flex flex-col space-y-4">
+            <div className="flex items-center justify-between border-b border-stone-100 pb-3">
+              <div>
+                <h3 className="font-black text-stone-900 text-base">Gerenciar Categorias do Cardápio</h3>
+                <p className="text-xs text-stone-500">
+                  Crie, edite ou exclua categorias mantendo seus produtos organizados.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setIsCategoryModalOpen(false);
+                  setEditingCategoryId(null);
+                  setCategoryToDelete(null);
+                }}
+                className="rounded-lg p-1.5 text-stone-400 hover:bg-stone-100"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <form onSubmit={handleCreateCategory} className="flex gap-2">
+              <input
+                type="text"
+                value={newCategoryName}
+                onChange={(e) => setNewCategoryName(e.target.value)}
+                placeholder="Nome da nova categoria..."
+                className="flex-1 rounded-xl border border-stone-200 px-3 py-2 text-xs text-stone-900 focus:border-amber-500 focus:outline-none"
+              />
+              <button
+                type="submit"
+                disabled={!newCategoryName.trim()}
+                className="inline-flex items-center gap-1 rounded-xl bg-amber-600 px-4 py-2 text-xs font-bold text-white hover:bg-amber-700 disabled:opacity-45"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                Adicionar
+              </button>
+            </form>
+
+            <div className="flex-1 overflow-y-auto divide-y divide-stone-100 border border-stone-200 rounded-2xl">
+              {categories.length === 0 ? (
+                <div className="p-6 text-center text-xs text-stone-500">Nenhuma categoria cadastrada.</div>
+              ) : (
+                categories.map((cat) => {
+                  const linkedCount = products.filter((p) => p.categoryId === cat.id).length;
+                  const isEditing = editingCategoryId === cat.id;
+                  return (
+                    <div key={cat.id} className="p-3 flex items-center justify-between gap-2">
+                      {isEditing ? (
+                        <div className="flex-1 flex items-center gap-2">
+                          <input
+                            type="text"
+                            value={editingCategoryName}
+                            onChange={(e) => setEditingCategoryName(e.target.value)}
+                            className="flex-1 rounded-lg border border-amber-400 px-2.5 py-1.5 text-xs font-bold text-stone-900 focus:outline-none"
+                          />
+                          <button
+                            type="button"
+                            onClick={handleSaveCategoryEdit}
+                            className="px-3 py-1.5 rounded-lg bg-emerald-600 text-white text-xs font-bold"
+                          >
+                            Salvar
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setEditingCategoryId(null)}
+                            className="px-2.5 py-1.5 rounded-lg border border-stone-200 text-xs text-stone-600"
+                          >
+                            Cancelar
+                          </button>
+                        </div>
+                      ) : (
+                        <>
+                          <div className="min-w-0">
+                            <p className="font-bold text-stone-900 text-xs truncate">{cat.name}</p>
+                            <p className="text-[11px] text-stone-500">{linkedCount} produto(s) vinculado(s)</p>
+                          </div>
+                          <div className="flex items-center gap-1 shrink-0">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setEditingCategoryId(cat.id);
+                                setEditingCategoryName(cat.name);
+                              }}
+                              className="p-1.5 rounded-lg text-stone-500 hover:bg-stone-100 hover:text-stone-900"
+                              title="Renomear categoria"
+                            >
+                              <Edit2 className="w-3.5 h-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleOpenDeleteCategory(cat)}
+                              className="p-1.5 rounded-lg text-stone-500 hover:bg-rose-50 hover:text-rose-600"
+                              title="Excluir categoria"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  );
+                })
+              )}
+            </div>
+
+            {categoryToDelete && (
+              <div className="rounded-2xl border border-rose-200 bg-rose-50/70 p-4 space-y-3">
+                <div className="flex items-start gap-2">
+                  <ArrowRightLeft className="w-4 h-4 text-rose-700 shrink-0 mt-0.5" />
+                  <div className="text-xs text-rose-950">
+                    <p className="font-bold">Excluir categoria "{categoryToDelete.name}"</p>
+                    <p className="text-[11px] mt-0.5">
+                      Escolha o destino dos{' '}
+                      <strong>{products.filter((p) => p.categoryId === categoryToDelete.id).length} produto(s)</strong>{' '}
+                      vinculados a esta categoria:
+                    </p>
+                  </div>
+                </div>
+
+                <div className="space-y-2 text-xs">
+                  {categories.filter((c) => c.id !== categoryToDelete.id).length > 0 && (
+                    <label className="flex items-start gap-2 rounded-xl bg-white border border-stone-200 p-2.5 cursor-pointer">
+                      <input
+                        type="radio"
+                        name="catDeleteStrategy"
+                        checked={deleteStrategy === 'transfer'}
+                        onChange={() => setDeleteStrategy('transfer')}
+                        className="mt-0.5 text-amber-600"
+                      />
+                      <div className="flex-1 space-y-1.5">
+                        <span className="font-bold text-stone-900 block">
+                          Transferir produtos para outra categoria
+                        </span>
+                        {deleteStrategy === 'transfer' && (
+                          <select
+                            value={transferTargetCatId}
+                            onChange={(e) => setTransferTargetCatId(e.target.value)}
+                            className="w-full rounded-lg border border-stone-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-stone-900"
+                          >
+                            {categories
+                              .filter((c) => c.id !== categoryToDelete.id)
+                              .map((c) => (
+                                <option key={c.id} value={c.id}>
+                                  {c.name}
+                                </option>
+                              ))}
+                          </select>
+                        )}
+                      </div>
+                    </label>
+                  )}
+
+                  <label className="flex items-center gap-2 rounded-xl bg-white border border-stone-200 p-2.5 cursor-pointer">
+                    <input
+                      type="radio"
+                      name="catDeleteStrategy"
+                      checked={deleteStrategy === 'uncategorized'}
+                      onChange={() => setDeleteStrategy('uncategorized')}
+                      className="text-amber-600"
+                    />
+                    <span className="font-bold text-stone-900">
+                      Deixar produtos vinculados sem categoria
+                    </span>
+                  </label>
+                </div>
+
+                <div className="flex justify-end gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setCategoryToDelete(null)}
+                    className="px-3 py-1.5 rounded-lg border border-stone-300 bg-white text-xs font-semibold text-stone-700"
+                  >
+                    Cancelar
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleConfirmDeleteCategory}
+                    className="px-4 py-1.5 rounded-lg bg-rose-600 text-white text-xs font-bold hover:bg-rose-700"
+                  >
+                    Confirmar Exclusão
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}

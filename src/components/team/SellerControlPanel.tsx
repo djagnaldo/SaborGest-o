@@ -49,7 +49,6 @@ export const SellerControlPanel: React.FC = () => {
   const [formEmail, setFormEmail] = useState('');
   const [formPhone, setFormPhone] = useState('');
   const [formAccessCode, setFormAccessCode] = useState('');
-  const [formCommission, setFormCommission] = useState<number>(5);
 
   const [qrImageUrl, setQrImageUrl] = useState<string>('');
   const [sellerWebKey, setSellerWebKey] = useState<string>('');
@@ -137,7 +136,6 @@ export const SellerControlPanel: React.FC = () => {
     setFormEmail('');
     setFormPhone('');
     setFormAccessCode(Math.floor(1000 + Math.random() * 9000).toString());
-    setFormCommission(5);
     setIsAddModalOpen(true);
   };
 
@@ -166,8 +164,8 @@ export const SellerControlPanel: React.FC = () => {
       status: 'autorizado',
       accessCode: formAccessCode.trim() || '1234',
       qrToken: newQrToken,
-      deviceModel: 'Terminal Android Autorizado',
-      commissionRate: formCommission,
+      deviceModel: 'Terminal Web Autorizado',
+      commissionRate: 0,
       permissions: {
         canAccessAdminPanel: false,
         canViewReports: false,
@@ -206,7 +204,6 @@ export const SellerControlPanel: React.FC = () => {
     setFormEmail(seller.email);
     setFormPhone(seller.phone || '');
     setFormAccessCode(seller.accessCode || '1234');
-    setFormCommission(seller.commissionRate || 5);
     setIsEditModalOpen(true);
   };
 
@@ -225,7 +222,6 @@ export const SellerControlPanel: React.FC = () => {
       email: formEmail.trim(),
       phone: formPhone.trim(),
       accessCode: formAccessCode.trim(),
-      commissionRate: formCommission,
       updatedAt: new Date().toISOString(),
     };
 
@@ -470,30 +466,16 @@ export const SellerControlPanel: React.FC = () => {
                 />
               </div>
 
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-bold text-stone-700">Código PIN de Acesso</label>
-                  <input
-                    type="text"
-                    maxLength={6}
-                    placeholder="Ex: 1024"
-                    value={formAccessCode}
-                    onChange={(e) => setFormAccessCode(e.target.value)}
-                    className="mt-1 w-full rounded-xl border border-stone-200 px-3.5 py-2.5 text-xs font-mono font-bold text-stone-900 focus:border-amber-500 focus:outline-none"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-xs font-bold text-stone-700">Comissão (%)</label>
-                  <input
-                    type="number"
-                    min={0}
-                    max={100}
-                    value={formCommission}
-                    onChange={(e) => setFormCommission(parseFloat(e.target.value) || 0)}
-                    className="mt-1 w-full rounded-xl border border-stone-200 px-3.5 py-2.5 text-xs text-stone-900 focus:border-amber-500 focus:outline-none"
-                  />
-                </div>
+              <div>
+                <label className="block text-xs font-bold text-stone-700">Código PIN de Acesso</label>
+                <input
+                  type="text"
+                  maxLength={6}
+                  placeholder="Ex: 1024"
+                  value={formAccessCode}
+                  onChange={(e) => setFormAccessCode(e.target.value)}
+                  className="mt-1 w-full rounded-xl border border-stone-200 px-3.5 py-2.5 text-xs font-mono font-bold text-stone-900 focus:border-amber-500 focus:outline-none"
+                />
               </div>
 
               <div>
@@ -574,28 +556,14 @@ export const SellerControlPanel: React.FC = () => {
                 />
               </div>
 
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-bold text-stone-700">Código PIN de Acesso</label>
-                  <input
-                    type="text"
-                    value={formAccessCode}
-                    onChange={(e) => setFormAccessCode(e.target.value)}
-                    className="mt-1 w-full rounded-xl border border-stone-200 px-3.5 py-2.5 text-xs font-mono font-bold text-stone-900 focus:border-amber-500 focus:outline-none"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-xs font-bold text-stone-700">Comissão (%)</label>
-                  <input
-                    type="number"
-                    min={0}
-                    max={100}
-                    value={formCommission}
-                    onChange={(e) => setFormCommission(parseFloat(e.target.value) || 0)}
-                    className="mt-1 w-full rounded-xl border border-stone-200 px-3.5 py-2.5 text-xs text-stone-900 focus:border-amber-500 focus:outline-none"
-                  />
-                </div>
+              <div>
+                <label className="block text-xs font-bold text-stone-700">Código PIN de Acesso</label>
+                <input
+                  type="text"
+                  value={formAccessCode}
+                  onChange={(e) => setFormAccessCode(e.target.value)}
+                  className="mt-1 w-full rounded-xl border border-stone-200 px-3.5 py-2.5 text-xs font-mono font-bold text-stone-900 focus:border-amber-500 focus:outline-none"
+                />
               </div>
 
               <div>

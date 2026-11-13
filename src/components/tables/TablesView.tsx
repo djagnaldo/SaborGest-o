@@ -63,10 +63,11 @@ import {
   getCategories,
   getOpenTableOrders,
   addOrAccumulateTableItems,
+  setTableStatusLocal,
   getTableDeletionBlockReason,
   addAuditLog,
 } from '../../services/storage';
-import { apiRequest } from '../../services/sync-client';
+import { apiRequest, updateTableStatusApi } from '../../services/sync-client';
 import { QuantitySelectorModal } from '../pos/QuantitySelectorModal';
 import { formatBRL, formatTimeBR, formatDateTimeBR } from '../../utils/formatters';
 import { playTableAlarmSound } from '../../utils/soundAlert';
@@ -136,9 +137,20 @@ export const TablesView: React.FC<TablesViewProps> = ({ onGoToSales }) => {
   const [isBatchMode, setIsBatchMode] = useState(false);
   const [selectedIdsForBatch, setSelectedIdsForBatch] = useState<string[]>([]);
 
-  // Feedback & Filtros
+  // Feedback & Filtros & Modais de Confirmação
   const [statusFilter, setStatusFilter] = useState<'all' | 'available' | 'occupied' | 'closing'>('all');
   const [feedbackMessage, setFeedbackMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [confirmModal, setConfirmModal] = useState<{
+    title: string;
+    message: string;
+    confirmLabel: string;
+    onConfirm: () => void;
+  } | null>(null);
+  const [cancelExtraModal, setCancelExtraModal] = useState<{
+    chargeId: string;
+    amount: number;
+    reason: string;
+  } | null>(null);
 
   // Estado temporal em tempo real para contagem regressiva
   const [currentTime, setCurrentTime] = useState<number>(Date.now());
@@ -321,43 +333,57 @@ export const TablesView: React.FC<TablesViewProps> = ({ onGoToSales }) => {
       return;
     }
 
-    if (confirm(`Confirma a exclusão de "${table.label || `Mesa ${table.number}`}"? Esta ação removerá apenas o cadastro da mesa; todo o histórico financeiro e de pedidos será preservado.`)) {
-      const result = deleteTable(
-        table.id,
-        currentUser ? { id: currentUser.id, name: currentUser.name } : undefined
-      );
-      if (result.success) {
-        loadTables();
-        setIsActionModalOpen(false);
-        showFeedback(`✓ "${table.label || `Mesa ${table.number}`}" excluída com sucesso.`);
-      } else {
-        showFeedback(result.error || 'Erro ao excluir mesa.', 'error');
-      }
-    }
+    setConfirmModal({
+      title: `Excluir "${table.label || `Mesa ${table.number}`}"`,
+      message:
+        'Esta ação removerá apenas o cadastro da mesa; todo o histórico financeiro e de pedidos será preservado.',
+      confirmLabel: 'Confirmar Exclusão',
+      onConfirm: () => {
+        const result = deleteTable(
+          table.id,
+          currentUser ? { id: currentUser.id, name: currentUser.name } : undefined
+        );
+        if (result.success) {
+          loadTables();
+          setIsActionModalOpen(false);
+          showFeedback(`✓ "${table.label || `Mesa ${table.number}`}" excluída com sucesso.`);
+        } else {
+          showFeedback(result.error || 'Erro ao excluir mesa.', 'error');
+        }
+        setConfirmModal(null);
+      },
+    });
   };
 
   // ADM: Exclusão em Lote das Selecionadas
   const handleExecuteBatchDelete = () => {
     if (!isAdm || selectedIdsForBatch.length === 0) return;
 
-    if (confirm(`Confirma a exclusão em lote de ${selectedIdsForBatch.length} mesa(s) selecionada(s)? Mesas ocupadas, com pedidos pendentes ou saldo em aberto serão protegidas.`)) {
-      const res = deleteTablesBatch(
-        selectedIdsForBatch,
-        currentUser ? { id: currentUser.id, name: currentUser.name } : undefined
-      );
-      loadTables();
-      setSelectedIdsForBatch([]);
-      setIsBatchMode(false);
-
-      if (res.blockedCount > 0) {
-        showFeedback(
-          `✓ ${res.successCount} mesa(s) livre(s) excluída(s). ⚠️ ${res.blockedCount} mesa(s) protegida(s): ${res.blockedReasons[0]}`,
-          'error'
+    setConfirmModal({
+      title: `Excluir ${selectedIdsForBatch.length} mesa(s) selecionada(s)`,
+      message:
+        'Mesas ocupadas, com pedidos pendentes ou saldo em aberto serão protegidas automaticamente.',
+      confirmLabel: 'Excluir Selecionadas',
+      onConfirm: () => {
+        const res = deleteTablesBatch(
+          selectedIdsForBatch,
+          currentUser ? { id: currentUser.id, name: currentUser.name } : undefined
         );
-      } else {
-        showFeedback(`✓ ${res.successCount} mesa(s) excluída(s) com sucesso em lote.`);
-      }
-    }
+        loadTables();
+        setSelectedIdsForBatch([]);
+        setIsBatchMode(false);
+        setConfirmModal(null);
+
+        if (res.blockedCount > 0) {
+          showFeedback(
+            `✓ ${res.successCount} mesa(s) livre(s) excluída(s). ⚠️ ${res.blockedCount} mesa(s) protegida(s): ${res.blockedReasons[0]}`,
+            'error'
+          );
+        } else {
+          showFeedback(`✓ ${res.successCount} mesa(s) excluída(s) com sucesso em lote.`);
+        }
+      },
+    });
   };
 
   // ADM: Excluir Todas as Mesas Disponíveis
@@ -370,14 +396,23 @@ export const TablesView: React.FC<TablesViewProps> = ({ onGoToSales }) => {
       return;
     }
 
-    if (confirm(`ATENÇÃO: Deseja excluir TODAS as ${availableTotal} mesa(s) livre(s) do salão? Mesas ocupadas ou com pendências financeiras permanecerão protegidas.`)) {
-      const res = deleteAllAvailableTables(
-        currentTenant.id,
-        currentUser ? { id: currentUser.id, name: currentUser.name } : undefined
-      );
-      loadTables();
-      showFeedback(`✓ ${res.successCount} mesa(s) livre(s) removida(s). ${res.blockedCount} mesa(s) em atendimento protegida(s).`);
-    }
+    setConfirmModal({
+      title: `Excluir todas as ${availableTotal} mesa(s) livre(s)`,
+      message:
+        'Mesas ocupadas ou com pendências financeiras permanecerão protegidas e os históricos continuam preservados.',
+      confirmLabel: 'Excluir Todas Livres',
+      onConfirm: () => {
+        const res = deleteAllAvailableTables(
+          currentTenant.id,
+          currentUser ? { id: currentUser.id, name: currentUser.name } : undefined
+        );
+        loadTables();
+        setConfirmModal(null);
+        showFeedback(
+          `✓ ${res.successCount} mesa(s) livre(s) removida(s). ${res.blockedCount} mesa(s) em atendimento protegida(s).`
+        );
+      },
+    });
   };
 
   // ADM: Adicionar Valor Extra à Mesa
@@ -459,13 +494,16 @@ export const TablesView: React.FC<TablesViewProps> = ({ onGoToSales }) => {
     }
   };
 
-  // ADM: Cancelar Lançamento Extra da Mesa
+  // ADM: Cancelar Lançamento Extra da Mesa (Modal React sem prompt nativo)
   const handleCancelExtraCharge = (chargeId: string, chargeAmount: number) => {
     if (!selectedTable || !currentUser || !isAdm) return;
+    setCancelExtraModal({ chargeId, amount: chargeAmount, reason: '' });
+  };
 
-    const reason = prompt(`Informe a justificativa obrigatória para cancelar o valor extra de ${formatBRL(chargeAmount)}:`, '');
-    if (reason === null) return;
-    if (!reason.trim()) {
+  const handleConfirmCancelExtraCharge = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedTable || !currentUser || !isAdm || !cancelExtraModal) return;
+    if (!cancelExtraModal.reason.trim()) {
       showFeedback('É obrigatório informar a justificativa para cancelar e estornar o lançamento.', 'error');
       return;
     }
@@ -473,15 +511,16 @@ export const TablesView: React.FC<TablesViewProps> = ({ onGoToSales }) => {
     const res = cancelTableExtraCharge(
       currentTenant.id,
       selectedTable.id,
-      chargeId,
-      reason.trim(),
+      cancelExtraModal.chargeId,
+      cancelExtraModal.reason.trim(),
       { id: currentUser.id, name: currentUser.name }
     );
 
     if (res.success && res.table) {
       setSelectedTable(res.table);
       loadTables();
-      showFeedback(`✓ Lançamento extra cancelado e estorno registrado mantendo o histórico original!`);
+      setCancelExtraModal(null);
+      showFeedback('✓ Lançamento extra cancelado e estorno registrado mantendo o histórico original!');
     } else {
       showFeedback(res.error || 'Erro ao cancelar lançamento extra.', 'error');
     }
@@ -605,21 +644,18 @@ export const TablesView: React.FC<TablesViewProps> = ({ onGoToSales }) => {
     }
   };
 
-  const handleMarkAwaitingPayment = (table: RestaurantTable) => {
-    const updated: RestaurantTable = {
-      ...table,
-      status: 'closing',
-    };
-    saveTable(updated);
-    addAuditLog({
-      tenantId: currentTenant.id,
-      userId: currentUser?.id || 'garcom',
-      userName: currentUser?.name || 'Vendedor',
-      action: 'SOLICITOU_CONTA',
-      details: `Marcou "${table.label || `Mesa ${table.number}`}" como Aguardando Pagamento (fechamento na aba Vendas).`,
-    });
+  const handleMarkAwaitingPayment = async (table: RestaurantTable) => {
+    const actor = { id: currentUser?.id || 'garcom', name: currentUser?.name || 'Vendedor' };
+    const localRes = setTableStatusLocal(currentTenant.id, table.id, 'closing', actor);
+    try {
+      const remoteRes = await updateTableStatusApi(currentTenant.id, table.id, 'closing', actor.id);
+      if (remoteRes?.table) {
+        setSelectedTable(remoteRes.table);
+      }
+    } catch {
+      if (localRes.table) setSelectedTable(localRes.table);
+    }
     loadTables();
-    setSelectedTable(updated);
     showFeedback(
       `"${table.label || `Mesa ${table.number}`}" marcada como Aguardando Pagamento. Finalize o recebimento na aba Vendas.`
     );
@@ -969,8 +1005,8 @@ export const TablesView: React.FC<TablesViewProps> = ({ onGoToSales }) => {
                           <Clock className="h-2.5 w-2.5" />
                           {formatTimeBR(table.openedAt)}
                         </span>
-                        <span className="truncate max-w-[65px]">
-                          {table.waiterName?.split(' ')[0] || 'Atendimento'}
+                        <span className="truncate max-w-[85px]" title={`Aberta por: ${table.openedByName || table.waiterName || 'Atendimento'}`}>
+                          {(table.openedByName || table.waiterName || 'Salão').split(' ')[0]}
                         </span>
                       </div>
                     </>
@@ -1191,6 +1227,7 @@ export const TablesView: React.FC<TablesViewProps> = ({ onGoToSales }) => {
                               <p className="text-[11px] text-stone-500 tabular-nums">
                                 Unitário: {formatBRL(item.unitPrice)}
                                 {item.variationName ? ` • ${item.variationName}` : ''}
+                                {item.addedByName ? ` • Lançado por: ${item.addedByName}` : ''}
                                 {item.notes ? ` • Obs: ${item.notes}` : ''}
                               </p>
                             </div>
@@ -1203,6 +1240,28 @@ export const TablesView: React.FC<TablesViewProps> = ({ onGoToSales }) => {
                     </div>
                   )}
                 </div>
+
+                {/* Registro Cronológico de Autoria Colaborativa na Mesa */}
+                {selectedTable.operationLogs && selectedTable.operationLogs.length > 0 && (
+                  <div className="space-y-1.5">
+                    <p className="font-bold text-stone-800 text-xs">Registro de Movimentações da Mesa</p>
+                    <div className="rounded-xl border border-stone-200 bg-stone-50 p-2.5 max-h-32 overflow-y-auto space-y-1 text-[11px]">
+                      {selectedTable.operationLogs.map((log) => (
+                        <div key={log.id} className="flex items-start justify-between gap-2 text-stone-600">
+                          <span>
+                            <strong className="text-stone-800">{log.operatorName}</strong>:{' '}
+                            {log.productName
+                              ? `${log.quantity ?? 1}× ${log.productName}${log.notes ? ` (${log.notes})` : ''}`
+                              : log.notes || log.type}
+                          </span>
+                          <span className="font-mono text-[10px] text-stone-400 shrink-0">
+                            {formatTimeBR(log.timestamp)}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
 
                 {/* Alerta de Tempo / Temporizador Vencido no Modal */}
                 {selectedTable.timer && (
@@ -1339,8 +1398,12 @@ export const TablesView: React.FC<TablesViewProps> = ({ onGoToSales }) => {
 
                 {selectedTable.openedAt && (
                   <div className="flex justify-between text-[11px] text-stone-500 pt-1 border-t border-stone-100">
-                    <span>Atendente: <strong>{selectedTable.waiterName || 'Salão'}</strong></span>
-                    <span>Aberta às: <strong>{formatTimeBR(selectedTable.openedAt)}</strong></span>
+                    <span>
+                      Aberta por: <strong>{selectedTable.openedByName || selectedTable.waiterName || 'Salão'}</strong>
+                    </span>
+                    <span>
+                      Aberta às: <strong>{formatTimeBR(selectedTable.openedAt)}</strong>
+                    </span>
                   </div>
                 )}
               </div>
@@ -2044,6 +2107,77 @@ export const TablesView: React.FC<TablesViewProps> = ({ onGoToSales }) => {
               )}
             </div>
           </div>
+        </div>
+      )}
+
+      {/* MODAL DE CONFIRMAÇÃO DE EXCLUSÃO DE MESA(S) */}
+      {confirmModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-900/60 p-4 backdrop-blur-xs">
+          <div className="w-full max-w-sm rounded-3xl border border-stone-200 bg-white p-6 shadow-2xl space-y-4">
+            <h3 className="font-black text-stone-900 text-base">{confirmModal.title}</h3>
+            <p className="text-xs text-stone-600 leading-relaxed">{confirmModal.message}</p>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => setConfirmModal(null)}
+                className="w-1/2 min-h-[42px] rounded-xl border border-stone-200 text-xs font-bold text-stone-700 hover:bg-stone-50"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={confirmModal.onConfirm}
+                className="w-1/2 min-h-[42px] rounded-xl bg-rose-600 text-xs font-bold text-white hover:bg-rose-700"
+              >
+                {confirmModal.confirmLabel}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL DE JUSTIFICATIVA PARA CANCELAR VALOR EXTRA */}
+      {cancelExtraModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-900/60 p-4 backdrop-blur-xs">
+          <form
+            onSubmit={handleConfirmCancelExtraCharge}
+            className="w-full max-w-sm rounded-3xl border border-stone-200 bg-white p-6 shadow-2xl space-y-4"
+          >
+            <div>
+              <h3 className="font-black text-stone-900 text-base">Cancelar Valor Extra</h3>
+              <p className="text-xs text-stone-500 mt-0.5">
+                Estornar lançamento de <strong>{formatBRL(cancelExtraModal.amount)}</strong>
+              </p>
+            </div>
+            <div>
+              <label className="block text-xs font-bold text-stone-700 mb-1">
+                Justificativa obrigatória *
+              </label>
+              <textarea
+                rows={3}
+                required
+                value={cancelExtraModal.reason}
+                onChange={(e) => setCancelExtraModal({ ...cancelExtraModal, reason: e.target.value })}
+                placeholder="Informe o motivo do cancelamento/estorno..."
+                className="w-full rounded-xl border border-stone-200 p-2.5 text-xs text-stone-900 focus:border-rose-500 focus:outline-none"
+              />
+            </div>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => setCancelExtraModal(null)}
+                className="w-1/2 min-h-[42px] rounded-xl border border-stone-200 text-xs font-bold text-stone-700 hover:bg-stone-50"
+              >
+                Voltar
+              </button>
+              <button
+                type="submit"
+                className="w-1/2 min-h-[42px] rounded-xl bg-rose-600 text-xs font-bold text-white hover:bg-rose-700"
+              >
+                Confirmar Estorno
+              </button>
+            </div>
+          </form>
         </div>
       )}
     </div>

@@ -3,29 +3,29 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
-  Settings,
   Building2,
   Trash2,
   RefreshCw,
   ShieldCheck,
   Database,
-  Clock,
-  Sparkles,
   Camera,
   QrCode,
   Banknote,
   CheckCircle2,
   Activity,
   Layers,
-  ArrowDownUp,
-  Cpu,
+  X,
+  AlertTriangle,
 } from 'lucide-react';
 import { useTenant } from '../../contexts/TenantContext';
 import { useAuth } from '../../contexts/AuthContext';
-import { getAuditLogs, addAuditLog } from '../../services/storage';
-import { getDeltaStats, broadcastDeltaUpdate, getMatrizInfo } from '../../services/local-db';
+import {
+  getAuditLogs,
+  addAuditLog,
+} from '../../services/storage';
+import { getDeltaStats, broadcastDeltaUpdate } from '../../services/local-db';
 import { formatDateTimeBR } from '../../utils/formatters';
 
 interface SettingsViewProps {
@@ -36,8 +36,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenEditTenant }) 
   const { currentTenant, updateTenant, clearTenantDemoData, reloadTenantDemoData } = useTenant();
   const { isAdm, currentUser } = useAuth();
   const auditLogs = getAuditLogs(currentTenant.id);
-  const matriz = getMatrizInfo();
   const deltaStats = getDeltaStats();
+
+  const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+  const [confirmClearDemo, setConfirmClearDemo] = useState(false);
 
   // Regras de Comprovante
   const [pixRule, setPixRule] = useState<'disabled' | 'optional' | 'required'>(
@@ -47,6 +49,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenEditTenant }) 
     currentTenant.settings?.cashReceiptRule || 'optional'
   );
   const [rulesSavedNotice, setRulesSavedNotice] = useState(false);
+
+  useEffect(() => {
+    setPixRule(currentTenant.settings?.pixReceiptRule || 'optional');
+    setCashRule(currentTenant.settings?.cashReceiptRule || 'optional');
+  }, [currentTenant.id, currentTenant.settings?.pixReceiptRule, currentTenant.settings?.cashReceiptRule]);
 
   const handleSaveReceiptRules = () => {
     const updatedTenant = {
@@ -90,13 +97,32 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenEditTenant }) 
             Configurações & Auditoria
           </h1>
           <span className="rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-semibold text-amber-800">
-            Sistema
+            Matriz ADM
           </span>
         </div>
         <p className="mt-1 text-xs text-stone-500 sm:text-sm">
-          Preferências operacionais do estabelecimento, status do banco de dados e trilha de auditoria completa.
+          Preferências operacionais do estabelecimento, regras de pagamento e trilha de auditoria completa.
         </p>
       </div>
+
+      {feedback && (
+        <div
+          className={`flex items-center justify-between rounded-xl border px-4 py-3 text-xs font-semibold ${
+            feedback.type === 'error'
+              ? 'border-rose-200 bg-rose-50 text-rose-900'
+              : 'border-emerald-200 bg-emerald-50 text-emerald-900'
+          }`}
+        >
+          <span>{feedback.text}</span>
+          <button
+            type="button"
+            onClick={() => setFeedback(null)}
+            className="p-1 opacity-70 hover:opacity-100"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+      )}
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
         {/* Dados do Estabelecimento */}
@@ -159,31 +185,33 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenEditTenant }) 
             O sistema suporta alternância entre dados de teste (com a marcação <code>isDemo: true</code>) e dados reais. Você pode limpar a demonstração a qualquer momento.
           </p>
 
-          <div className="flex flex-col gap-2 pt-2">
-            <button
-              onClick={() => {
-                if (confirm('Deseja realmente remover os dados de demonstração deste estabelecimento?')) {
-                  clearTenantDemoData();
-                  alert('Dados de demonstração removidos com sucesso!');
-                }
-              }}
-              className="flex items-center justify-center gap-2 rounded-xl border border-rose-200 bg-rose-50 px-4 py-2.5 text-xs font-semibold text-rose-700 hover:bg-rose-100 transition"
-            >
-              <Trash2 className="h-4 w-4 text-rose-600" />
-              Limpar Dados de Demonstração
-            </button>
+          {isAdm && (
+            <div className="flex flex-col gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setConfirmClearDemo(true)}
+                className="flex items-center justify-center gap-2 rounded-xl border border-rose-200 bg-rose-50 px-4 py-2.5 text-xs font-semibold text-rose-700 hover:bg-rose-100 transition"
+              >
+                <Trash2 className="h-4 w-4 text-rose-600" />
+                Limpar Dados de Demonstração
+              </button>
 
-            <button
-              onClick={() => {
-                reloadTenantDemoData();
-                alert('Dados de demonstração recarregados com sucesso!');
-              }}
-              className="flex items-center justify-center gap-2 rounded-xl border border-stone-200 bg-stone-50 px-4 py-2.5 text-xs font-semibold text-stone-700 hover:bg-stone-100 transition"
-            >
-              <RefreshCw className="h-4 w-4 text-stone-600" />
-              Recarregar Dados de Demonstração
-            </button>
-          </div>
+              <button
+                type="button"
+                onClick={() => {
+                  reloadTenantDemoData();
+                  setFeedback({
+                    type: 'success',
+                    text: 'Dados de demonstração recarregados com sucesso!',
+                  });
+                }}
+                className="flex items-center justify-center gap-2 rounded-xl border border-stone-200 bg-stone-50 px-4 py-2.5 text-xs font-semibold text-stone-700 hover:bg-stone-100 transition"
+              >
+                <RefreshCw className="h-4 w-4 text-stone-600" />
+                Recarregar Dados de Demonstração
+              </button>
+            </div>
+          )}
         </div>
       </div>
 
@@ -388,6 +416,48 @@ export const SettingsView: React.FC<SettingsViewProps> = ({ onOpenEditTenant }) 
           </table>
         </div>
       </div>
+      {/* Modal React de Confirmação: Limpar Dados Demo */}
+      {confirmClearDemo && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-900/60 p-4 backdrop-blur-xs">
+          <div className="w-full max-w-md rounded-2xl border border-rose-200 bg-white p-6 shadow-2xl space-y-4">
+            <div className="flex items-center gap-3">
+              <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-rose-100 text-rose-700">
+                <AlertTriangle className="h-5 w-5" />
+              </div>
+              <div>
+                <h3 className="text-sm font-bold text-stone-900">Limpar Dados de Demonstração</h3>
+                <p className="text-xs text-stone-500">
+                  Remove apenas registros marcados como demonstração deste estabelecimento.
+                </p>
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-2 pt-2 border-t border-stone-100">
+              <button
+                type="button"
+                onClick={() => setConfirmClearDemo(false)}
+                className="rounded-xl border border-stone-200 px-4 py-2 text-xs font-semibold text-stone-600 hover:bg-stone-50"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  clearTenantDemoData();
+                  setConfirmClearDemo(false);
+                  setFeedback({
+                    type: 'success',
+                    text: 'Dados de demonstração removidos com sucesso!',
+                  });
+                }}
+                className="rounded-xl bg-rose-600 px-4 py-2 text-xs font-bold text-white hover:bg-rose-700"
+              >
+                Confirmar Remoção
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

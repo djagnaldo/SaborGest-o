@@ -4,6 +4,14 @@
  */
 
 import type {
+  ArchivedPeriodPdf,
+  Category,
+  Customer,
+  Product,
+  RestaurantTable,
+  SelectiveResetOptions,
+  SelectiveResetResult,
+  Supplier,
   UserProfile,
   WebAccessMode,
   WebAccessStatusResponse,
@@ -235,7 +243,7 @@ export function getOfflineQueueCount(): number {
 export async function apiRequest<T = any>(
   path: string,
   options: {
-    method?: 'GET' | 'POST' | 'DELETE';
+    method?: 'GET' | 'POST' | 'PUT' | 'DELETE';
     body?: any;
     activeUserId?: string;
     queueOnOffline?: boolean;
@@ -415,7 +423,10 @@ function applySnapshotSafely(data: Record<string, any>, revision?: number): void
 
 export async function refreshSnapshotFromServer(tenantId: string, activeUserId?: string): Promise<void> {
   try {
-    const snap = await apiRequest<{ data?: Record<string, any>; revision?: number }>(
+    const snap = await apiRequest<{
+      data?: Record<string, any>;
+      revision?: number;
+    }>(
       `/api/state/snapshot?tenantId=${encodeURIComponent(tenantId)}`,
       { activeUserId }
     );
@@ -528,7 +539,9 @@ export function scheduleStatePushToServer(
   if (applyingRemoteState) return;
   if (typeof window === 'undefined') return;
   if (isAndroidNativeHost() && (!nativeServerRunning || !activeNativePort)) return;
-  if (!getWebPortalAuth() && !matrizSecret) return;
+  const webAuth = getWebPortalAuth();
+  if (!webAuth && !matrizSecret) return;
+  if (webAuth?.session.mode === 'seller') return;
 
   if (syncDebounceTimer) clearTimeout(syncDebounceTimer);
   syncDebounceTimer = setTimeout(async () => {
@@ -660,4 +673,202 @@ export async function fetchQrDataUrl(targetUrl: string, activeUserId?: string): 
     { activeUserId }
   );
   return res.qrDataUrl;
+}
+
+// ==================================================
+// MÍDIA, MESAS, CATÁLOGO, CONTATOS E ARQUIVOS PDF
+// ==================================================
+
+export async function uploadMediaFile(
+  dataUrl: string,
+  prefix = 'prod',
+  activeUserId?: string
+): Promise<{ fileName: string; url: string }> {
+  return apiRequest('/api/media/upload', {
+    method: 'POST',
+    activeUserId,
+    body: { dataUrl, prefix },
+  });
+}
+
+export async function updateTableStatusApi(
+  tenantId: string,
+  tableId: string,
+  status: 'available' | 'occupied' | 'closing',
+  activeUserId?: string
+): Promise<{ table: RestaurantTable; revision: number }> {
+  return apiRequest(`/api/tables/${encodeURIComponent(tableId)}/status`, {
+    method: 'POST',
+    activeUserId,
+    body: { tenantId, status },
+  });
+}
+
+export async function upsertCategoryApi(
+  tenantId: string,
+  category: Partial<Category> & { name: string },
+  activeUserId?: string
+): Promise<{ category: Category }> {
+  if (category.id) {
+    return apiRequest(`/api/catalog/categories/${encodeURIComponent(category.id)}`, {
+      method: 'PUT',
+      activeUserId,
+      body: { ...category, tenantId },
+    });
+  }
+  return apiRequest('/api/catalog/categories', {
+    method: 'POST',
+    activeUserId,
+    body: { ...category, tenantId },
+  });
+}
+
+export async function deleteCategoryApi(
+  tenantId: string,
+  categoryId: string,
+  strategy: 'transfer' | 'uncategorized',
+  targetCategoryId?: string,
+  activeUserId?: string
+): Promise<{ movedProductsCount: number }> {
+  const qs = new URLSearchParams({ tenantId, strategy });
+  if (targetCategoryId) qs.set('targetCategoryId', targetCategoryId);
+  return apiRequest(`/api/catalog/categories/${encodeURIComponent(categoryId)}?${qs.toString()}`, {
+    method: 'DELETE',
+    activeUserId,
+    body: { tenantId, strategy, targetCategoryId },
+  });
+}
+
+export async function upsertProductApi(
+  tenantId: string,
+  product: Partial<Product> & { name: string },
+  activeUserId?: string
+): Promise<{ product: Product }> {
+  if (product.id) {
+    return apiRequest(`/api/catalog/products/${encodeURIComponent(product.id)}`, {
+      method: 'PUT',
+      activeUserId,
+      body: { ...product, tenantId },
+    });
+  }
+  return apiRequest('/api/catalog/products', {
+    method: 'POST',
+    activeUserId,
+    body: { ...product, tenantId },
+  });
+}
+
+export async function deleteProductApi(
+  tenantId: string,
+  productId: string,
+  activeUserId?: string
+): Promise<{ actionTaken: 'deleted' | 'deactivated'; message: string }> {
+  return apiRequest(
+    `/api/catalog/products/${encodeURIComponent(productId)}?tenantId=${encodeURIComponent(tenantId)}`,
+    {
+      method: 'DELETE',
+      activeUserId,
+    }
+  );
+}
+
+export async function upsertCustomerApi(
+  tenantId: string,
+  customer: Partial<Customer> & { name: string },
+  activeUserId?: string
+): Promise<{ customer: Customer }> {
+  if (customer.id) {
+    return apiRequest(`/api/contacts/customers/${encodeURIComponent(customer.id)}`, {
+      method: 'PUT',
+      activeUserId,
+      body: { ...customer, tenantId },
+    });
+  }
+  return apiRequest('/api/contacts/customers', {
+    method: 'POST',
+    activeUserId,
+    body: { ...customer, tenantId },
+  });
+}
+
+export async function deleteCustomerApi(
+  tenantId: string,
+  customerId: string,
+  activeUserId?: string
+): Promise<void> {
+  await apiRequest(
+    `/api/contacts/customers/${encodeURIComponent(customerId)}?tenantId=${encodeURIComponent(tenantId)}`,
+    {
+      method: 'DELETE',
+      activeUserId,
+    }
+  );
+}
+
+export async function upsertSupplierApi(
+  tenantId: string,
+  supplier: Partial<Supplier> & { name: string },
+  activeUserId?: string
+): Promise<{ supplier: Supplier }> {
+  if (supplier.id) {
+    return apiRequest(`/api/contacts/suppliers/${encodeURIComponent(supplier.id)}`, {
+      method: 'PUT',
+      activeUserId,
+      body: { ...supplier, tenantId },
+    });
+  }
+  return apiRequest('/api/contacts/suppliers', {
+    method: 'POST',
+    activeUserId,
+    body: { ...supplier, tenantId },
+  });
+}
+
+export async function deleteSupplierApi(
+  tenantId: string,
+  supplierId: string,
+  activeUserId?: string
+): Promise<void> {
+  await apiRequest(
+    `/api/contacts/suppliers/${encodeURIComponent(supplierId)}?tenantId=${encodeURIComponent(tenantId)}`,
+    {
+      method: 'DELETE',
+      activeUserId,
+    }
+  );
+}
+
+export async function fetchArchivedPdfsApi(
+  tenantId: string,
+  activeUserId?: string
+): Promise<ArchivedPeriodPdf[]> {
+  const res = await apiRequest<{ archivePdfs: ArchivedPeriodPdf[] }>(
+    `/api/admin/archive-pdfs?tenantId=${encodeURIComponent(tenantId)}`,
+    { activeUserId }
+  );
+  return res.archivePdfs || [];
+}
+
+export async function saveArchivedPdfApi(
+  pdf: ArchivedPeriodPdf,
+  activeUserId?: string
+): Promise<ArchivedPeriodPdf> {
+  const res = await apiRequest<{ archivePdf: ArchivedPeriodPdf }>('/api/admin/archive-pdfs', {
+    method: 'POST',
+    activeUserId,
+    body: pdf,
+  });
+  return res.archivePdf;
+}
+
+export async function executeResetPeriodApi(
+  tenantId: string,
+  payload: SelectiveResetOptions,
+  activeUserId?: string
+): Promise<SelectiveResetResult> {
+  return apiRequest('/api/admin/reset-period', {
+    method: 'POST',
+    activeUserId,
+    body: { ...payload, tenantId },
+  });
 }

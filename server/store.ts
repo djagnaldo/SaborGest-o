@@ -8,6 +8,8 @@ import type {
   Category,
   Product,
   RestaurantTable,
+  TableStatus,
+  TableOperationLog,
   Order,
   OrderItem,
   CashRegisterSession,
@@ -16,10 +18,16 @@ import type {
   AuditLog,
   SavedReport,
   ArchivedPeriod,
+  ArchivedPeriodPdf,
   SystemBackup,
   SystemThemeConfig,
   TableAccountArchive,
   TablePaymentRecord,
+  Customer,
+  Supplier,
+  SelectiveResetOptions,
+  SelectiveResetResult,
+  RegeneratedSellerKeyInfo,
   WebAccessMode,
   WebAccessKeySummary,
   WebSessionInfo,
@@ -38,6 +46,8 @@ import {
   INITIAL_DEMO_SAVED_REPORTS,
   INITIAL_DEMO_ARCHIVED_PERIODS,
   INITIAL_DEMO_BACKUPS,
+  INITIAL_DEMO_CUSTOMERS,
+  INITIAL_DEMO_SUPPLIERS,
   DEFAULT_THEME_CONFIG,
 } from '../src/services/mock-data';
 
@@ -75,8 +85,11 @@ export interface PersistedTenantData {
   auditLogs: AuditLog[];
   savedReports: SavedReport[];
   archivedPeriods: ArchivedPeriod[];
+  archivedPdfs: ArchivedPeriodPdf[];
   backups: SystemBackup[];
   tableArchives: TableAccountArchive[];
+  customers: Customer[];
+  suppliers: Supplier[];
   themeConfig: SystemThemeConfig;
 }
 
@@ -90,11 +103,9 @@ export interface ServerDatabase {
   processedMutationIds: string[];
 }
 
-const DATA_DIR = path.resolve(process.cwd(), '.data');
-const DB_FILE = path.join(DATA_DIR, 'saborgestao-db.json');
+const DEFAULT_DATA_DIR = path.resolve(process.cwd(), '.data');
 
 function ensureCleanSeedOrders(): Order[] {
-  // Garante que nenhuma comanda ativa seja gerada no seed inicial (comanda foi removida)
   return INITIAL_DEMO_ORDERS.map((o) =>
     o.type === 'comanda'
       ? { ...o, type: 'counter' as const, comandaNumber: undefined }
@@ -119,8 +130,11 @@ function createInitialDatabase(): ServerDatabase {
       auditLogs: [],
       savedReports: INITIAL_DEMO_SAVED_REPORTS,
       archivedPeriods: INITIAL_DEMO_ARCHIVED_PERIODS,
+      archivedPdfs: [],
       backups: INITIAL_DEMO_BACKUPS,
       tableArchives: [],
+      customers: INITIAL_DEMO_CUSTOMERS,
+      suppliers: INITIAL_DEMO_SUPPLIERS,
       themeConfig: DEFAULT_THEME_CONFIG,
     },
     accessKeys: [],
@@ -167,6 +181,10 @@ function maskKey(plainKey: string): string {
 }
 
 export class AuthoritativeStore {
+  private readonly dataDir: string;
+  private readonly dbFile: string;
+  private readonly mediaDir: string;
+  private readonly archivesDir: string;
   private db: ServerDatabase;
   private onAfterChange?: (event: {
     type: string;
@@ -181,33 +199,56 @@ export class AuthoritativeStore {
       tenantId?: string;
       revokedUserIds?: string[];
       revokedSessionIds?: string[];
-    }) => void
+    }) => void,
+    customDataDir?: string
   ) {
     this.onAfterChange = onAfterChange;
+    this.dataDir = customDataDir || DEFAULT_DATA_DIR;
+    this.dbFile = path.join(this.dataDir, 'saborgestao-db.json');
+    this.mediaDir = path.join(this.dataDir, 'media');
+    this.archivesDir = path.join(this.dataDir, 'archives');
     this.db = this.loadFromDisk();
+  }
+
+  private ensureDirectories(): void {
+    for (const dir of [this.dataDir, this.mediaDir, this.archivesDir]) {
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+    }
   }
 
   private loadFromDisk(): ServerDatabase {
     try {
-      if (!fs.existsSync(DATA_DIR)) {
-        fs.mkdirSync(DATA_DIR, { recursive: true });
-      }
-      if (fs.existsSync(DB_FILE)) {
-        const raw = fs.readFileSync(DB_FILE, 'utf-8');
+      this.ensureDirectories();
+      if (fs.existsSync(this.dbFile)) {
+        const raw = fs.readFileSync(this.dbFile, 'utf-8');
         const parsed = JSON.parse(raw) as Partial<ServerDatabase>;
         if (parsed && parsed.data && Array.isArray(parsed.data.tenants)) {
-          return {
+          const initial = createInitialDatabase();
+          const loaded: ServerDatabase = {
             revision: parsed.revision || 1,
             webAccessEnabled: parsed.webAccessEnabled ?? true,
             data: {
-              ...createInitialDatabase().data,
+              ...initial.data,
               ...parsed.data,
+              customers: Array.isArray(parsed.data.customers)
+                ? parsed.data.customers
+                : initial.data.customers,
+              suppliers: Array.isArray(parsed.data.suppliers)
+                ? parsed.data.suppliers
+                : initial.data.suppliers,
+              archivedPdfs: Array.isArray(parsed.data.archivedPdfs)
+                ? parsed.data.archivedPdfs
+                : [],
             },
             accessKeys: parsed.accessKeys || [],
             sessions: parsed.sessions || [],
             connectionLogs: parsed.connectionLogs || [],
             processedMutationIds: parsed.processedMutationIds || [],
           };
+          this.writeAtomic(loaded);
+          return loaded;
         }
       }
     } catch (err) {
@@ -220,12 +261,10 @@ export class AuthoritativeStore {
 
   private writeAtomic(dbSnapshot: ServerDatabase = this.db): void {
     try {
-      if (!fs.existsSync(DATA_DIR)) {
-        fs.mkdirSync(DATA_DIR, { recursive: true });
-      }
-      const tmp = `${DB_FILE}.tmp-${process.pid}-${Date.now()}`;
+      this.ensureDirectories();
+      const tmp = `${this.dbFile}.tmp-${process.pid}-${Date.now()}`;
       fs.writeFileSync(tmp, JSON.stringify(dbSnapshot, null, 2), 'utf-8');
-      fs.renameSync(tmp, DB_FILE);
+      fs.renameSync(tmp, this.dbFile);
     } catch (err) {
       console.error('Erro ao gravar banco em disco:', err);
     }
@@ -281,6 +320,20 @@ export class AuthoritativeStore {
     }
   }
 
+  private appendTableLog(table: RestaurantTable, log: Omit<TableOperationLog, 'id'>): TableOperationLog[] {
+    const current = Array.isArray(table.operationLogs) ? [...table.operationLogs] : [];
+    current.push({
+      ...log,
+      id: `tlog-${Date.now()}-${crypto.randomBytes(2).toString('hex')}`,
+    });
+    if (current.length > 200) {
+      return current.slice(current.length - 200);
+    }
+    return current;
+  }
+
+  // ==================== REDE E SNAPSHOTS ====================
+
   public getNetworkInfo(port: number) {
     const interfaces = os.networkInterfaces();
     const lanIps: string[] = [];
@@ -321,29 +374,65 @@ export class AuthoritativeStore {
     const data = this.db.data;
 
     if (roleMode === 'seller') {
-      // RBAC estrito: vendedor não recebe relatórios financeiros globais, backups ou arquivos administrativos sensíveis
+      // RBAC ESTRITO: vendedor vê apenas pedidos próprios e mesas em andamento; ZERO finanças globais, caixa, clientes/fornecedores ou arquivos
+      const sellerOrders = data.orders.filter((o) => {
+        if (o.tenantId !== activeTenantId) return false;
+        const isOwner =
+          o.waiterId === userId ||
+          o.createdById === userId ||
+          Boolean(o.contributors?.some((c) => c.id === userId));
+        if (isOwner) return true;
+        // Permite colaborar em pedidos de mesa ainda em aberto (não pagos e não encerrados/cancelados)
+        return o.type === 'table' && o.status !== 'closed' && o.status !== 'cancelled' && !o.paid;
+      });
+
+      const maskedOpenCash = data.cashSessions
+        .filter((c) => c.tenantId === activeTenantId && c.status === 'open')
+        .map((c) => ({
+          id: c.id,
+          tenantId: c.tenantId,
+          openedBy: c.openedBy,
+          openedByName: c.openedByName,
+          openedAt: c.openedAt,
+          status: 'open' as const,
+          initialAmount: 0,
+          totalCash: 0,
+          totalPix: 0,
+          totalDevendo: 0,
+          totalWithdrawals: 0,
+          totalDeposits: 0,
+          expectedAmount: 0,
+        }));
+
       return {
         revision: this.db.revision,
         webAccessEnabled: this.db.webAccessEnabled,
         tenantId: activeTenantId,
         data: {
-          tenants: data.tenants,
-          users: data.users.map((u) => ({
-            ...u,
-            accessCode: u.id === userId ? u.accessCode : undefined,
-          })),
-          categories: data.categories,
-          products: data.products,
-          tables: data.tables,
-          orders: data.orders,
-          cashSessions: data.cashSessions.filter((c) => c.status === 'open'),
+          tenants: data.tenants.filter((t) => t.id === activeTenantId),
+          users: data.users
+            .filter((u) => u.tenantId === activeTenantId)
+            .map((u) => ({
+              ...u,
+              accessCode: u.id === userId ? u.accessCode : undefined,
+              commissionRate: 0,
+              salesTargetMonthly: undefined,
+            })),
+          categories: data.categories.filter((c) => c.tenantId === activeTenantId),
+          products: data.products.filter((p) => p.tenantId === activeTenantId),
+          tables: data.tables.filter((t) => t.tenantId === activeTenantId),
+          orders: sellerOrders,
+          cashSessions: maskedOpenCash,
           financial: [],
           inventoryTransactions: [],
           auditLogs: [],
           savedReports: [],
           archivedPeriods: [],
+          archivedPdfs: [],
           backups: [],
           tableArchives: [],
+          customers: [],
+          suppliers: [],
           themeConfig: data.themeConfig,
         },
       };
@@ -356,6 +445,8 @@ export class AuthoritativeStore {
       data,
     };
   }
+
+  // ==================== ACESSO WEB E CHAVES ====================
 
   public getWebAccessStatus(tenantId: string, port: number) {
     const net = this.getNetworkInfo(port);
@@ -498,7 +589,6 @@ export class AuthoritativeStore {
     const hours = Math.max(1, Math.min(720, params.expiresInHours || 24));
     const expiresAt = new Date(Date.now() + hours * 3600 * 1000).toISOString();
 
-    // Desconecta sessões antigas associadas a essa chave antes de rotacionar
     const revokedSessionIds = this.db.sessions
       .filter((s) => s.keyId === existing.id)
       .map((s) => s.id);
@@ -810,6 +900,466 @@ export class AuthoritativeStore {
     return { user: updated, revokedSessionIds };
   }
 
+  // ==================== MÍDIA, CARDÁPIO E CATEGORIAS (MATRIZ CENTRAL) ====================
+
+  public saveMediaFile(params: {
+    dataUrl: string;
+    prefix?: string;
+  }): { url: string; fileName: string; sizeBytes: number } {
+    this.ensureDirectories();
+    const raw = (params.dataUrl || '').trim();
+    const match = /^data:(image\/(?:png|jpeg|jpg|webp|gif));base64,(.+)$/i.exec(raw);
+    if (!match) {
+      throw new Error('Imagem inválida. Envie PNG, JPG, WEBP ou GIF em Base64.');
+    }
+    const mime = match[1].toLowerCase();
+    const ext = mime === 'image/png' ? 'png' : mime === 'image/webp' ? 'webp' : mime === 'image/gif' ? 'gif' : 'jpg';
+    const bytes = Buffer.from(match[2], 'base64');
+    if (bytes.length === 0 || bytes.length > 6 * 1024 * 1024) {
+      throw new Error('Tamanho de imagem excede o limite de 6 MB.');
+    }
+
+    const safePrefix = (params.prefix || 'media').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 20) || 'media';
+    const fileName = `${safePrefix}-${Date.now()}-${crypto.randomBytes(3).toString('hex')}.${ext}`;
+    const fullPath = path.join(this.mediaDir, fileName);
+    fs.writeFileSync(fullPath, bytes);
+    return { url: `/api/media/${fileName}`, fileName, sizeBytes: bytes.length };
+  }
+
+  public readMediaFile(fileName: string): { buffer: Buffer; mimeType: string } | null {
+    if (!/^[a-zA-Z0-9._-]+$/.test(fileName)) return null;
+    const fullPath = path.join(this.mediaDir, fileName);
+    if (!fs.existsSync(fullPath)) return null;
+    const lower = fileName.toLowerCase();
+    const mimeType = lower.endsWith('.png')
+      ? 'image/png'
+      : lower.endsWith('.webp')
+      ? 'image/webp'
+      : lower.endsWith('.gif')
+      ? 'image/gif'
+      : 'image/jpeg';
+    return { buffer: fs.readFileSync(fullPath), mimeType };
+  }
+
+  public upsertCategory(
+    tenantId: string,
+    payload: Partial<Category> & { name: string },
+    actor: { id: string; name: string }
+  ): Category {
+    const cleanName = (payload.name || '').trim();
+    if (!cleanName) throw new Error('Informe o nome da categoria.');
+
+    const existingIdx = payload.id
+      ? this.db.data.categories.findIndex((c) => c.id === payload.id && c.tenantId === tenantId)
+      : -1;
+    const nowIso = new Date().toISOString();
+
+    let saved: Category;
+    if (existingIdx >= 0) {
+      const prev = this.db.data.categories[existingIdx];
+      saved = {
+        ...prev,
+        name: cleanName,
+        icon: payload.icon ?? prev.icon,
+        color: payload.color ?? prev.color,
+        order: typeof payload.order === 'number' ? payload.order : prev.order,
+        active: typeof payload.active === 'boolean' ? payload.active : prev.active,
+      };
+      this.db.data.categories[existingIdx] = saved;
+    } else {
+      const maxOrder = this.db.data.categories
+        .filter((c) => c.tenantId === tenantId)
+        .reduce((max, c) => Math.max(max, c.order || 0), 0);
+      saved = {
+        id: payload.id || `cat-${Date.now()}-${crypto.randomBytes(2).toString('hex')}`,
+        tenantId,
+        name: cleanName,
+        icon: payload.icon,
+        color: payload.color || '#d97706',
+        order: typeof payload.order === 'number' ? payload.order : maxOrder + 1,
+        active: payload.active ?? true,
+        createdAt: nowIso,
+      };
+      this.db.data.categories.push(saved);
+    }
+
+    this.addAuditLog({
+      tenantId,
+      userId: actor.id,
+      userName: actor.name,
+      action: existingIdx >= 0 ? 'EDITOU_CATEGORIA' : 'CRIOU_CATEGORIA',
+      details: `${existingIdx >= 0 ? 'Atualizou' : 'Cadastrou'} a categoria "${saved.name}".`,
+    });
+    this.commit('category_upserted', { tenantId });
+    return saved;
+  }
+
+  public deleteCategory(
+    tenantId: string,
+    categoryId: string,
+    opts: { strategy?: 'transfer' | 'uncategorized'; targetCategoryId?: string },
+    actor: { id: string; name: string }
+  ): { deletedId: string; affectedProductsCount: number } {
+    const idx = this.db.data.categories.findIndex(
+      (c) => c.id === categoryId && c.tenantId === tenantId
+    );
+    if (idx < 0) throw new Error('Categoria não encontrada.');
+    const cat = this.db.data.categories[idx];
+
+    const linkedProducts = this.db.data.products.filter(
+      (p) => p.tenantId === tenantId && p.categoryId === categoryId
+    );
+
+    if (linkedProducts.length > 0) {
+      if (opts.strategy === 'transfer') {
+        const targetExists = this.db.data.categories.some(
+          (c) => c.tenantId === tenantId && c.id === opts.targetCategoryId && c.id !== categoryId
+        );
+        if (!targetExists) {
+          throw new Error('Selecione uma categoria de destino válida para transferir os produtos.');
+        }
+        this.db.data.products = this.db.data.products.map((p) =>
+          p.tenantId === tenantId && p.categoryId === categoryId
+            ? { ...p, categoryId: opts.targetCategoryId!, updatedAt: new Date().toISOString() }
+            : p
+        );
+      } else if (opts.strategy === 'uncategorized') {
+        this.db.data.products = this.db.data.products.map((p) =>
+          p.tenantId === tenantId && p.categoryId === categoryId
+            ? { ...p, categoryId: '', updatedAt: new Date().toISOString() }
+            : p
+        );
+      } else {
+        throw new Error(
+          `Esta categoria possui ${linkedProducts.length} produto(s). Escolha transferir os produtos ou deixá-los sem categoria antes de excluir.`
+        );
+      }
+    }
+
+    this.db.data.categories.splice(idx, 1);
+    this.addAuditLog({
+      tenantId,
+      userId: actor.id,
+      userName: actor.name,
+      action: 'EXCLUIU_CATEGORIA',
+      details: `Excluiu a categoria "${cat.name}" (${linkedProducts.length} produto(s) ${
+        opts.strategy === 'transfer' ? 'transferido(s)' : 'movido(s) para sem categoria'
+      }).`,
+    });
+    this.commit('category_deleted', { tenantId });
+    return { deletedId: categoryId, affectedProductsCount: linkedProducts.length };
+  }
+
+  public upsertProduct(
+    tenantId: string,
+    payload: Partial<Product> & { name: string },
+    actor: { id: string; name: string }
+  ): Product {
+    const cleanName = (payload.name || '').trim();
+    if (!cleanName) throw new Error('Informe o nome do produto.');
+
+    let resolvedImageUrl = payload.imageUrl;
+    if (resolvedImageUrl && resolvedImageUrl.startsWith('data:image/')) {
+      const savedMedia = this.saveMediaFile({ dataUrl: resolvedImageUrl, prefix: 'prod' });
+      resolvedImageUrl = savedMedia.url;
+    }
+
+    const sellingPrice = Number(payload.sellingPrice ?? 0);
+    const costPrice = Number(payload.costPrice ?? 0);
+    const profitMargin =
+      sellingPrice > 0
+        ? Number((((sellingPrice - costPrice) / sellingPrice) * 100).toFixed(2))
+        : 0;
+    const nowIso = new Date().toISOString();
+
+    const existingIdx = payload.id
+      ? this.db.data.products.findIndex((p) => p.id === payload.id && p.tenantId === tenantId)
+      : -1;
+
+    let saved: Product;
+    if (existingIdx >= 0) {
+      const prev = this.db.data.products[existingIdx];
+      saved = {
+        ...prev,
+        ...payload,
+        id: prev.id,
+        tenantId,
+        name: cleanName,
+        imageUrl: resolvedImageUrl !== undefined ? resolvedImageUrl : prev.imageUrl,
+        costPrice,
+        sellingPrice,
+        profitMargin,
+        allowWeight: false,
+        updatedAt: nowIso,
+      };
+      this.db.data.products[existingIdx] = saved;
+    } else {
+      saved = {
+        id: payload.id || `prod-${Date.now()}-${crypto.randomBytes(2).toString('hex')}`,
+        tenantId,
+        name: cleanName,
+        internalCode:
+          payload.internalCode?.trim() ||
+          `P-${Math.floor(100 + Math.random() * 900)}`,
+        barcode: payload.barcode,
+        categoryId: payload.categoryId ?? '',
+        description: payload.description || '',
+        imageUrl: resolvedImageUrl,
+        costPrice,
+        sellingPrice,
+        profitMargin,
+        unit: payload.unit || 'un',
+        allowWeight: false,
+        stockQuantity: Number(payload.stockQuantity ?? 0),
+        minStock: Number(payload.minStock ?? 0),
+        supplierId: payload.supplierId,
+        active: payload.active ?? true,
+        isComposite: Boolean(payload.isComposite),
+        recipe: payload.recipe,
+        variations: payload.variations,
+        addons: payload.addons,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+      this.db.data.products.push(saved);
+    }
+
+    this.addAuditLog({
+      tenantId,
+      userId: actor.id,
+      userName: actor.name,
+      action: existingIdx >= 0 ? 'EDITOU_PRODUTO' : 'CRIOU_PRODUTO',
+      details: `${existingIdx >= 0 ? 'Atualizou' : 'Cadastrou'} o produto "${saved.name}" (R$ ${saved.sellingPrice.toFixed(2)}).`,
+    });
+    this.commit('product_upserted', { tenantId });
+    return saved;
+  }
+
+  public deleteProductSafely(
+    tenantId: string,
+    productId: string,
+    actor: { id: string; name: string }
+  ): { deletedId: string } {
+    const idx = this.db.data.products.findIndex(
+      (p) => p.id === productId && p.tenantId === tenantId
+    );
+    if (idx < 0) throw new Error('Produto não encontrado.');
+    const prod = this.db.data.products[idx];
+
+    const hasOpenOrder = this.db.data.orders.some(
+      (o) =>
+        o.tenantId === tenantId &&
+        o.status !== 'cancelled' &&
+        o.status !== 'closed' &&
+        !o.paid &&
+        o.items.some((it) => it.productId === productId)
+    );
+    if (hasOpenOrder) {
+      throw new Error(
+        `Não é possível excluir "${prod.name}" porque ele está lançado em uma mesa ainda aberta.`
+      );
+    }
+
+    this.db.data.products.splice(idx, 1);
+    this.addAuditLog({
+      tenantId,
+      userId: actor.id,
+      userName: actor.name,
+      action: 'EXCLUIU_PRODUTO',
+      details: `Excluiu o produto "${prod.name}" do cardápio.`,
+    });
+    this.commit('product_deleted', { tenantId });
+    return { deletedId: productId };
+  }
+
+  // ==================== CLIENTES E FORNECEDORES ====================
+
+  public upsertCustomer(
+    tenantId: string,
+    payload: Partial<Customer> & { name: string },
+    actor: { id: string; name: string }
+  ): Customer {
+    const cleanName = (payload.name || '').trim();
+    if (!cleanName) throw new Error('Informe o nome do cliente.');
+    const existingIdx = payload.id
+      ? this.db.data.customers.findIndex((c) => c.id === payload.id && c.tenantId === tenantId)
+      : -1;
+    const nowIso = new Date().toISOString();
+
+    let saved: Customer;
+    if (existingIdx >= 0) {
+      const prev = this.db.data.customers[existingIdx];
+      saved = {
+        ...prev,
+        ...payload,
+        id: prev.id,
+        tenantId,
+        name: cleanName,
+        pendingCredit: 0,
+      };
+      this.db.data.customers[existingIdx] = saved;
+    } else {
+      saved = {
+        id: payload.id || `cust-${Date.now()}-${crypto.randomBytes(2).toString('hex')}`,
+        tenantId,
+        name: cleanName,
+        phone: payload.phone?.trim() || '',
+        email: payload.email?.trim() || '',
+        address: payload.address?.trim() || '',
+        notes: payload.notes?.trim() || '',
+        totalSpent: Number(payload.totalSpent ?? 0),
+        pendingCredit: 0,
+        ordersCount: Number(payload.ordersCount ?? 0),
+        createdAt: nowIso,
+      };
+      this.db.data.customers.unshift(saved);
+    }
+
+    this.addAuditLog({
+      tenantId,
+      userId: actor.id,
+      userName: actor.name,
+      action: existingIdx >= 0 ? 'EDITOU_CLIENTE' : 'CRIOU_CLIENTE',
+      details: `${existingIdx >= 0 ? 'Atualizou' : 'Cadastrou'} cliente "${saved.name}".`,
+    });
+    this.commit('customer_upserted', { tenantId });
+    return saved;
+  }
+
+  public deleteCustomer(
+    tenantId: string,
+    customerId: string,
+    actor: { id: string; name: string }
+  ): { deletedId: string } {
+    const idx = this.db.data.customers.findIndex(
+      (c) => c.id === customerId && c.tenantId === tenantId
+    );
+    if (idx < 0) throw new Error('Cliente não encontrado.');
+    const cust = this.db.data.customers[idx];
+    this.db.data.customers.splice(idx, 1);
+    this.addAuditLog({
+      tenantId,
+      userId: actor.id,
+      userName: actor.name,
+      action: 'EXCLUIU_CLIENTE',
+      details: `Excluiu o cliente "${cust.name}".`,
+    });
+    this.commit('customer_deleted', { tenantId });
+    return { deletedId: customerId };
+  }
+
+  public upsertSupplier(
+    tenantId: string,
+    payload: Partial<Supplier> & { name: string },
+    actor: { id: string; name: string }
+  ): Supplier {
+    const cleanName = (payload.name || '').trim();
+    if (!cleanName) throw new Error('Informe o nome do fornecedor.');
+    const existingIdx = payload.id
+      ? this.db.data.suppliers.findIndex((s) => s.id === payload.id && s.tenantId === tenantId)
+      : -1;
+    const nowIso = new Date().toISOString();
+
+    let saved: Supplier;
+    if (existingIdx >= 0) {
+      const prev = this.db.data.suppliers[existingIdx];
+      saved = {
+        ...prev,
+        ...payload,
+        id: prev.id,
+        tenantId,
+        name: cleanName,
+        pendingBalance: 0,
+      };
+      this.db.data.suppliers[existingIdx] = saved;
+    } else {
+      saved = {
+        id: payload.id || `sup-${Date.now()}-${crypto.randomBytes(2).toString('hex')}`,
+        tenantId,
+        name: cleanName,
+        document: payload.document?.trim() || '',
+        phone: payload.phone?.trim() || '',
+        email: payload.email?.trim() || '',
+        address: payload.address?.trim() || '',
+        category: payload.category?.trim() || 'Geral',
+        pendingBalance: 0,
+        createdAt: nowIso,
+      };
+      this.db.data.suppliers.unshift(saved);
+    }
+
+    this.addAuditLog({
+      tenantId,
+      userId: actor.id,
+      userName: actor.name,
+      action: existingIdx >= 0 ? 'EDITOU_FORNECEDOR' : 'CRIOU_FORNECEDOR',
+      details: `${existingIdx >= 0 ? 'Atualizou' : 'Cadastrou'} fornecedor "${saved.name}".`,
+    });
+    this.commit('supplier_upserted', { tenantId });
+    return saved;
+  }
+
+  public deleteSupplier(
+    tenantId: string,
+    supplierId: string,
+    actor: { id: string; name: string }
+  ): { deletedId: string } {
+    const idx = this.db.data.suppliers.findIndex(
+      (s) => s.id === supplierId && s.tenantId === tenantId
+    );
+    if (idx < 0) throw new Error('Fornecedor não encontrado.');
+    const sup = this.db.data.suppliers[idx];
+    this.db.data.suppliers.splice(idx, 1);
+    this.addAuditLog({
+      tenantId,
+      userId: actor.id,
+      userName: actor.name,
+      action: 'EXCLUIU_FORNECEDOR',
+      details: `Excluiu o fornecedor "${sup.name}".`,
+    });
+    this.commit('supplier_deleted', { tenantId });
+    return { deletedId: supplierId };
+  }
+
+  // ==================== MESAS E VENDAS COM AUTORIA COLABORATIVA ====================
+
+  public setTableStatus(params: {
+    tenantId: string;
+    tableId: string;
+    status: TableStatus;
+    operator: { id: string; name: string };
+  }): RestaurantTable {
+    const tableIdx = this.db.data.tables.findIndex(
+      (t) => t.id === params.tableId && t.tenantId === params.tenantId
+    );
+    if (tableIdx < 0) throw new Error('Mesa não encontrada.');
+    const table = this.db.data.tables[tableIdx];
+    const nowIso = new Date().toISOString();
+
+    const updated: RestaurantTable = {
+      ...table,
+      status: params.status,
+      operationLogs: this.appendTableLog(table, {
+        type: 'status_changed',
+        notes: `Status alterado de "${table.status}" para "${params.status}"`,
+        operatorId: params.operator.id,
+        operatorName: params.operator.name,
+        timestamp: nowIso,
+      }),
+    };
+    this.db.data.tables[tableIdx] = updated;
+
+    this.addAuditLog({
+      tenantId: params.tenantId,
+      userId: params.operator.id,
+      userName: params.operator.name,
+      action: 'ALTEROU_STATUS_MESA',
+      details: `Alterou status da ${table.label || `Mesa ${table.number}`} para "${params.status}".`,
+    });
+    this.commit('table_status_changed', { tenantId: params.tenantId });
+    return updated;
+  }
+
   public addOrAccumulateTableItems(params: {
     tenantId: string;
     tableId: string;
@@ -854,7 +1404,6 @@ export class AuthoritativeStore {
       throw new Error('Selecione ao menos um produto para adicionar à mesa.');
     }
 
-    // 1. Valida estoque dos deltas adicionados
     for (const reqItem of params.items) {
       if (!reqItem.quantity || reqItem.quantity <= 0) {
         throw new Error('Quantidade inválida para item do pedido.');
@@ -871,7 +1420,6 @@ export class AuthoritativeStore {
       }
     }
 
-    // 2. Localiza pedido aberto existente da mesa ou cria um novo
     let orderIdx = this.db.data.orders.findIndex(
       (o) =>
         o.tenantId === params.tenantId &&
@@ -883,12 +1431,30 @@ export class AuthoritativeStore {
     );
 
     const nowIso = new Date().toISOString();
+    const isOpeningTable = !table.openedById || table.status === 'available';
     let order: Order;
 
     if (orderIdx >= 0) {
+      const existingOrder = this.db.data.orders[orderIdx];
+      const existingContributors = Array.isArray(existingOrder.contributors)
+        ? [...existingOrder.contributors]
+        : [];
+      if (
+        existingOrder.waiterId &&
+        existingOrder.waiterName &&
+        !existingContributors.some((c) => c.id === existingOrder.waiterId)
+      ) {
+        existingContributors.push({ id: existingOrder.waiterId, name: existingOrder.waiterName });
+      }
+      if (!existingContributors.some((c) => c.id === params.operator.id)) {
+        existingContributors.push({ id: params.operator.id, name: params.operator.name });
+      }
       order = {
-        ...this.db.data.orders[orderIdx],
-        items: this.db.data.orders[orderIdx].items.map((i) => ({ ...i })),
+        ...existingOrder,
+        createdById: existingOrder.createdById || existingOrder.waiterId || table.openedById || params.operator.id,
+        createdByName: existingOrder.createdByName || existingOrder.waiterName || table.openedByName || params.operator.name,
+        contributors: existingContributors,
+        items: existingOrder.items.map((i) => ({ ...i })),
       };
     } else {
       const nextNum =
@@ -903,8 +1469,11 @@ export class AuthoritativeStore {
         tableNumber: table.number,
         tableName: table.label || `Mesa ${table.number}`,
         customerName: table.customerName,
-        waiterId: params.operator.id,
-        waiterName: params.operator.name,
+        waiterId: table.openedById || params.operator.id,
+        waiterName: table.openedByName || params.operator.name,
+        createdById: table.openedById || params.operator.id,
+        createdByName: table.openedByName || params.operator.name,
+        contributors: [{ id: params.operator.id, name: params.operator.name }],
         items: [],
         subtotal: 0,
         discount: 0,
@@ -918,7 +1487,17 @@ export class AuthoritativeStore {
       };
     }
 
-    // 3. Baixa estoque delta e acumula itens equivalentes no pedido aberto
+    let nextLogs = Array.isArray(table.operationLogs) ? [...table.operationLogs] : [];
+    if (isOpeningTable) {
+      nextLogs = this.appendTableLog({ ...table, operationLogs: nextLogs }, {
+        type: 'table_opened',
+        notes: `Mesa aberta por ${params.operator.name}`,
+        operatorId: params.operator.id,
+        operatorName: params.operator.name,
+        timestamp: nowIso,
+      });
+    }
+
     for (const reqItem of params.items) {
       const prodIdx = this.db.data.products.findIndex(
         (p) => p.id === reqItem.productId && p.tenantId === params.tenantId
@@ -970,10 +1549,16 @@ export class AuthoritativeStore {
       if (existingItemIdx >= 0) {
         const existingItem = order.items[existingItemIdx];
         const accumulatedQty = Number((existingItem.quantity + reqItem.quantity).toFixed(3));
-        // Preserva o unitPrice original travado no item já lançado na mesa
+        const existingAuthors = (existingItem.addedByName || '').split(',').map((s) => s.trim()).filter(Boolean);
+        if (!existingAuthors.includes(params.operator.name)) {
+          existingAuthors.push(params.operator.name);
+        }
         order.items[existingItemIdx] = {
           ...existingItem,
           quantity: accumulatedQty,
+          addedById: existingItem.addedById || params.operator.id,
+          addedByName: existingAuthors.join(', ') || params.operator.name,
+          addedAt: existingItem.addedAt || nowIso,
           total: Number((accumulatedQty * existingItem.unitPrice).toFixed(2)),
         };
       } else {
@@ -985,9 +1570,23 @@ export class AuthoritativeStore {
           variationName: reqItem.variationName,
           selectedAddons: reqItem.selectedAddons,
           notes: cleanNotes || undefined,
+          addedById: params.operator.id,
+          addedByName: params.operator.name,
+          addedAt: nowIso,
           total: Number((reqItem.quantity * unitPrice).toFixed(2)),
         });
       }
+
+      nextLogs = this.appendTableLog({ ...table, operationLogs: nextLogs }, {
+        type: 'item_added',
+        productId: prod.id,
+        productName: prod.name,
+        quantity: reqItem.quantity,
+        notes: reqItem.variationName ? `Variação: ${reqItem.variationName}` : undefined,
+        operatorId: params.operator.id,
+        operatorName: params.operator.name,
+        timestamp: nowIso,
+      });
     }
 
     const itemsSubtotal = Number(
@@ -1007,7 +1606,6 @@ export class AuthoritativeStore {
       this.db.data.orders.unshift(order);
     }
 
-    // Soma de todos os pedidos em aberto desta mesa para consistência absoluta
     const allOpenTableOrders = this.db.data.orders.filter(
       (o) =>
         o.tenantId === params.tenantId &&
@@ -1026,6 +1624,8 @@ export class AuthoritativeStore {
       ...table,
       status: table.status === 'closing' ? 'closing' : 'occupied',
       openedAt: table.openedAt || nowIso,
+      openedById: table.openedById || params.operator.id,
+      openedByName: table.openedByName || params.operator.name,
       waiterId: table.waiterId || params.operator.id,
       waiterName: table.waiterName || params.operator.name,
       currentOrderId: order.id,
@@ -1033,6 +1633,7 @@ export class AuthoritativeStore {
       extraTotal,
       currentTotal: grandTotal,
       activeOrdersCount: allOpenTableOrders.length,
+      operationLogs: nextLogs,
     };
     this.db.data.tables[tableIdx] = updatedTable;
 
@@ -1120,7 +1721,6 @@ export class AuthoritativeStore {
       };
       updatedPayments.push(newPay);
 
-      // Atualiza sessão aberta de caixa
       const cashIdx = this.db.data.cashSessions.findIndex(
         (c) => c.tenantId === params.tenantId && c.status === 'open'
       );
@@ -1163,6 +1763,14 @@ export class AuthoritativeStore {
         status: 'closing',
         paidAmount: newPaidTotal,
         payments: updatedPayments,
+        operationLogs: this.appendTableLog(table, {
+          type: 'payment_partial',
+          amount: paidNow,
+          notes: `Pagamento parcial (${params.method.toUpperCase()}) — restante R$ ${remainingBalance.toFixed(2)}`,
+          operatorId: params.operator.id,
+          operatorName: params.operator.name,
+          timestamp: nowIso,
+        }),
       };
       this.db.data.tables[tableIdx] = partialTable;
       this.addAuditLog({
@@ -1176,7 +1784,6 @@ export class AuthoritativeStore {
       return { settled: false, remainingBalance, table: partialTable };
     }
 
-    // Quitação integral: encerra pedidos vinculados da mesa, arquiva conta, libera mesa
     const linkedOrderIds: string[] = [];
     const orderPaymentsSummary = updatedPayments.map((p) => ({
       method: p.method,
@@ -1198,7 +1805,10 @@ export class AuthoritativeStore {
           ...o,
           status: 'closed' as const,
           paid: true,
-          payments: orderPaymentsSummary.length > 0 ? orderPaymentsSummary : [{ method: params.method, amount: o.total }],
+          payments:
+            orderPaymentsSummary.length > 0
+              ? orderPaymentsSummary
+              : [{ method: params.method, amount: o.total }],
           closedAt: o.closedAt || nowIso,
         };
       }
@@ -1229,6 +1839,8 @@ export class AuthoritativeStore {
       ...table,
       status: 'available',
       openedAt: undefined,
+      openedById: undefined,
+      openedByName: undefined,
       waiterId: undefined,
       waiterName: undefined,
       currentOrderId: undefined,
@@ -1239,6 +1851,7 @@ export class AuthoritativeStore {
       payments: [],
       extraCharges: [],
       activeOrdersCount: 0,
+      operationLogs: [],
       timer: undefined,
     };
     this.db.data.tables[tableIdx] = freedTable;
@@ -1338,6 +1951,9 @@ export class AuthoritativeStore {
         variationName: reqItem.variationName,
         selectedAddons: reqItem.selectedAddons,
         notes: reqItem.notes,
+        addedById: params.operator.id,
+        addedByName: params.operator.name,
+        addedAt: nowIso,
         total: Number((reqItem.quantity * unitPrice).toFixed(2)),
       });
     }
@@ -1355,6 +1971,9 @@ export class AuthoritativeStore {
       customerName: params.customerName?.trim() || undefined,
       waiterId: params.operator.id,
       waiterName: params.operator.name,
+      createdById: params.operator.id,
+      createdByName: params.operator.name,
+      contributors: [{ id: params.operator.id, name: params.operator.name }],
       items: orderItems,
       subtotal,
       discount: 0,
@@ -1442,7 +2061,6 @@ export class AuthoritativeStore {
 
     const nowIso = new Date().toISOString();
 
-    // Estorna itens para o estoque
     for (const item of order.items) {
       const pIdx = this.db.data.products.findIndex(
         (p) => p.id === item.productId && p.tenantId === order.tenantId
@@ -1477,7 +2095,6 @@ export class AuthoritativeStore {
     };
     this.db.data.orders[idx] = updatedOrder;
 
-    // Se era pedido em aberto de uma mesa, recalcula os totais da mesa
     if (order.type === 'table' && order.tableId) {
       const tIdx = this.db.data.tables.findIndex((t) => t.id === order.tableId);
       if (tIdx >= 0) {
@@ -1518,12 +2135,385 @@ export class AuthoritativeStore {
     return updatedOrder;
   }
 
+  // ==================== ARQUIVAMENTO DE PDF E LIMPEZA DE PERÍODO ====================
+
+  public getArchivedPdfs(tenantId: string): ArchivedPeriodPdf[] {
+    return (this.db.data.archivedPdfs || []).filter((p) => p.tenantId === tenantId);
+  }
+
+  public getArchivedPdfById(id: string): ArchivedPeriodPdf | undefined {
+    return (this.db.data.archivedPdfs || []).find((p) => p.id === id);
+  }
+
+  public saveArchivedPdf(
+    pdf: ArchivedPeriodPdf,
+    actor: { id: string; name: string }
+  ): ArchivedPeriodPdf {
+    const startMs = new Date(`${pdf.periodStart}T00:00:00`).getTime();
+    const endMs = new Date(`${pdf.periodEnd}T23:59:59`).getTime();
+    if (Number.isNaN(startMs) || Number.isNaN(endMs) || endMs < startMs) {
+      throw new Error('Período inválido para geração do arquivo PDF.');
+    }
+    if (!pdf.pdfBase64 || pdf.pdfBase64.length < 30) {
+      throw new Error('Conteúdo binário do PDF ausente.');
+    }
+
+    const pdfBytes = Buffer.from(pdf.pdfBase64, 'base64');
+    if (pdfBytes.slice(0, 4).toString('utf-8') !== '%PDF') {
+      throw new Error('Arquivo gerado não possui cabeçalho PDF válido.');
+    }
+
+    this.ensureDirectories();
+    const safeFileName = (pdf.fileName || `${pdf.id}.pdf`).replace(/[^a-zA-Z0-9._-]/g, '_');
+    fs.writeFileSync(path.join(this.archivesDir, safeFileName), pdfBytes);
+
+    const record: ArchivedPeriodPdf = {
+      ...pdf,
+      restorable: false,
+      fileName: safeFileName,
+      sizeBytes: pdfBytes.length,
+    };
+
+    const existing = this.db.data.archivedPdfs || [];
+    this.db.data.archivedPdfs = [record, ...existing.filter((p) => p.id !== record.id)];
+
+    this.addAuditLog({
+      tenantId: record.tenantId,
+      userId: actor.id,
+      userName: actor.name,
+      action: 'ARQUIVOU_PERIODO_PDF',
+      details: `Gerou arquivo histórico PDF (${record.fileName}) referente a ${record.periodStart} até ${record.periodEnd}. Documento somente para consulta/arquivamento.`,
+    });
+
+    this.commit('pdf_archived', { tenantId: record.tenantId });
+    return record;
+  }
+
+  public executeCleanPeriodReset(
+    tenantId: string,
+    params: Partial<SelectiveResetOptions> & { confirmationText?: string; archivePdfId?: string },
+    actor: { id: string; name: string },
+    ipAddress = '127.0.0.1'
+  ): SelectiveResetResult {
+    if ((params.confirmationText || '').trim() !== 'CONFIRMAR LIMPEZA') {
+      throw new Error('Digite exatamente "CONFIRMAR LIMPEZA" para executar a limpeza do sistema.');
+    }
+
+    const archivedPdf = (this.db.data.archivedPdfs || []).find(
+      (p) => p.id === params.archivePdfId && p.tenantId === tenantId
+    );
+    if (!archivedPdf) {
+      throw new Error(
+        'É obrigatório gerar e salvar o arquivo histórico em PDF antes de limpar o sistema.'
+      );
+    }
+
+    const keepProducts = params.keepProducts !== false;
+    const keepProductPhotos = params.keepProductPhotos !== false;
+    const keepProductDescriptions = params.keepProductDescriptions !== false;
+    const keepCategories = params.keepCategories !== false;
+    const zeroProductPrices = Boolean(params.zeroProductPrices);
+    const zeroProductStock = Boolean(params.zeroProductStock);
+
+    const keepCustomers = params.keepCustomers !== false;
+    const keepSuppliers = params.keepSuppliers !== false;
+    const keepSellers = params.keepSellers !== false;
+    const rotateSellerKeys = Boolean(params.rotateSellerKeys);
+
+    const clearOrders = params.clearOrders !== false;
+    const clearTables = params.clearTables !== false;
+    const clearCashRegisters = params.clearCashRegisters !== false;
+    const clearExpenses = params.clearExpenses !== false;
+    const clearReceipts = params.clearReceipts !== false;
+    const clearStockMovements = params.clearStockMovements !== false;
+    const clearSavedReports = Boolean(params.clearSavedReports);
+    const clearOperationalLogs = Boolean(params.clearOperationalLogs);
+
+    const clearedSummary: string[] = [];
+    const preservedSummary: string[] = [];
+    const revokedUserIds: string[] = [];
+    const revokedSessionIds: string[] = [];
+    const regeneratedSellerKeys: RegeneratedSellerKeyInfo[] = [];
+
+    // 1. NUNCA deixar mesas ou comandas abertas após limpeza de período
+    this.db.data.tables = this.db.data.tables.map((t) =>
+      t.tenantId === tenantId
+        ? {
+            ...t,
+            status: 'available',
+            currentOrderId: undefined,
+            currentTotal: 0,
+            productsTotal: 0,
+            extraTotal: 0,
+            paidAmount: 0,
+            payments: [],
+            extraCharges: [],
+            activeOrdersCount: 0,
+            openedAt: undefined,
+            openedById: undefined,
+            openedByName: undefined,
+            waiterId: undefined,
+            waiterName: undefined,
+            customerName: undefined,
+            operationLogs: [],
+            timer: undefined,
+          }
+        : t
+    );
+    clearedSummary.push('Mesas e comandas abertas encerradas automaticamente');
+
+    if (clearTables) {
+      this.db.data.tableArchives = this.db.data.tableArchives.filter((a) => a.tenantId !== tenantId);
+      clearedSummary.push('Históricos operacionais de mesas');
+    } else {
+      preservedSummary.push('Histórico arquivado de mesas');
+    }
+
+    // 2. Categorias
+    if (!keepCategories) {
+      this.db.data.categories = this.db.data.categories.filter((c) => c.tenantId !== tenantId);
+      clearedSummary.push('Categorias do cardápio');
+    } else {
+      preservedSummary.push('Categorias do cardápio');
+    }
+
+    // 3. Produtos (preservação granular de fotos, descrições, códigos, preços e estoque)
+    if (!keepProducts) {
+      this.db.data.products = this.db.data.products.filter((p) => p.tenantId !== tenantId);
+      clearedSummary.push('Catálogo completo de produtos');
+    } else {
+      const nowIso = new Date().toISOString();
+      this.db.data.products = this.db.data.products.map((p) => {
+        if (p.tenantId !== tenantId) return p;
+        return {
+          ...p,
+          categoryId: keepCategories ? p.categoryId : '',
+          imageUrl: keepProductPhotos ? p.imageUrl : undefined,
+          description: keepProductDescriptions ? p.description : '',
+          sellingPrice: zeroProductPrices ? 0 : p.sellingPrice,
+          costPrice: zeroProductPrices ? 0 : p.costPrice,
+          profitMargin: zeroProductPrices ? 0 : p.profitMargin,
+          stockQuantity: zeroProductStock ? 0 : p.stockQuantity,
+          updatedAt: nowIso,
+        };
+      });
+      const keptParts = ['Produtos e códigos'];
+      if (keepProductPhotos) keptParts.push('fotos');
+      else clearedSummary.push('Fotografias dos produtos');
+      if (keepProductDescriptions) keptParts.push('descrições');
+      else clearedSummary.push('Descrições dos produtos');
+      if (!zeroProductPrices) keptParts.push('preços');
+      else clearedSummary.push('Preços de venda zerados');
+      if (!zeroProductStock) keptParts.push('estoque');
+      else clearedSummary.push('Saldos de estoque zerados');
+      preservedSummary.push(keptParts.join(', '));
+    }
+
+    // 4. Clientes & Fornecedores
+    if (!keepCustomers) {
+      this.db.data.customers = this.db.data.customers.filter((c) => c.tenantId !== tenantId);
+      clearedSummary.push('Cadastro de clientes');
+    } else {
+      preservedSummary.push('Clientes cadastrados');
+    }
+
+    if (!keepSuppliers) {
+      this.db.data.suppliers = this.db.data.suppliers.filter((s) => s.tenantId !== tenantId);
+      clearedSummary.push('Cadastro de fornecedores');
+    } else {
+      preservedSummary.push('Fornecedores cadastrados');
+    }
+
+    // 5. Vendedores e Chaves Individuais
+    if (!keepSellers) {
+      const removedIds = this.db.data.users
+        .filter((u) => u.tenantId === tenantId && u.role !== 'admin')
+        .map((u) => u.id);
+      revokedUserIds.push(...removedIds);
+
+      this.db.data.users = this.db.data.users.filter(
+        (u) => u.tenantId !== tenantId || u.role === 'admin'
+      );
+
+      // Revoga chaves e encerra sessões de vendedores removidos
+      const nowIso = new Date().toISOString();
+      this.db.accessKeys = this.db.accessKeys.map((k) =>
+        k.tenantId === tenantId && k.mode === 'seller' && !k.revoked
+          ? { ...k, revoked: true, revokedAt: nowIso }
+          : k
+      );
+      for (const s of this.db.sessions) {
+        if (s.tenantId === tenantId && s.mode === 'seller') {
+          revokedSessionIds.push(s.id);
+        }
+      }
+      this.db.sessions = this.db.sessions.filter(
+        (s) => !(s.tenantId === tenantId && s.mode === 'seller')
+      );
+      clearedSummary.push('Vendedores cadastrados e suas chaves de acesso');
+    } else {
+      if (rotateSellerKeys) {
+        const now = new Date();
+        const nowIso = now.toISOString();
+        const expiresAt = new Date(now.getTime() + 24 * 3600 * 1000).toISOString();
+
+        // Revoga chaves e sessões anteriores dos vendedores deste estabelecimento
+        this.db.accessKeys = this.db.accessKeys.map((k) =>
+          k.tenantId === tenantId && k.mode === 'seller' && !k.revoked
+            ? { ...k, revoked: true, revokedAt: nowIso }
+            : k
+        );
+        for (const s of this.db.sessions) {
+          if (s.tenantId === tenantId && s.mode === 'seller') {
+            revokedSessionIds.push(s.id);
+          }
+        }
+        this.db.sessions = this.db.sessions.filter(
+          (s) => !(s.tenantId === tenantId && s.mode === 'seller')
+        );
+
+        const activeSellers = this.db.data.users.filter(
+          (u) => u.tenantId === tenantId && u.role !== 'admin' && u.canSell !== false && u.status !== 'bloqueado'
+        );
+        for (const seller of activeSellers) {
+          const plainKey = generateReadableKey('seller');
+          const { salt, hash } = hashSecret(plainKey);
+          const keyPreview = maskKey(plainKey);
+          const rec: StoredAccessKey = {
+            id: `wkey-${Date.now()}-${crypto.randomBytes(2).toString('hex')}`,
+            tenantId,
+            mode: 'seller',
+            userId: seller.id,
+            userName: seller.name,
+            keyPreview,
+            salt,
+            keyHash: hash,
+            createdAt: nowIso,
+            expiresAt,
+            revoked: false,
+          };
+          this.db.accessKeys.unshift(rec);
+          regeneratedSellerKeys.push({
+            userId: seller.id,
+            userName: seller.name,
+            plainKey,
+            keyPreview,
+            expiresAt,
+          });
+        }
+        this.addConnectionLog({
+          tenantId,
+          event: 'key_renewed',
+          mode: 'seller',
+          userName: actor.name,
+          deviceLabel: 'Limpeza e Novo Período',
+          ipAddress,
+          details: `${regeneratedSellerKeys.length} chave(s) de vendedor(es) redefinida(s) na virada de período.`,
+        });
+        preservedSummary.push(
+          `Vendedores cadastrados (${regeneratedSellerKeys.length} nova(s) chave(s) gerada(s))`
+        );
+      } else {
+        preservedSummary.push('Vendedores cadastrados e chaves atuais');
+      }
+    }
+
+    // 6. Vendas e Pedidos
+    if (clearOrders) {
+      this.db.data.orders = this.db.data.orders.filter((o) => o.tenantId !== tenantId);
+      clearedSummary.push('Vendas e históricos de pedidos');
+    } else {
+      const nowIso = new Date().toISOString();
+      this.db.data.orders = this.db.data.orders.map((o) =>
+        o.tenantId === tenantId && o.status !== 'closed' && o.status !== 'cancelled'
+          ? { ...o, status: 'cancelled', closedAt: o.closedAt || nowIso }
+          : o
+      );
+      preservedSummary.push('Histórico de vendas concluídas');
+    }
+
+    // 7. Caixa e Movimentações
+    if (clearCashRegisters) {
+      this.db.data.cashSessions = this.db.data.cashSessions.filter((c) => c.tenantId !== tenantId);
+      clearedSummary.push('Caixa e movimentações de caixa');
+    } else {
+      preservedSummary.push('Sessões de caixa');
+    }
+
+    // 8. Gastos e Recebimentos (filtragem granular)
+    if (clearExpenses || clearReceipts) {
+      this.db.data.financial = this.db.data.financial.filter((f) => {
+        if (f.tenantId !== tenantId) return true;
+        const isReceipt = f.type === 'revenue' || f.type === 'deposit';
+        if (isReceipt && clearReceipts) return false;
+        if (!isReceipt && clearExpenses) return false;
+        return true;
+      });
+      if (clearExpenses) clearedSummary.push('Gastos e despesas');
+      else preservedSummary.push('Gastos e despesas');
+      if (clearReceipts) clearedSummary.push('Recebimentos financeiros');
+      else preservedSummary.push('Recebimentos financeiros');
+    } else {
+      preservedSummary.push('Gastos e recebimentos');
+    }
+
+    // 9. Movimentações de Estoque
+    if (clearStockMovements) {
+      this.db.data.inventoryTransactions = this.db.data.inventoryTransactions.filter(
+        (m) => m.tenantId !== tenantId
+      );
+      clearedSummary.push('Movimentações de estoque');
+    } else {
+      preservedSummary.push('Movimentações de estoque');
+    }
+
+    // 10. Relatórios Operacionais Salvos
+    if (clearSavedReports) {
+      this.db.data.savedReports = this.db.data.savedReports.filter((r) => r.tenantId !== tenantId);
+      clearedSummary.push('Relatórios operacionais salvos');
+    } else {
+      preservedSummary.push('Relatórios operacionais salvos');
+    }
+
+    // 11. Outros Registros Operacionais (PDFs históricos são SEMPRE mantidos)
+    if (clearOperationalLogs) {
+      this.db.data.archivedPeriods = this.db.data.archivedPeriods.filter((a) => a.tenantId !== tenantId);
+      this.db.data.auditLogs = this.db.data.auditLogs.filter((l) => l.tenantId !== tenantId);
+      clearedSummary.push('Logs e arquivos operacionais auxiliares');
+    }
+
+    preservedSummary.push('PDFs históricos arquivados e configurações do estabelecimento');
+
+    this.addAuditLog({
+      tenantId,
+      userId: actor.id,
+      userName: actor.name,
+      action: 'LIMPEZA_NOVO_PERIODO',
+      details: `Limpeza seletiva pós-PDF (${archivedPdf.fileName}). Zerados: ${clearedSummary.join('; ')}. Preservados: ${preservedSummary.join('; ')}.${params.reason ? ` Motivo: ${params.reason}` : ''}`,
+    });
+
+    this.commit('period_cleaned', {
+      tenantId,
+      revokedUserIds,
+      revokedSessionIds,
+    });
+
+    return {
+      archivePdfId: archivedPdf.id,
+      clearedSummary,
+      preservedSummary,
+      regeneratedSellerKeys: regeneratedSellerKeys.length > 0 ? regeneratedSellerKeys : undefined,
+      revision: this.db.revision,
+    };
+  }
+
+  // ==================== SINCRONIZAÇÃO ADMINISTRATIVA ====================
+
   public syncStateFromClient(
     partial: Partial<PersistedTenantData>,
     tenantId: string,
     actorName: string
   ): { revision: number; revokedUserIds: string[]; revokedSessionIds: string[] } {
-    // Atualiza coleções mantendo integridade de sessões/chaves
     const prevUsers = this.db.data.users;
     if (partial.tenants) this.db.data.tenants = partial.tenants;
     if (partial.users) this.db.data.users = partial.users;
@@ -1537,11 +2527,19 @@ export class AuthoritativeStore {
     if (partial.auditLogs) this.db.data.auditLogs = partial.auditLogs;
     if (partial.savedReports) this.db.data.savedReports = partial.savedReports;
     if (partial.archivedPeriods) this.db.data.archivedPeriods = partial.archivedPeriods;
+    if (partial.archivedPdfs) {
+      // Preserva os PDFs existentes na Matriz e anexa quaisquer novos enviados
+      const map = new Map<string, ArchivedPeriodPdf>();
+      for (const pdf of this.db.data.archivedPdfs || []) map.set(pdf.id, pdf);
+      for (const pdf of partial.archivedPdfs) map.set(pdf.id, pdf);
+      this.db.data.archivedPdfs = Array.from(map.values());
+    }
     if (partial.backups) this.db.data.backups = partial.backups;
     if (partial.tableArchives) this.db.data.tableArchives = partial.tableArchives;
+    if (partial.customers) this.db.data.customers = partial.customers;
+    if (partial.suppliers) this.db.data.suppliers = partial.suppliers;
     if (partial.themeConfig) this.db.data.themeConfig = partial.themeConfig;
 
-    // Se algum vendedor foi bloqueado na sincronização, derruba sessões dele imediatamente
     const blockedUserIds: string[] = [];
     for (const u of this.db.data.users) {
       const wasBlocked = prevUsers.find((pu) => pu.id === u.id);

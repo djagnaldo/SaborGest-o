@@ -153,6 +153,16 @@ export const INITIAL_DEMO_NOTIFICATIONS = [
     read: true,
     priority: 5 as const,
   },
+  {
+    id: 'notif-5',
+    tenantId: 'tenant-demo-01',
+    type: 'system_update' as const,
+    title: 'Suporte a Produtos por Peso (kg / g)',
+    message: 'Produtos com unidade em kg ou g permitem informar o peso exato com cálculo proporcional de preço e baixa no estoque. A leitura automática direta de balanças físicas depende de driver ou plugin compatível.',
+    timestamp: new Date(Date.now() - 120 * 60000).toISOString(),
+    read: false,
+    priority: 7 as const,
+  },
 ];
 
 export const INITIAL_DEMO_USERS: UserProfile[] = [

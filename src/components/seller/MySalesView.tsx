@@ -191,6 +191,9 @@ export const MySalesView: React.FC = () => {
                       </div>
                       <p className="mt-0.5 text-[11px] text-stone-500">
                         {formatDateTimeBR(ord.createdAt)} · {ord.items.length} itens · {paymentMethodLabel}
+                        {ord.waiterId && ord.waiterId !== currentUser?.id && ord.waiterName
+                          ? ` · Mesa aberta por ${ord.waiterName}`
+                          : ''}
                       </p>
                     </div>
                   </div>

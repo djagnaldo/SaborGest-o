@@ -4,7 +4,7 @@
  */
 
 import React, { useState, useEffect } from 'react';
-import { TenantProvider, useTenant } from './contexts/TenantContext';
+import { TenantProvider } from './contexts/TenantContext';
 import { AuthProvider, useAuth } from './contexts/AuthContext';
 import { ThemeProvider } from './contexts/ThemeContext';
 import { Header } from './components/layout/Header';
@@ -12,7 +12,6 @@ import { Sidebar, ActiveTab } from './components/layout/Sidebar';
 import { OverviewDashboard } from './components/dashboard/OverviewDashboard';
 import { LocalServerManager } from './components/server/LocalServerManager';
 import { SellerControlPanel } from './components/team/SellerControlPanel';
-import { PcBrowserAccessModal } from './components/server/PcBrowserAccessModal';
 import { WebPortalGate } from './components/server/WebPortalGate';
 import { ProductsView } from './components/products/ProductsView';
 import { TablesView } from './components/tables/TablesView';
@@ -39,12 +38,11 @@ import {
 } from 'lucide-react';
 
 const AppContent: React.FC = () => {
-  const { activeView, isWebPortal, webPortalAuth, isAdm } = useAuth();
+  const { activeView, isWebPortal, webPortalAuth } = useAuth();
   const [currentTab, setCurrentTab] = useState<ActiveTab>('dashboard');
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [isTenantModalOpen, setIsTenantModalOpen] = useState(false);
   const [tenantModalMode, setTenantModalMode] = useState<'create' | 'edit'>('create');
-  const [isPcModalOpen, setIsPcModalOpen] = useState(false);
   const [preselectedTableNumber, setPreselectedTableNumber] = useState<number | null>(null);
 
   useEffect(() => {
@@ -78,13 +76,8 @@ const AppContent: React.FC = () => {
 
   return (
     <div className="flex h-screen w-full flex-col bg-stone-100 font-sans text-stone-900 antialiased overflow-hidden">
-      {/* Header Principal Limpo */}
-      <Header
-        onOpenNewTenant={handleOpenNewTenant}
-        onOpenEditTenant={handleOpenEditTenant}
-        onToggleSidebarMobile={() => setMobileSidebarOpen(!mobileSidebarOpen)}
-        onOpenPcAccess={isAdm ? () => setIsPcModalOpen(true) : undefined}
-      />
+      {/* Header Simplificado (Marca + Menu Mobile + Notificações) */}
+      <Header onToggleSidebarMobile={() => setMobileSidebarOpen(!mobileSidebarOpen)} />
 
       <div className="flex flex-1 overflow-hidden">
         <Sidebar
@@ -92,11 +85,14 @@ const AppContent: React.FC = () => {
           onSelectTab={setCurrentTab}
           mobileOpen={mobileSidebarOpen}
           onCloseMobile={() => setMobileSidebarOpen(false)}
+          onOpenNewTenant={handleOpenNewTenant}
+          onOpenEditTenant={handleOpenEditTenant}
         />
 
         {/* Área Principal de Conteúdo */}
         <main className="flex-1 overflow-y-auto p-4 sm:p-6 lg:p-8">
-          <div className="mx-auto max-w-7xl">
+          <div className="mx-auto max-w-7xl space-y-4">
+
             {currentTab === 'dashboard' && <OverviewDashboard onNavigate={setCurrentTab} />}
             {currentTab === 'server' && <LocalServerManager />}
             {currentTab === 'team' && <SellerControlPanel />}
@@ -274,17 +270,6 @@ const AppContent: React.FC = () => {
         onClose={() => setIsTenantModalOpen(false)}
         mode={tenantModalMode}
       />
-
-      {isAdm && (
-        <PcBrowserAccessModal
-          isOpen={isPcModalOpen}
-          onClose={() => setIsPcModalOpen(false)}
-          onOpenFullManager={() => {
-            setIsPcModalOpen(false);
-            setCurrentTab('server');
-          }}
-        />
-      )}
     </div>
   );
 };

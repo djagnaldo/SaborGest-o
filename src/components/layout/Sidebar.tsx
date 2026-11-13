@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React from 'react';
+import React, { useState } from 'react';
 import {
   LayoutDashboard,
   UtensilsCrossed,
@@ -19,14 +19,19 @@ import {
   ShoppingBag,
   Award,
   ChevronRight,
+  ChevronDown,
   X,
   Globe,
   FolderArchive,
   Database,
   Palette,
   LogOut,
+  Building2,
+  Plus,
+  CheckCircle2,
 } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
+import { useTenant } from '../../contexts/TenantContext';
 import { getRoleName } from '../../utils/formatters';
 
 export type ActiveTab =
@@ -53,6 +58,8 @@ interface SidebarProps {
   onSelectTab: (tab: ActiveTab) => void;
   mobileOpen: boolean;
   onCloseMobile: () => void;
+  onOpenNewTenant: () => void;
+  onOpenEditTenant: () => void;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -60,8 +67,13 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onSelectTab,
   mobileOpen,
   onCloseMobile,
+  onOpenNewTenant,
+  onOpenEditTenant,
 }) => {
-  const { currentUser, isAdm, activeView, setActiveView, webPortalAuth, logout } = useAuth();
+  const { currentUser, users, isAdm, activeView, setActiveView, switchUser, webPortalAuth, logout } = useAuth();
+  const { currentTenant, tenants, switchTenant } = useTenant();
+  const [showTenantSwitcher, setShowTenantSwitcher] = useState(false);
+  const [showOperatorSwitcher, setShowOperatorSwitcher] = useState(false);
 
   const adminNavItems: Array<{ id: ActiveTab; label: string; icon: any }> = [
     { id: 'dashboard', label: 'Início', icon: LayoutDashboard },
@@ -94,7 +106,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
   return (
     <>
-      {/* Overlay Mobile */}
       {mobileOpen && (
         <div
           onClick={onCloseMobile}
@@ -102,16 +113,15 @@ export const Sidebar: React.FC<SidebarProps> = ({
         />
       )}
 
-      {/* Sidebar Container */}
       <aside
         className={`fixed inset-y-0 left-0 z-40 flex w-72 flex-col border-r border-stone-200 bg-white transition-transform duration-200 ease-in-out lg:static lg:translate-x-0 ${
           mobileOpen ? 'translate-x-0' : 'max-lg:-translate-x-full'
         }`}
       >
-        {/* Top Header dentro da Sidebar (Mobile) */}
         <div className="flex h-16 items-center justify-between border-b border-stone-200 px-5 lg:hidden">
           <span className="text-sm font-bold text-stone-900">Navegação</span>
           <button
+            type="button"
             onClick={onCloseMobile}
             className="rounded-lg p-2 text-stone-500 hover:bg-stone-100"
             aria-label="Fechar menu"
@@ -120,8 +130,75 @@ export const Sidebar: React.FC<SidebarProps> = ({
           </button>
         </div>
 
-        {/* Card do Usuário e Ambiente */}
-        <div className="p-4 border-b border-stone-100">
+        {/* Card do Usuário, Estabelecimento e Ambiente */}
+        <div className="p-4 border-b border-stone-100 space-y-2.5">
+          {isAdm && !webPortalAuth && (
+            <div>
+              <button
+                type="button"
+                onClick={() => setShowTenantSwitcher(!showTenantSwitcher)}
+                className="flex w-full items-center justify-between rounded-xl border border-stone-200 bg-stone-50 px-3 py-2 text-left text-xs hover:bg-stone-100 transition"
+              >
+                <div className="flex items-center gap-2 min-w-0">
+                  <Building2 className="h-4 w-4 text-amber-600 shrink-0" />
+                  <div className="min-w-0">
+                    <p className="truncate font-bold text-stone-900">{currentTenant?.name}</p>
+                    <p className="truncate text-[10px] text-stone-500 capitalize">
+                      {currentTenant?.segment || 'Estabelecimento'}
+                    </p>
+                  </div>
+                </div>
+                <ChevronDown className="h-3.5 w-3.5 text-stone-400 shrink-0" />
+              </button>
+
+              {showTenantSwitcher && (
+                <div className="mt-1.5 rounded-xl border border-stone-200 bg-white p-1.5 shadow-sm space-y-1">
+                  {tenants.map((t) => (
+                    <button
+                      key={t.id}
+                      type="button"
+                      onClick={() => {
+                        switchTenant(t.id);
+                        setShowTenantSwitcher(false);
+                      }}
+                      className={`flex w-full items-center justify-between rounded-lg px-2.5 py-1.5 text-left text-xs ${
+                        t.id === currentTenant?.id
+                          ? 'bg-amber-50 text-amber-900 font-bold'
+                          : 'text-stone-700 hover:bg-stone-50'
+                      }`}
+                    >
+                      <span className="truncate">{t.name}</span>
+                      {t.id === currentTenant?.id && <CheckCircle2 className="h-3.5 w-3.5 text-amber-600 shrink-0" />}
+                    </button>
+                  ))}
+                  <div className="border-t border-stone-100 pt-1 flex gap-1">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowTenantSwitcher(false);
+                        onOpenEditTenant();
+                      }}
+                      className="flex-1 rounded-lg px-2 py-1.5 text-[11px] font-semibold text-stone-700 hover:bg-stone-100"
+                    >
+                      Editar
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowTenantSwitcher(false);
+                        onOpenNewTenant();
+                      }}
+                      className="flex items-center justify-center gap-1 flex-1 rounded-lg bg-amber-600 px-2 py-1.5 text-[11px] font-semibold text-white hover:bg-amber-700"
+                    >
+                      <Plus className="h-3 w-3" />
+                      Novo
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
           <div
             className={`rounded-2xl p-3 border transition ${
               activeView === 'admin'
@@ -154,9 +231,41 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   {currentUser ? getRoleName(currentUser.role) : ''}
                 </p>
               </div>
+              {!webPortalAuth && users.length > 1 && (
+                <button
+                  type="button"
+                  onClick={() => setShowOperatorSwitcher(!showOperatorSwitcher)}
+                  className="p-1.5 rounded-lg bg-white/80 hover:bg-white text-stone-600 border border-stone-200/80"
+                  title="Alternar operador na Matriz"
+                >
+                  <ChevronDown className="h-3.5 w-3.5" />
+                </button>
+              )}
             </div>
 
-            {/* Quick Switch de Ambiente (apenas se Administrador e fora de bloqueio vendedor) */}
+            {showOperatorSwitcher && !webPortalAuth && (
+              <div className="mt-2 rounded-xl bg-white border border-stone-200 p-1.5 space-y-1 max-h-40 overflow-y-auto">
+                {users.map((u) => (
+                  <button
+                    key={u.id}
+                    type="button"
+                    onClick={() => {
+                      switchUser(u.id);
+                      setShowOperatorSwitcher(false);
+                    }}
+                    className={`flex w-full items-center justify-between rounded-lg px-2 py-1.5 text-left text-[11px] ${
+                      u.id === currentUser?.id
+                        ? 'bg-amber-50 text-amber-900 font-bold'
+                        : 'text-stone-700 hover:bg-stone-50'
+                    }`}
+                  >
+                    <span className="truncate">{u.name}</span>
+                    <span className="text-[10px] text-stone-400 shrink-0">{getRoleName(u.role)}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+
             {isAdm && (
               <div className="mt-3 flex items-center gap-1 rounded-xl bg-white/80 p-1 border border-stone-200/60">
                 <button

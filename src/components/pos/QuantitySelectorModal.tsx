@@ -3,9 +3,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Product } from '../../types';
-import { X, Plus, Minus, Scale, AlertCircle, Check } from 'lucide-react';
+import { X, Plus, Minus, AlertCircle } from 'lucide-react';
 import { formatCurrencyBR as formatCurrency } from '../../utils/formatters';
 
 interface QuantitySelectorModalProps {
@@ -37,15 +37,15 @@ export const QuantitySelectorModal: React.FC<QuantitySelectorModalProps> = ({
   const [quantity, setQuantity] = useState<number>(1);
   const [weightInput, setWeightInput] = useState<string>('0.500');
   const [selectedVariation, setSelectedVariation] = useState<string>('');
-  const [selectedAddonIds, setSelectedAddonIds] = useState<string[]>([]);
   const [notes, setNotes] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
+  const submittingRef = useRef<boolean>(false);
 
   useEffect(() => {
     if (!product) return;
+    submittingRef.current = false;
     setError(null);
     setNotes('');
-    setSelectedAddonIds([]);
     setSelectedVariation(product.variations?.[0]?.name || '');
 
     if (product.allowWeight || product.unit === 'kg') {
@@ -67,12 +67,7 @@ export const QuantitySelectorModal: React.FC<QuantitySelectorModalProps> = ({
       ? product.variations.find((v) => v.name === selectedVariation)?.price ?? product.sellingPrice
       : product.sellingPrice;
 
-  const selectedAddons = (product.addons || [])
-    .filter((a) => selectedAddonIds.includes(a.id))
-    .map((a) => ({ name: a.name, price: a.price }));
-
-  const addonsTotal = selectedAddons.reduce((sum, a) => sum + a.price, 0);
-  const unitPrice = Number((basePrice + addonsTotal).toFixed(2));
+  const unitPrice = Number(basePrice.toFixed(2));
   const totalPrice = Number((unitPrice * quantity).toFixed(2));
   const maxStock = product.stockQuantity ?? 0;
 
@@ -113,6 +108,7 @@ export const QuantitySelectorModal: React.FC<QuantitySelectorModalProps> = ({
 
   const handleConfirm = (e: React.FormEvent) => {
     e.preventDefault();
+    if (submittingRef.current) return;
     if (!quantity || quantity <= 0) {
       setError('Informe uma quantidade válida maior que zero.');
       return;
@@ -122,14 +118,16 @@ export const QuantitySelectorModal: React.FC<QuantitySelectorModalProps> = ({
       return;
     }
 
-    onConfirm({
+    submittingRef.current = true;
+    const payload = {
       product,
       quantity,
       variationName: selectedVariation || undefined,
-      selectedAddons: selectedAddons.length > 0 ? selectedAddons : undefined,
       notes: notes.trim() || undefined,
       unitPrice,
-    });
+    };
+    onClose();
+    onConfirm(payload);
   };
 
   return (
@@ -210,59 +208,12 @@ export const QuantitySelectorModal: React.FC<QuantitySelectorModalProps> = ({
             </div>
           )}
 
-          {/* Addons */}
-          {product.addons && product.addons.length > 0 && (
-            <div>
-              <label className="block text-xs font-bold uppercase tracking-wider text-stone-500 mb-2">
-                Adicionais
-              </label>
-              <div className="space-y-2">
-                {product.addons.map((addon) => {
-                  const checked = selectedAddonIds.includes(addon.id);
-                  return (
-                    <button
-                      key={addon.id}
-                      type="button"
-                      onClick={() =>
-                        setSelectedAddonIds((prev) =>
-                          checked ? prev.filter((id) => id !== addon.id) : [...prev, addon.id]
-                        )
-                      }
-                      className={`w-full min-h-[44px] px-3 py-2 rounded-xl border flex items-center justify-between gap-2 transition-all cursor-pointer ${
-                        checked
-                          ? 'border-amber-600 bg-amber-50 text-stone-900'
-                          : 'border-stone-200 bg-white text-stone-700 hover:border-stone-300'
-                      }`}
-                    >
-                      <span className="flex items-center gap-2 text-sm font-medium">
-                        <span
-                          className={`w-5 h-5 rounded flex items-center justify-center border ${
-                            checked
-                              ? 'bg-amber-600 border-amber-600 text-white'
-                              : 'border-stone-300 bg-white'
-                          }`}
-                        >
-                          {checked && <Check className="w-3.5 h-3.5" />}
-                        </span>
-                        {addon.name}
-                      </span>
-                      <span className="text-xs font-bold tabular-nums text-stone-700">
-                        + {formatCurrency(addon.price)}
-                      </span>
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-
           {/* Quantity or Weight */}
           {isWeightProduct ? (
             <div className="bg-stone-50 border border-stone-200 rounded-2xl p-4 space-y-3">
               <div className="flex items-center justify-between">
                 <span className="text-xs font-bold uppercase tracking-wider text-stone-600 flex items-center gap-1.5">
-                  <Scale className="w-4 h-4 text-amber-600" />
-                  Pesagem na Balança ({product.unit})
+                  Quantidade ({product.unit})
                 </span>
                 <span className="text-xs text-stone-500 tabular-nums">
                   {formatCurrency(unitPrice)} / {product.unit}
